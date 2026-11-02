@@ -195,18 +195,26 @@ def _runtime_locked(function):
 class _ChildGraph:
     def __init__(self, owner: 'GreenContextPair', binaries: Sequence[RoleBinary],
                  arguments: Sequence[_KernelArgs]):
-        if len(binaries) != 3 or [x.role for x in binaries] != [1, 2, 3]:
-            raise ValueError('expected dispatch, compute, finalize cubins')
-        if len(arguments) != 3:
+        roles = [x.role for x in binaries]
+        if roles not in ([1, 2, 3], [1, 2, 3, 4]):
+            raise ValueError('expected dispatch, compute, finalize (and ECO plan) cubins')
+        if len(arguments) != len(binaries):
             raise ValueError('expected one argument vector per role')
         self.graph = None
         self.executable = None
         self.kernels = []
         self.arguments = tuple(arguments)
+        # Role contexts: dispatch on the communication partition, compute and finalize on the compute partition.
+        # The ECO plan (one CTA) shares the communication partition: with ECO, dispatch launches one CTA fewer
+        # than the partition's SMs (one full-shared-memory CTA per SM), which leaves the plan its own SM.
+        # Finalize depends on every other role; the others run concurrently.
+        role_context = {1: 0, 2: 1, 3: 1, 4: 0}
+        order = [index for role in (1, 2, 4, 3) for index, x in enumerate(binaries) if x.role == role]
         try:
             self.graph = _ok(cu.cuGraphCreate(0))
             nodes = []
-            for index, binary in enumerate(binaries):
+            for index in order:
+                binary = binaries[index]
                 loaded = owner._get_loaded_kernel(binary)
                 self.kernels.append(loaded)
                 kernel = loaded.kernel
@@ -216,17 +224,17 @@ class _ChildGraph:
                 params = cu.CUgraphNodeParams()
                 params.type = cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
                 params.kernel.kern = kernel
-                params.kernel.ctx = owner.contexts[0 if index == 0 else 1]
+                params.kernel.ctx = owner.contexts[role_context[binary.role]]
                 params.kernel.gridDimX = binary.grid
                 params.kernel.gridDimY = params.kernel.gridDimZ = 1
                 params.kernel.blockDimX = binary.threads
                 params.kernel.blockDimY = params.kernel.blockDimZ = 1
                 params.kernel.sharedMemBytes = binary.smem_bytes
                 params.kernel.kernelParams = arguments[index].pointer
-                dependencies = nodes[:2] if index == 2 else []
+                dependencies = list(nodes) if binary.role == 3 else []
                 node = _ok(cu.cuGraphAddNode(self.graph, dependencies, None,
                                              len(dependencies), params))
-                if index == 1:
+                if binary.role == 2:
                     attr = cu.CUkernelNodeAttrValue()
                     attr.clusterDim.x, attr.clusterDim.y, attr.clusterDim.z = 2, 1, 1
                     _ok(cu.cuGraphKernelNodeSetAttribute(
@@ -364,12 +372,12 @@ class GreenContextPair:
         # A role may have its own CuTe kernel ABI (for example a peer pointer
         # table used by dispatch/epilogue but not the MMA worker). Retain the
         # previous flat-vector form for existing single-rank callers.
-        if len(arguments) == 3 and all(isinstance(item, (tuple, list))
-                                       for item in arguments):
+        if len(arguments) == len(binaries) and all(isinstance(item, (tuple, list))
+                                                   for item in arguments):
             args = tuple(_KernelArgs(item) for item in arguments)
         else:
             common = _KernelArgs(arguments)
-            args = (common, common, common)
+            args = (common,) * len(binaries)
         key = _child_key(binaries, args)
         graph = self.graphs.get(key)
         if graph is None:

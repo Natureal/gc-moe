@@ -154,3 +154,18 @@ def sync_activation(*, loc=None, ip=None):
 def sync_weight(*, loc=None, ip=None):
     llvm.inline_asm(None, [], 'bar.sync 4, 64;', '~{memory}',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def read_globaltimer(*, loc=None, ip=None) -> Uint64:
+    """Device-wide nanosecond timer (ECO timeline trace)."""
+    return Uint64(llvm.inline_asm(T.i64(), [], 'mov.u64 $0, %globaltimer;', '=l',
+                                  has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
+                                  loc=loc, ip=ip))
+
+
+@dsl_user_op
+def prefetch_global_l2(ptr, *, loc=None, ip=None) -> None:
+    """Prefetch the line holding `ptr` into L2."""
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value()], 'prefetch.global.L2 [$0];', 'l',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)

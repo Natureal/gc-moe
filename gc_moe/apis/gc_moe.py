@@ -148,7 +148,16 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
                     activation: str = 'swiglu', activation_clamp: Optional[float] = None,
                     fast_math: bool = True,
                     shared_recipe: Optional[tuple[int, int, int]] = None,
-                    activation_alpha: Optional[float] = None) -> None:
+                    activation_alpha: Optional[float] = None,
+                    eco_meta: Optional[torch.Tensor] = None,
+                    eco_state: Optional[torch.Tensor] = None,
+                    eco_logical_experts: int = 0) -> None:
+    """ECO online split (`sym_buffer` from `get_symm_buffer_for_gc_moe(..., eco=True)`; `eco_meta`: the layer's
+    int32 EcoMeta from `rtp_llm/eplb/eco.py` with `gc_moe.eco.unit_ref.unit_section` appended (offset in
+    header[15]); `eco_logical_experts`: its logical expert count): `topk_idx` holds logical experts, the
+    `sym_buffer.num_experts` physical slots serve them, and a plan role splits each replicated expert's tokens over
+    its copies every call. `eco_state` (int16 [physical + logical], zero-initialized, one per layer, reset when the
+    placement changes) warm-starts each plan from the layer's previous one; without it every call plans cold."""
     config = validate_call(y, l1_weights, l2_weights, sym_buffer,
                            shared_l1_weights, shared_l2_weights,
                            cumulative_local_expert_recv_stats, recipe, activation,
@@ -158,4 +167,5 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
     from ..jit_kernels.impls.sm100_fp8_fp4_gc_moe import launch_gc_moe
     launch_gc_moe(config, y, l1_weights, l2_weights, call_buffer,
                   shared_l1_weights, shared_l2_weights,
-                  cumulative_local_expert_recv_stats)
+                  cumulative_local_expert_recv_stats,
+                  eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts)

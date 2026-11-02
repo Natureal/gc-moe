@@ -25,6 +25,7 @@ from ...layout.gc_moe import (
     align,
     ceil_div,
 )
+from ...eco.plan import ECO_PLAN_ROLE, ECO_UNIT_THREADS, compile_eco_plan, eco_unit_config
 from ...runtime.gc_moe import RoleBinary, get_context
 from ...runtime.jit import (
     COMPILE_LOCK,
@@ -188,8 +189,8 @@ def _get_or_compile_binaries(key: tuple, identity: CompilerIdentity,
         binaries = _BINARY_CACHE.get(key)
         if binaries is None:
             binaries = tuple(compile_roles())
-            if len(binaries) != 3 or tuple(item.role for item in binaries) != (1, 2, 3):
-                raise RuntimeError('GC role compilation did not produce all three roles')
+            if tuple(item.role for item in binaries) not in ((1, 2, 3), (1, 2, 3, 4)):
+                raise RuntimeError('GC role compilation did not produce all three roles (and the ECO plan)')
             if _compiler_identity(target) != identity:
                 raise RuntimeError('compiler identity changed while compiling role binaries')
             _BINARY_CACHE[key] = binaries
@@ -395,12 +396,16 @@ def _order_role2_value_formals(ptx: str) -> str:
 
 def _assemble_role_value_params(ptx: str, role: int,
                                 dump_dir: str, *, target: str,
-                                ptxas_options: tuple[str, ...] = PTXAS_OPTIONS) -> tuple[str, bytes, str]:
-    """Build each role with relative peer value, plus role2's value maps."""
+                                ptxas_options: tuple[str, ...] = PTXAS_OPTIONS,
+                                eco: bool = False) -> tuple[str, bytes, str]:
+    """Build each role with relative peer value, plus role2's value maps.
+
+    ECO: role1 also takes the layer's EcoMeta pointer after the token count."""
     ptx = _clean_cute_ptx(ptx)
     if ptx_target(ptx) != target:
         raise RuntimeError('CuTe generated a different device target')
-    expected = {1: ('ptr', 'ptr', 'u32', 'u32', 'f32', 'f32'),
+    expected = {1: (('ptr', 'ptr', 'u32', 'u32', 'ptr', 'f32', 'f32') if eco else
+                    ('ptr', 'ptr', 'u32', 'u32', 'f32', 'f32')),
                 2: (('ptr', 'ptr', 'u32', 'u32', 'ptr', 'f32', 'f32') +
                     ('ptr',) * 17),
                 3: ('ptr', 'ptr', 'u32', 'u32', 'ptr', 'ptr', 'ptr',
@@ -516,16 +521,43 @@ def _check_ring_capacity(config, sym_buffer, compute_sms: int) -> None:
         raise ValueError('GC SF ring capacity is insufficient for block M')
 
 
+_ECO_PEER_TABLES: dict = {}
+
+
+def _eco_trace_enabled() -> bool:
+    """Timeline trace build (signals 'eco_trace', slots in gc_moe.eco.plan.ECO_TRACE_SLOTS)"""
+    return os.environ.get('GC_MOE_ECO_TRACE', '0') == '1'
+
+
 def prepare_role_binaries(config, y: torch.Tensor,
                           l1_weights: tuple[torch.Tensor, torch.Tensor],
                           l2_weights: tuple[torch.Tensor, torch.Tensor],
                           sym_buffer, shared_l1_weights=None,
                           shared_l2_weights=None, stats=None,
-                          context=None):
-    """Encode live maps once per pointer set and compile each role once/shape."""
+                          context=None, eco_meta=None, eco_state=None,
+                          eco_logical_experts: int = 0):
+    """Encode live maps once per pointer set and compile each role once/shape.
+
+    ECO (`eco_meta`: the layer's int32 EcoMeta, `eco_state`: optional u16 [P + E] warm-plan state): a fourth
+    role plans on its own Green partition, `topk_idx` holds logical experts."""
     _check_supported(config, sym_buffer)
+    eco = eco_meta is not None
+    eco_logical = 0
+    if eco:
+        if eco_meta.dtype != torch.int32 or not eco_meta.is_cuda or not eco_meta.is_contiguous():
+            raise ValueError('ECO metadata must be a contiguous CUDA int32 tensor')
+        if not sym_buffer.layout.eco:
+            raise ValueError('ECO needs a symmetric buffer created with eco=True (same shared expert count)')
+        eco_logical = int(eco_logical_experts)
+        if eco_logical <= 0 or eco_logical % 2:
+            raise ValueError('ECO needs the (even) logical expert count')
+        if eco_state is not None and (eco_state.dtype != torch.int16 or
+                                      eco_state.numel() != sym_buffer.num_experts + eco_logical):
+            raise ValueError('ECO state must be int16 [physical + logical experts]')
     if context is None:
         context = get_context()
+    # ECO: dispatch keeps one SM of its partition free for the plan CTA (one CTA per SM either way)
+    dispatch_sms = context.dispatch_sms - 1 if eco else context.dispatch_sms
     device = sym_buffer.buffer.device
     weight_pairs = (l1_weights, l2_weights)
     if shared_l1_weights is not None:
@@ -559,7 +591,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     key = _capture_key(config, sym_buffer, context, y, l1_weights, l2_weights,
                        shared_l1_weights, shared_l2_weights, stats,
                        nvlink_timeout_secs, role_resources, combine_resources,
-                       compiler_identity)
+                       compiler_identity) + ((eco_logical,) if eco else ())
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -583,7 +615,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                 role_kernels = []
                 for index, role in enumerate((1, 2, 3)):
                     role_kernel = GCMoERoleKernel(
-                        role, context.dispatch_sms, context.compute_sms,
+                        role, dispatch_sms, context.compute_sms,
                         config.block_m, config.hidden, config.intermediate,
                         config.tokens, sym_buffer.group.size(), config.local_experts,
                         config.shared_experts,
@@ -600,7 +632,8 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         has_stats=stats is not None,
                         nvlink_timeout_secs=nvlink_timeout_secs,
                         role_config=role_configs[index],
-                        combine_geometry=combine_geometry if role == 3 else None)
+                        combine_geometry=combine_geometry if role == 3 else None,
+                        eco_logical_experts=eco_logical, eco_trace=eco and _eco_trace_enabled())
                     role_kernels.append(role_kernel)
                 binary_key = _binary_key(
                     compiler_identity, tuple(role_kernels), role_resources,
@@ -614,6 +647,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                     map_views = tuple(from_dlpack(map_storage[i * 128:(i + 1) * 128])
                                       for i in range(18))
                     role3_map_view = from_dlpack(map_storage[:2304])
+                    eco_meta_view = from_dlpack(eco_meta) if eco else None
                     y_view = from_dlpack(y)
                     stats_view = from_dlpack(stats) if stats is not None else signal_view
                     rank_view, token_view = Uint32(0), Uint32(0)
@@ -629,20 +663,33 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                          clamp_view, alpha_view)
                                         if role == 3 else
                                         (signal_view, peer_view, rank_view, token_view,
-                                         None, None, None,
+                                         eco_meta_view, None, None,
                                          clamp_view, alpha_view))
                         cubin = compile_kernel(
                             role_kernel, compile_args, compiler_identity,
                             lambda ptx, dump_dir: _assemble_role_value_params(
                                 ptx, role, dump_dir, target=compiler_target,
-                                ptxas_options=compiler_identity.ptxas_options))
+                                ptxas_options=compiler_identity.ptxas_options,
+                                eco=eco and role == 1))
                         role_config = role_configs[index]
                         compiled_binaries.append(RoleBinary(
                             role, cubin, role_config.dynamic_smem,
                             role_config.threads,
-                            context.dispatch_sms if role == 1 else
+                            dispatch_sms if role == 1 else
                             context.compute_sms if role == 2 else
                             role_kernel.finalize_sms))
+                    if eco:
+                        # ECO plan role: nvcc cubin, static shared memory, one CTA on the dispatch SM left free
+                        compiled_binaries.append(RoleBinary(
+                            ECO_PLAN_ROLE,
+                            compile_eco_plan(sym_buffer.num_experts, sym_buffer.group.size(), eco_logical,
+                                             layout.eco_base,
+                                             layout.views['topk_idx'].offset, sym_buffer.num_topk,
+                                             sym_buffer.num_max_tokens_per_rank,
+                                             eco_unit_config(sym_buffer.group.size(), config.block_m),
+                                             trace=_eco_trace_enabled()),
+                            0,
+                            ECO_UNIT_THREADS, 1))
                     return compiled_binaries
 
                 binaries = _get_or_compile_binaries(
@@ -665,18 +712,34 @@ def prepare_role_binaries(config, y: torch.Tensor,
     y_arg = ctypes.c_void_p(y.data_ptr())
     stats_arg = ctypes.c_void_p(stats.data_ptr() if stats is not None else
                                sym_buffer.buffer.data_ptr())
-    arguments = ((signal_arg, peer_arg, rank_arg, token_arg,
-                  clamp_arg, alpha_arg),
+    role1_args = ((signal_arg, peer_arg, rank_arg, token_arg, ctypes.c_void_p(eco_meta.data_ptr()),
+                   clamp_arg, alpha_arg) if eco else
+                  (signal_arg, peer_arg, rank_arg, token_arg, clamp_arg, alpha_arg))
+    arguments = (role1_args,
                  (signal_arg, peer_arg, rank_arg, token_arg,
                   clamp_arg, alpha_arg, *map_args),
                  (signal_arg, peer_arg, rank_arg, token_arg, role3_map_arg,
                   y_arg, stats_arg, clamp_arg, alpha_arg))
+    if eco:
+        # Peer base addresses for the plan CTA's remote stores (device table, stable for graph capture)
+        key = (sym_buffer.buffer.device.index, tuple(sym_buffer.peer_addresses))
+        peers = _ECO_PEER_TABLES.get(key)
+        if peers is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError('run ECO GC MoE once outside graph capture first')
+            peers = _ECO_PEER_TABLES[key] = torch.tensor(key[1], dtype=torch.int64, device=sym_buffer.buffer.device)
+        arguments += ((ctypes.c_void_p(eco_meta.data_ptr()), ctypes.c_void_p(sym_buffer.buffer.data_ptr()),
+                       ctypes.c_void_p(eco_state.data_ptr() if eco_state is not None else 0),
+                       ctypes.c_void_p(0), ctypes.c_void_p(peers.data_ptr()),
+                       ctypes.c_uint32(sym_buffer.rank_idx), ctypes.c_uint32(config.tokens)),)
     return list(prepared.binaries), arguments
 
 def launch_gc_moe(config, y, l1_weights, l2_weights, sym_buffer,
-                  shared_l1_weights, shared_l2_weights, stats) -> None:
+                  shared_l1_weights, shared_l2_weights, stats,
+                  eco_meta=None, eco_state=None, eco_logical_experts: int = 0) -> None:
     context = get_context()
     binaries, arguments = prepare_role_binaries(
         config, y, l1_weights, l2_weights, sym_buffer,
-        shared_l1_weights, shared_l2_weights, stats, context)
+        shared_l1_weights, shared_l2_weights, stats, context,
+        eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts)
     context.launch(binaries, arguments)

@@ -137,6 +137,44 @@ def _signal_offsets() -> dict[str, int]:
 SIGNAL_OFFSETS = _signal_offsets()
 
 
+def _eco_signal_offsets() -> dict[str, int]:
+    """ECO region layout, relative to `GCBufferLayout.eco_base`. Epoch-tagged signals (value epoch + 1, epoch =
+    recv_parity): role1 publishes the fixed slots' totals and this rank's single-copy slot count after the rank
+    barrier; the plan publishes every slot's quota and its canonical start within the expert's copies. `eco_counts`
+    (last): per-source logical token counts, [2 generations][ranks][experts] u16 `(tag << 14) | count`, tag =
+    (epoch / 2) % 3 + 1: every entry of a generation is rewritten every other call, so the tag tells this call's
+    value from the previous one (self-validating, no fence/flag); logical experts <= physical slots."""
+    fields = (
+        ('eco_counts_ready', 1, 4),
+        ('eco_plan_ready', 1, 4),
+        ('eco_num_fixed', 1, 4),
+        # per source rank: epoch + 1 once its replicated experts' source indices are in place (its plan CTA)
+        ('eco_reps_ready', MAX_RANKS, 4),
+        ('eco_slot_count', MAX_EXPERTS_PER_RANK, 4),
+        ('eco_quota', MAX_EXPERTS, 4),
+        ('eco_quota_start', MAX_EXPERTS, 4),
+        # Optional timeline trace (globaltimer ns, GC_MOE_ECO_TRACE=1 builds)
+        ('eco_trace', 64, 8),
+        # Per-call trace ring (64 calls x 8 u32 ns since the call's role1 start)
+        ('eco_trace_ring', 512, 4),
+    )
+    offset = 0
+    result = {}
+    for name, count, element_bytes in fields:
+        offset = align(offset, 128 if name == 'eco_trace_ring' else element_bytes)
+        result[name] = offset
+        offset += count * element_bytes
+    result['eco_counts'] = align(offset, 128)
+    return result
+
+
+ECO_SIGNAL_OFFSETS = _eco_signal_offsets()
+
+
+def eco_region_bytes(num_ranks: int, num_experts: int) -> int:
+    return align(ECO_SIGNAL_OFFSETS['eco_counts'] + 2 * num_ranks * num_experts * 2, 128)
+
+
 @dataclass(frozen=True)
 class BufferView:
     offset: int
@@ -157,6 +195,7 @@ class GCBufferLayout:
     ring_tokens: int
     sf_ring_tokens: int
     num_shared_experts: int = 0
+    eco: bool = False
 
     def __post_init__(self) -> None:
         ranks, experts, capacity = self.num_ranks, self.num_experts, self.capacity
@@ -234,6 +273,14 @@ class GCBufferLayout:
         return result
 
     @property
+    def eco_base(self) -> int:
+        """ECO region (eco layouts only): appended after every original field, which keeps their offsets"""
+        v = self.views['combine_tokens']
+        return align(v.offset + v.nbytes, 128)
+
+    @property
     def nbytes(self) -> int:
+        if self.eco:
+            return self.eco_base + eco_region_bytes(self.num_ranks, self.num_experts)
         v = self.views['combine_tokens']
         return v.offset + v.nbytes

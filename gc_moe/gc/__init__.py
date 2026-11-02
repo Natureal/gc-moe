@@ -33,7 +33,7 @@ class GCSymmBuffer:
     def __init__(self, group: dist.ProcessGroup, num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int, hidden: int,
                  intermediate_hidden: int, num_shared_experts: int = 0,
-                 mma_type: str = 'fp8xfp4', activation: str = 'swiglu', base=None):
+                 mma_type: str = 'fp8xfp4', activation: str = 'swiglu', base=None, eco: bool = False):
         if mma_type != 'fp8xfp4' or activation != 'swiglu':
             raise ValueError('GC MoE requires fp8xfp4/swiglu')
         self.group = group
@@ -51,7 +51,7 @@ class GCSymmBuffer:
         self.layout = GCBufferLayout(group.size(), num_experts,
                                      self.num_max_tokens_per_rank, num_topk,
                                      hidden, intermediate_hidden, ring_tokens,
-                                     sf_ring_tokens, num_shared_experts)
+                                     sf_ring_tokens, num_shared_experts, eco=eco)
         if base is None:
             allocator = torch if group.size() == 1 else symm_mem
             self.buffer = allocator.empty(self.layout.nbytes, dtype=torch.int8, device='cuda')
@@ -152,9 +152,11 @@ def get_symm_buffer_for_gc_moe(group: dist.ProcessGroup, num_experts: int,
                                  num_max_tokens_per_rank: int, num_topk: int,
                                  hidden: int, intermediate_hidden: int,
                                  num_shared_experts: int = 0,
-                                 mma_type: str = 'fp8xfp4', activation: str = 'swiglu') -> GCSymmBuffer:
+                                 mma_type: str = 'fp8xfp4', activation: str = 'swiglu',
+                                 eco: bool = False) -> GCSymmBuffer:
+    """`eco`: also reserve the ECO online-split region (after every original field) for `eco_meta` calls"""
     return GCSymmBuffer(group, num_experts, num_max_tokens_per_rank, num_topk,
-                        hidden, intermediate_hidden, num_shared_experts, mma_type, activation)
+                        hidden, intermediate_hidden, num_shared_experts, mma_type, activation, eco=eco)
 
 
 def _gc_interleave_rows(t: torch.Tensor) -> torch.Tensor:
@@ -228,10 +230,14 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
                     activation: str = 'swiglu', activation_clamp: Optional[float] = None,
                     fast_math: bool = True,
                     shared_recipe: Optional[Tuple[int, int, int]] = None,
-                    activation_alpha: Optional[float] = None) -> None:
+                    activation_alpha: Optional[float] = None,
+                    eco_meta: Optional[torch.Tensor] = None,
+                    eco_state: Optional[torch.Tensor] = None,
+                    eco_logical_experts: int = 0) -> None:
     if hasattr(sym_buffer, 'num_shared_experts'):
         assert (sym_buffer.num_shared_experts > 0) == (shared_l1_weights is not None)
     from ..apis.gc_moe import fp8_fp4_gc_moe as launch
     launch(y, l1_weights, l2_weights, sym_buffer, shared_l1_weights,
            shared_l2_weights, cumulative_local_expert_recv_stats, recipe,
-           activation, activation_clamp, fast_math, shared_recipe, activation_alpha)
+           activation, activation_clamp, fast_math, shared_recipe, activation_alpha,
+           eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts)

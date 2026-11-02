@@ -14,14 +14,21 @@ import cutlass.cute as cute
 from cutlass import Int32, Uint32, Uint64
 
 from ..common.math import warp_inclusive_sum
+from ..layout.gc_moe import ECO_SIGNAL_OFFSETS, SIGNAL_OFFSETS
 from ..ptx.ld_st import (
+    atom_add_u64,
+    ld_acquire_gpu_u32,
     ld_volatile_u32,
+    red_global_max_u64,
+    red_global_min_u64,
     ld_volatile_u64,
+    st_global_u32,
     atom_add_u32,
     st_async_cluster_u32x4,
 )
 from ..ptx.utils import (
     elect_one_sync,
+    read_globaltimer,
     warp_first_set_bit,
 )
 
@@ -199,6 +206,59 @@ def advance_expert(counts: cute.Tensor, token_idx: Uint32,
 
 
 @cute.jit
+def eco_trace_point(signals: cute.Pointer, slot: cutlass.Constexpr, is_max: cutlass.Constexpr,
+                    enabled: cutlass.Constexpr, eco_base: cutlass.Constexpr) -> None:
+    """ECO timeline trace (elected lane): min or max of globaltimer into signals 'eco_trace'[slot]"""
+    if cutlass.const_expr(enabled):
+        if elect_one_sync():
+            ptr = signals + ((eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) + slot * 8) // 4
+            if cutlass.const_expr(is_max):
+                red_global_max_u64(ptr, read_globaltimer())
+            else:
+                red_global_min_u64(ptr, read_globaltimer())
+
+
+@cute.jit
+def eco_trace_ring_point(signals: cute.Pointer, field: cutlass.Constexpr, block: Int32,
+                         enabled: cutlass.Constexpr, eco_base: cutlass.Constexpr) -> None:
+    """ECO per-call trace ring (block 0's elected lane): ns since this call's role1 start into `field`"""
+    if cutlass.const_expr(enabled):
+        if block == Int32(0):
+            if elect_one_sync():
+                base = signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4
+                elapsed = Uint32(read_globaltimer() - ld_volatile_u64(base + 24 * 2))
+                entry = Uint32(ld_volatile_u64(base + 30 * 2)) % Uint32(64)
+                st_global_u32(signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_trace_ring']) // 4 + entry * Uint32(8) + field, elapsed)
+
+
+@cute.jit
+def eco_load_replicas(signals: cute.Pointer, rank_idx: Uint32, epoch: Uint32,
+                      num_fixed: Uint32, expert_counts: cute.Tensor, lane: Int32,
+                      local_experts: cutlass.Constexpr,
+                      block_m: cutlass.Constexpr, eco_base: cutlass.Constexpr,
+                      trace: cutlass.Constexpr = False, block: Int32 = None) -> Uint32:
+    """ECO: wait for this call's plan, cache the replica slots' quotas, return the routed M-block total"""
+    eco_trace_point(signals, 11, False, trace, eco_base)
+    wait_begin = read_globaltimer() if cutlass.const_expr(trace) else Uint64(0)
+    while ld_acquire_gpu_u32(signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_plan_ready']) // 4) != epoch + Uint32(1):
+        pass
+    eco_trace_point(signals, 12, True, trace, eco_base)
+    if cutlass.const_expr(trace):
+        if elect_one_sync():
+            # Graph-replay accumulators: scheduler stall on the plan (sum, count)
+            atom_add_u64(signals + ((eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) + 26 * 8) // 4, read_globaltimer() - wait_begin)
+            atom_add_u64(signals + ((eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) + 28 * 8) // 4, Uint64(1))
+    lane_m_blocks = Uint32(0)
+    for wave in cutlass.range_constexpr((local_experts + 31) // 32):
+        slot_idx = Uint32(wave * 32 + lane)
+        if slot_idx >= num_fixed and slot_idx < Uint32(local_experts):
+            expert_counts[wave] = ld_volatile_u32(
+                signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_quota']) // 4 + rank_idx * Uint32(local_experts) + slot_idx)
+        lane_m_blocks += (expert_counts[wave] + Uint32(block_m - 1)) // Uint32(block_m)
+    return cute.arch.warp_redux_sync(lane_m_blocks, 'add')
+
+
+@cute.jit
 def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                    recv_ptr: cute.Pointer, l1_count_ptr: cute.Pointer,
                    l2_count_ptr: cute.Pointer, shared_l1_count_ptr: cute.Pointer,
@@ -214,8 +274,16 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                    local_experts: cutlass.Constexpr,
                    num_ranks: cutlass.Constexpr,
                    shared_experts: cutlass.Constexpr,
+                   eco: cutlass.Constexpr = False,
+                   signals: cute.Pointer = None,
+                   rank_idx: Uint32 = None,
+                   eco_trace: cutlass.Constexpr = False,
+                   eco_base: cutlass.Constexpr = 0,
 ) -> None:
-    """Publish shared and interleaved routed tasks, then the end sentinel."""
+    """Publish shared and interleaved routed tasks, then the end sentinel.
+
+    ECO: the single-copy slots (published by role1 after the rank barrier) are scheduled first; a claim beyond
+    them waits for the plan role and extends the routed total with the replica slots' quotas."""
     shared_m_blocks = (num_tokens + Uint32(block_m - 1)) // \
         Uint32(block_m)
     shared_l2_early = (shared_m_blocks * Uint32(l2_clusters) <=
@@ -240,15 +308,34 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
     # Each lane owns experts wave*32+lane in registers, as in
     # GCMoEScheduler. The count cache survives routed L1/L2 task
     # claims, without an E-dependent shared prefix allocation.
-    for wave in cutlass.range_constexpr(
-            (local_experts + 31) // 32):
-        local_expert = Uint32(wave * 32 + lane)
-        count = Uint64(0)
-        if local_expert < Uint32(local_experts):
-            while Uint32(count >> 32) != Uint32(
-                    dispatch_sms * num_ranks):
-                count = ld_volatile_u64(recv_ptr + local_expert * 2)
-        expert_counts[wave] = Uint32(count)
+    eco_epoch = Uint32(0)
+    eco_num_fixed = Uint32(0)
+    eco_plan_loaded = Uint32(0)
+    if cutlass.const_expr(eco):
+        eco_epoch = ld_volatile_u32(signals + SIGNAL_OFFSETS['recv_parity'] // 4)
+        while ld_acquire_gpu_u32(signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_counts_ready']) // 4) != eco_epoch + Uint32(1):
+            pass
+        eco_trace_point(signals, 10, False, eco_trace, eco_base)
+        eco_trace_ring_point(signals, 4, block, eco_trace, eco_base)
+        eco_num_fixed = ld_volatile_u32(signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_num_fixed']) // 4)
+        for wave in cutlass.range_constexpr(
+                (local_experts + 31) // 32):
+            slot_idx = Uint32(wave * 32 + lane)
+            expert_counts[wave] = Uint32(0)
+            if slot_idx < eco_num_fixed:
+                expert_counts[wave] = ld_volatile_u32(
+                    signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_slot_count']) // 4 + slot_idx)
+    else:
+        for wave in cutlass.range_constexpr(
+                (local_experts + 31) // 32):
+            local_expert = Uint32(wave * 32 + lane)
+            count = Uint64(0)
+            if local_expert < Uint32(local_experts):
+                while Uint32(count >> 32) != Uint32(
+                        dispatch_sms * num_ranks):
+                    count = ld_volatile_u64(recv_ptr + local_expert * 2)
+            expert_counts[wave] = Uint32(count)
+        eco_trace_ring_point(signals, 4, block, eco_trace, eco_base)
     cute.arch.sync_warp()
     lane_m_blocks = Uint32(0)
     for wave in cutlass.range_constexpr(
@@ -278,6 +365,8 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
         l1_warmup = min(total_l1_waves,
                         max(Uint32(first_l2_warmup), interleave_warmup))
     l1_done = Uint32(0xffffffff)
+    # Typed before the loop for both count-loading paths (CuTe DSL joins need one type)
+    local_expert = Uint32(0)
     scheduling = True
     while scheduling:
         wait_task_slot(empty, iteration)
@@ -286,6 +375,12 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
             if l1_warmup != l1_done and l1_warmup > 0:
                 l1_warmup -= Uint32(1)
                 task_idx = claim_task(l1_count_ptr, Int32(lane))
+                if cutlass.const_expr(eco):
+                    if eco_plan_loaded == Uint32(0) and task_idx >= routed_m_blocks * l1_clusters:
+                        routed_m_blocks = eco_load_replicas(
+                            signals, rank_idx, eco_epoch, eco_num_fixed, expert_counts, Int32(lane),
+                            local_experts, block_m, eco_base, eco_trace, block)
+                        eco_plan_loaded = Uint32(1)
                 if task_idx >= routed_m_blocks * l1_clusters:
                     l1_warmup = l1_done
                 else:
@@ -303,6 +398,12 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                     fetching = False
             else:
                 task_idx = claim_task(l2_count_ptr, Int32(lane))
+                if cutlass.const_expr(eco):
+                    if eco_plan_loaded == Uint32(0) and task_idx >= routed_m_blocks * l2_clusters:
+                        routed_m_blocks = eco_load_replicas(
+                            signals, rank_idx, eco_epoch, eco_num_fixed, expert_counts, Int32(lane),
+                            local_experts, block_m, eco_base, eco_trace, block)
+                        eco_plan_loaded = Uint32(1)
                 if task_idx >= routed_m_blocks * l2_clusters:
                     scheduling = False
                     fetching = False

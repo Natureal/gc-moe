@@ -474,3 +474,31 @@ def ld_shared_u32x4_sm90(ptr: cute.Pointer, *, loc=None, ip=None):
         '=r,=r,=r,=r,r,~{memory}', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
     return tuple(Uint32(llvm.extractvalue(T.i32(), result, [i])) for i in range(4))
+
+
+@dsl_user_op
+def red_global_min_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'red.global.min.u64 [$0], $1;', 'l,l',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def red_global_max_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'red.global.max.u64 [$0], $1;', 'l,l',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def atom_max_u32_global(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'red.global.max.u32 [$0], $1;', 'l,r',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def st_global_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'st.global.u32 [$0], $1;', 'l,r',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)

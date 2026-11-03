@@ -20,17 +20,21 @@ ECO_UNIT_THREADS = 576
 ECO_TIME_WEIGHTS = {16: (249, 140), 32: (272, 117), 64: (260, 111), 96: (335, 38), 128: (293, 52)}
 
 
-def eco_unit_config(num_ranks: int, block_m: int) -> tuple:
+def eco_unit_config(num_ranks: int, block_m: int, extra_slots: int = 0) -> tuple:
     """Plan role build for an EP size and the call's block M (gc-moe's choice; the plan unit): (block M, block weight
     wb, active-slot weight wa, warm auction rounds, cold auction rounds, two-hop rounds). The planner minimizes the
     slowest rank's time wb * blocks + wa * active slots + tokens; GC_MOE_ECO_OBJECTIVE=token balances the tokens alone
     (wb = wa = 0, two rounds up to EP16). Dense rank graphs (<= 32 ranks) need one-hop rounds only; EP64 starts with
-    two two-hop rounds. GC_MOE_ECO_UNIT_CFG overrides (wb, wa, warm rounds, cold rounds, two-hop rounds)."""
+    two two-hop rounds, then scales warm rounds down with the replica slots per rank (`extra_slots`): each round's
+    cost grows with the relief-pair table while the dispatch warps need the plan at a fixed point (~34us into a
+    128-token call), so rounds must fit that window. GC_MOE_ECO_UNIT_CFG overrides (wb, wa, warm rounds, cold
+    rounds, two-hop rounds)."""
     if os.environ.get('GC_MOE_ECO_UNIT_CFG'):
         return (block_m,) + tuple(int(x) for x in os.environ['GC_MOE_ECO_UNIT_CFG'].split(','))
     token = os.environ.get('GC_MOE_ECO_OBJECTIVE', 'time') == 'token'
     wb, wa = (0, 0) if token else ECO_TIME_WEIGHTS[min(ECO_TIME_WEIGHTS, key=lambda b: (abs(b - block_m), b))]
-    nr, hop2 = (1 + token, 0) if num_ranks <= 16 else (2, 0) if num_ranks <= 32 else (3, 2)
+    nr, hop2 = (1 + token, 0) if num_ranks <= 16 else (2, 0) if num_ranks <= 32 else (
+        (3, 2) if extra_slots <= num_ranks else (2, 2) if extra_slots <= 3 * num_ranks else (1, 2))
     return (block_m, wb, wa, nr, 6, hop2)
 # Timeline trace slots (globaltimer ns, GC_MOE_ECO_TRACE=1): mode store / min / max
 ECO_TRACE_SLOTS = {

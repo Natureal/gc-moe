@@ -28,6 +28,7 @@ class UnitPlanner:
         self.rank = np.arange(self.P) // self.S
         self.bm, self.wb, self.wa = block_m, wb, wa
         self.nr, self.nr_cold, self.hop2_rounds = rounds, cold_rounds, hop2_rounds
+        self.last_rounds = 0
         self.slack = wb + block_m + wa
         self.active = np.ones(self.P, bool)
         self.slot_of = np.zeros(self.E, np.int64)
@@ -175,6 +176,7 @@ class UnitPlanner:
     # ---- auction rounds ----------------------------------------------------------------------------------------
     def _rounds(self, nr):
         for k in range(nr):
+            self.last_rounds = k + 1
             if self._auction_round(k < self.hop2_rounds) == 0:
                 break
         return self.quota()

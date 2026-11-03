@@ -489,9 +489,8 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             milestone(32);
         // The picks are the delta smallest elements of the copies' merged arithmetic sequences
         // (tr + i*kUnit, lowest index on ties): closed form via the threshold T*. Each lane replays its whole
-        // expert locally — loads all copies from shared memory, then a plain binary search with no collectives.
+        // expert locally — loads all copies from shared memory, then straight-line math with no loop.
         for (int g = tid; g < NS; g += kPlanThreads) {
-            const long long tt0 = clock64();
             const int se = small_ids[g], sk = ecnt[se], so = eoff[se], stot = counts[se];
             int s4[4], trj[4], suj[4], sown = -1;
             #pragma unroll
@@ -506,36 +505,47 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             const int delta = ((stot > 0) ? (stot + kBM - 1) / kBM : 0) - (suj[0] + suj[1] + suj[2] + suj[3]);
             const bool pos = delta > 0, neg = delta < 0;
             // Copy j's elements live on levels m = trj/kUnit + i (residue rj = trj - n*kUnit orders
-            // same-level picks). The add/remove thresholds are found with a fixed-trip binary search
-            // over the small level domain — fully unrolled straight-line code, no loop.
-            int nn[4], rr[4], nmax = 0, dmin = 0x40000000;
+            // same-level picks). Both deltas are closed forms over the level domain — no search loop.
+            int nn[4], rr[4];
             #pragma unroll
             for (int j = 0; j < 4; ++ j) {
                 nn[j] = static_cast<int>(static_cast<uint32_t>(trj[j]) / kUnit);
                 rr[j] = trj[j] - nn[j] * kUnit;
-                if (j < sk) {
-                    nmax = max(nmax, nn[j]);
-                    dmin = min(dmin, nn[j] - suj[j]);
-                }
             }
             int ap[4] = {0, 0, 0, 0}, an[4] = {0, 0, 0, 0};
-            const long long tt1 = clock64();
             if (pos) {
-                // smallest m with count_below(m+1) = sum_j max(0, m+1-n_j) >= delta
-                int lo = -1, hi = nmax + delta;
-                #pragma unroll
-                for (int it = 0; it < 8; ++ it) {
-                    const int mid = lo + (hi - lo) / 2;
-                    int f = 0;
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++ j)
-                        f += (j < sk) ? max(0, mid + 1 - nn[j]) : 0;
-                    if (f >= delta)
-                        hi = mid;
-                    else
-                        lo = mid;
+                // smallest m with count_below(m+1) = sum_j max(0, m+1-n_j) >= delta. C(X) (X = m + 1) is
+                // piecewise linear: with exactly the t smallest levels a < X it reads t X - P_t, so the
+                // crossing X* = ceil((delta + P_t) / t) is a closed form per segment — no search loop.
+                int a0 = 0 < sk ? nn[0] : 0x3fffffff, a1 = 1 < sk ? nn[1] : 0x3fffffff,
+                    a2 = 2 < sk ? nn[2] : 0x3fffffff, a3 = 3 < sk ? nn[3] : 0x3fffffff;
+                if (a0 > a1) { const int t = a0; a0 = a1; a1 = t; }
+                if (a2 > a3) { const int t = a2; a2 = a3; a3 = t; }
+                if (a0 > a2) { const int t = a0; a0 = a2; a2 = t; }
+                if (a1 > a3) { const int t = a1; a1 = a3; a3 = t; }
+                if (a1 > a2) { const int t = a1; a1 = a2; a2 = t; }
+                const int p2 = a0 + a1, p3 = p2 + a2, p4 = p3 + a3;
+                int X = (delta + p4 + 3) / 4;   // the last segment (t = sk) always holds the crossing
+                if (sk == 3)
+                    X = (delta + p3 + 2) / 3;
+                else if (sk == 2)
+                    X = (delta + p2 + 1) / 2;
+                else if (sk == 1)
+                    X = delta + a0;
+                // a smaller segment wins the crossing iff its own candidate lands inside it
+                if (sk > 3) {
+                    const int x3 = (delta + p3 + 2) / 3;
+                    if (x3 >= a2 and x3 < a3)
+                        X = x3;
                 }
-                const int L = hi;
+                if (sk > 2) {
+                    const int x2 = (delta + p2 + 1) / 2;
+                    if (x2 >= a1 and x2 < a2)
+                        X = x2;
+                }
+                if (delta + a0 < a1)
+                    X = delta + a0;
+                const int L = X - 1;
                 int cbe = 0;
                 #pragma unroll
                 for (int j = 0; j < 4; ++ j)
@@ -553,21 +563,50 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 }
             } else if (neg) {
                 const int D = -delta;
-                // largest m with count_ge(m) = sum_j min(su_j, max(0, n_j-m+1)) >= D
-                int lo = dmin - 1, hi = nmax + 1;
+                // count_ge(m) = sum_j min(su_j, n_j-m+1)^+ is decreasing piecewise-linear in m with
+                // breaks only at n_j and d_j = n_j-su_j+1. lo = largest probed n_j with count_ge >= D
+                // brackets M; inside the bracket a linear solve plus at-most-3 straight-line
+                // saturation corrections pin M exactly — again no loop.
+                int g0 = 0, g1 = 0, g2 = 0, g3 = 0;
                 #pragma unroll
-                for (int it = 0; it < 8; ++ it) {
-                    const int mid = lo + (hi - lo) / 2;
-                    int f = 0;
+                for (int j = 0; j < 4; ++ j) {
+                    g0 += max(0, min(suj[j], nn[j] - nn[0] + 1));
+                    g1 += max(0, min(suj[j], nn[j] - nn[1] + 1));
+                    g2 += max(0, min(suj[j], nn[j] - nn[2] + 1));
+                    g3 += max(0, min(suj[j], nn[j] - nn[3] + 1));
+                }
+                int lo = -0x40000000, sat = 0, M;
+                lo = max(lo, g0 >= D ? nn[0] : -0x40000000);
+                lo = max(lo, g1 >= D ? nn[1] : -0x40000000);
+                lo = max(lo, g2 >= D ? nn[2] : -0x40000000);
+                lo = max(lo, g3 >= D ? nn[3] : -0x40000000);
+                M = lo;
+                #pragma unroll
+                for (int rep = 0; rep < 4; ++ rep) {   // copies above lo+1 contribute linearly;
+                    int S = 0, Pn = 0, u = 0;          // ones whose d_j exceeds the solve saturate
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++ j) {
+                        const bool lin = j < sk and nn[j] >= lo + 1 and !((sat >> j) & 1);
+                        S += ((sat >> j) & 1) ? suj[j] : 0;
+                        Pn += lin ? nn[j] + 1 : 0;
+                        u += lin;
+                    }
+                    if (u == 0)
+                        break;
+                    const int v = Pn + S - D;   // floor division (v may be negative)
+                    const int m0 = v >= 0 ? v / u : -((-v + u - 1) / u);
+                    if (m0 <= lo)
+                        break;
+                    int vio = 0;
                     #pragma unroll
                     for (int j = 0; j < 4; ++ j)
-                        f += (j < sk) ? max(0, min(suj[j], nn[j] - mid + 1)) : 0;
-                    if (f >= D)
-                        lo = mid;
-                    else
-                        hi = mid;
+                        vio |= (j < sk and nn[j] >= lo + 1 and !((sat >> j) & 1) and nn[j] - suj[j] + 1 > m0) ? (1 << j) : 0;
+                    if (vio == 0) {
+                        M = m0;
+                        break;
+                    }
+                    sat |= vio;
                 }
-                const int M = lo;
                 int cab = 0;
                 #pragma unroll
                 for (int j = 0; j < 4; ++ j)
@@ -607,12 +646,6 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 if (s4[j] >= 0) {
                     y[s4[j]] = sun[j] - (j == sown); pf[s4[j]] = j == sown;
                 }
-            if (stats != nullptr) {
-                const long long tt2 = clock64();
-                stats[kP / kR + 400 + tid] = static_cast<int>(tt2 - tt0);   // whole expert, per lane
-                stats[kP / kR + 1400 + tid] = static_cast<int>(tt1 - tt0);
-                stats[kP / kR + 2000 + tid] = static_cast<int>(tt2 - tt1);                  // search+tails
-            }
         }
         if (tid == 0)
             milestone(37);

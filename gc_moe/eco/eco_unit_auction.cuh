@@ -220,9 +220,20 @@
                     const int s0 = i < n ? elist[eb + i] : -1;
                     const uint64_t key = s0 >= 0 ? ckey[s0] : ~0ull;
                     int excl = 0;
-                    for (int j = 0; j < n; ++ j) {   // only the rank's emitted slots can have a smaller key
-                        const int jt = elist[eb + j];
-                        excl += ckey[jt] < key ? csh[jt] : 0;
+                    if ((kGS & (kGS - 1)) == 0 and n <= static_cast<int>(kGS)) {   // the whole rival set sits on
+                        const int myc = s0 >= 0 ? csh[s0] : 0;   // group lanes: rotate the (key, add) pairs
+                        #pragma unroll                               // through the group instead of a serial scan
+                        for (int d = 1; d < static_cast<int>(kGS); ++ d) {
+                            const int src = (pos + d) & (static_cast<int>(kGS) - 1);
+                            const uint64_t kj = __shfl_sync(~0u, key, grp * static_cast<int>(kGS) + src);
+                            const int cj = __shfl_sync(~0u, myc, grp * static_cast<int>(kGS) + src);
+                            excl += kj < key ? cj : 0;
+                        }
+                    } else {   // only the rank's emitted slots can have a smaller key
+                        for (int j = 0; j < n; ++ j) {
+                            const int jt = elist[eb + j];
+                            excl += ckey[jt] < key ? csh[jt] : 0;
+                        }
                     }
                     bool emit = false;
                     uint64_t ok = 0;

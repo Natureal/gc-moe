@@ -83,6 +83,7 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     // Count gathering
     __shared__ alignas(16) uint16_t counts[kE];
     __shared__ alignas(16) uint32_t route_count[kE];
+    __shared__ alignas(16) uint32_t sums[kE];   // global per-expert totals (count scan; separate so polling can start while other threads still write rows)
     // Static tables: active copies expert-major ascending in `cslot`; per slot: logical expert, active copy count of
     // its expert (0: passive), start of its expert's list; replicated experts split into small (<= 4 copies) / big
     __shared__ alignas(16) int phy[kP], clen[kP], cst[kP], cslot[kP], ecnt[kE], eoff[kE];
@@ -275,7 +276,7 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         constexpr uint32_t kVectors = kE / 8;
         const uint32_t helper = tid - 32;
         for (uint32_t e = helper; e < kE; e += kHelpers)
-            route_count[e] = 0;
+            route_count[e] = sums[e] = 0;
         helper_sync();
         for (uint32_t i = helper; i < num_routes; i += kHelpers) {
             const auto e = static_cast<uint64_t>(__ldg(routes + i));
@@ -296,13 +297,9 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         if (helper == 0)
             milestone(17);
         // A thread owns one 8-expert column (16-byte loads, polled until all eight entries carry this call's tag)
-        // over a strided subset of the sources
+        // over a strided subset of the sources; no barrier after the row writes so early threads poll immediately
         const auto* table = reinterpret_cast<const uint4*>(buffer + OFF_ECO_COUNTS + gen * kR * kP * 2);
         constexpr uint32_t kSplit = kHelpers / kVectors > 0 ? kHelpers / kVectors : 1;
-        helper_sync();
-        for (uint32_t e = helper; e < kE; e += kHelpers)
-            route_count[e] = 0;
-        helper_sync();
         for (uint32_t item = helper; item < kVectors * kSplit; item += kHelpers) {
             const uint32_t v = item % kVectors, part = item / kVectors;
             uint32_t sum[8] = {};
@@ -319,11 +316,24 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                     const uint32_t src = src0 + b * kSplit;
                     w[b] = src < kR ? __ldcg(table + src * (kP / 8) + v) : make_uint4(tag2, tag2, tag2, tag2);
                 }
+                // Re-poll every stale source in parallel each round: late rows then cost one extra
+                // round trip per generation of arrivals, not one per source position.
+                uint32_t pending = 0;
+                #pragma unroll
+                for (uint32_t b = 0; b < kBatchSrc; ++ b)
+                    pending |= stale(w[b]) ? (1u << b) : 0u;
+                while (pending != 0) {
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kBatchSrc; ++ b)
+                        if (pending & (1u << b))
+                            w[b] = ld_volatile_v4(table + (src0 + b * kSplit) * (kP / 8) + v);
+                    pending = 0;
+                    #pragma unroll
+                    for (uint32_t b = 0; b < kBatchSrc; ++ b)
+                        pending |= stale(w[b]) ? (1u << b) : 0u;
+                }
                 #pragma unroll
                 for (uint32_t b = 0; b < kBatchSrc; ++ b) {
-                    const uint32_t src = src0 + b * kSplit;
-                    while (stale(w[b]))
-                        w[b] = ld_volatile_v4(table + src * (kP / 8) + v);
                     const uint32_t ws[4] = {w[b].x, w[b].y, w[b].z, w[b].w};
                     #pragma unroll
                     for (uint32_t k = 0; k < 4; ++ k)
@@ -332,13 +342,13 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             }
             #pragma unroll
             for (uint32_t k = 0; k < 8; ++ k)
-                atomicAdd(route_count + v * 8 + k, sum[k]);
+                atomicAdd(sums + v * 8 + k, sum[k]);
         }
         if (helper == 0)
             milestone(18);
         helper_sync();
         for (uint32_t e = helper; e < kE; e += kHelpers)
-            counts[e] = static_cast<uint16_t>(route_count[e]);
+            counts[e] = static_cast<uint16_t>(sums[e]);
         // This rank's single-copy slot totals for the compute role (its scheduler starts on them before the rank
         // barrier, like plain GC's receive counts)
         helper_sync();

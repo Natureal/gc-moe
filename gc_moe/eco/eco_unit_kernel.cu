@@ -417,9 +417,14 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     // each (lane = copy). A lane replays its whole expert locally — the planning phase uses no collectives.
     int bp[kBigPerWarp], bq[kBigPerWarp], bk[kBigPerWarp], btot[kBigPerWarp];
     bool bvalid[kBigPerWarp], bon[kBigPerWarp];
+    // Hand big experts to the warps the small experts leave idle (small experts sit one per lane, on the
+    // first ceil(NS/32) warps), so the big-expert work overlaps the small-expert passes instead of
+    // stacking behind them.
+    const int bw = (NS + 31) / 32;
     #pragma unroll
     for (uint32_t i = 0; i < kBigPerWarp; ++ i) {
-        const int g = static_cast<int>(warp + kPlanWarps * i);
+        const int g = (static_cast<int>(warp) - bw + static_cast<int>(kPlanWarps)) % static_cast<int>(kPlanWarps) +
+                      static_cast<int>(kPlanWarps) * i;
         bvalid[i] = g < NB;
         const int e = bvalid[i] ? big_ids[g] : 0;
         bk[i] = bvalid[i] ? ecnt[e] : 0;
@@ -651,7 +656,8 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             milestone(37);
         if (stats != nullptr and lane == 0)
             atomicMax(stats + kP / kR + 52 + warp, static_cast<int>((clock64() - t_entry) / 16));
-        plan_sync();
+        // No barrier here: big-expert slots are disjoint from the small experts' and live on the warps
+        // the small pass left idle, so the two passes run concurrently (same split as the cold path).
         if (tid == 0)
             milestone(34);
         #pragma unroll

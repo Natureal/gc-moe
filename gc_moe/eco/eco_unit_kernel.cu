@@ -49,7 +49,6 @@ __device__ __forceinline__ void helper_sync() { __syncwarp(); asm volatile("bar.
 __device__ __forceinline__ void index_sync() { __syncwarp(); asm volatile("bar.sync 3, 64;" ::: "memory"); }
 __device__ __forceinline__ void stage_sync() { __syncwarp(); asm volatile("bar.sync 4, 96;" ::: "memory"); }
 __device__ __forceinline__ void rows_sync() { __syncwarp(); asm volatile("bar.sync 5, 544;" ::: "memory"); }
-
 __device__ __forceinline__ void st_release_gpu(uint32_t* ptr, const uint32_t& value) {
     asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
 }
@@ -104,6 +103,10 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     __shared__ int din2[kR], dip[kR];           // decoded best outflow: receiver time increase, partial flag
     __shared__ int rcnt[kR], rfill[kR], rbs[kR];   // offers per receiver, its segment fill and base
     __shared__ int Ts[kR];                      // one-hop rounds: the round's rank times (moves apply concurrently)
+    static constexpr int kEmW = (kP / kR + 31) / 32;
+    __shared__ uint32_t emask[kR * kEmW];       // per rank: bitmask of slots that got a candidate key this round
+    __shared__ uint16_t elist[kP];              // per rank: the emitted source slots, compacted (dedup via emask)
+    __shared__ int ecntr[kR];                   // per rank: emitted count
 #if ECO_R <= 32
     __shared__ alignas(16) uint64_t ckey2[kP];  // one-hop rounds: the second candidate key buffer
 #endif
@@ -273,6 +276,8 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         // The count rows go out on the two index warps (idle after staging): their posted remote stores' fabric
         // drain then stalls only these warps' LSU path, not the helpers' polls and shared-memory plan work.
         rows_sync();   // route_count[] complete (helpers arrive once counting is done)
+        if (stats != nullptr and lane == 0)
+            stats[kP / kR + 44 + warp] = 21;
         constexpr uint32_t kVectors = kE / 8;
         const uint32_t tag = (epoch / 2) % 3 + 1, tag2 = (tag << 14) | (tag << 30);
         const auto pack = [&](const uint32_t& e) { return tag2 | route_count[e] | (route_count[e + 1] << 16); };
@@ -300,7 +305,11 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 atomicAdd(route_count + e, 1u);
         }
         helper_sync();
+        if (stats != nullptr and lane == 0)
+            stats[kP / kR + 44 + warp] = 10;
         rows_sync();   // hand route_count[] to the index warps; they issue this rank's remote row stores
+        if (stats != nullptr and lane == 0)
+            stats[kP / kR + 44 + warp] = 11;
         if (helper == 0)
             milestone(16);
         // Entries `(tag << 14) | count`, eight per 16-byte store
@@ -319,6 +328,8 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             };
             constexpr uint32_t kBatchSrc = 8;
             for (uint32_t src0 = part; src0 < kR; src0 += kSplit * kBatchSrc) {
+                if (stats != nullptr and lane == 0)
+                    stats[kP / kR + 80 + warp] = item * 64 + src0;
                 uint4 w[kBatchSrc];
                 #pragma unroll
                 for (uint32_t b = 0; b < kBatchSrc; ++ b) {
@@ -353,6 +364,8 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             for (uint32_t k = 0; k < 8; ++ k)
                 atomicAdd(sums + v * 8 + k, sum[k]);
         }
+        if (stats != nullptr and lane == 0)
+            stats[kP / kR + 80 + warp] = 0xffff;
         if (helper == 0)
             milestone(18);
         helper_sync();
@@ -398,14 +411,10 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 atomicAdd(&T0[s / kS], pcost(y[s], pf[s], rm[s]));
         }
     }
-    // Small replicated experts: one thread each (registers); big ones: a warp each (lane = copy)
-    const bool sm_on = tid < static_cast<uint32_t>(NS);
-    const int se = sm_on ? small_ids[tid] : 0, sk = sm_on ? ecnt[se] : 0, so = sm_on ? eoff[se] : 0;
-    const int stot = sm_on ? counts[se] : 0;
-    int sp[4], sq[4];
-    #pragma unroll
-    for (int j = 0; j < 4; ++ j)
-        sp[j] = j < sk ? cslot[so + j] : 0;
+    if (tid == 0)
+        milestone(31);
+    // Small replicated experts: one lane each, striding when there are more than kPlanThreads; big ones: a warp
+    // each (lane = copy). A lane replays its whole expert locally — the planning phase uses no collectives.
     int bp[kBigPerWarp], bq[kBigPerWarp], bk[kBigPerWarp], btot[kBigPerWarp];
     bool bvalid[kBigPerWarp], bon[kBigPerWarp];
     #pragma unroll
@@ -425,31 +434,30 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         // copies with the lowest estimate (+ own additions) or remove them from the highest (+ own removals); the
         // partial stays with its owner while it holds a unit, else goes to the holding copy with the highest estimate
         constexpr int kUnit = kWB + kBM;
-        int su[4] = {0, 0, 0, 0}, sown = -1;
-        if (sm_on) {
-            if (stot > 0) {
-                const int npv = pcnt[se], kp = (npv + kBM - 1) / kBM;
-                if (kp > 0) {
-                    const int remp = npv - (kp - 1) * kBM;
-                    #pragma unroll
-                    for (int j = 0; j < 4; ++ j) {
-                        const int qs = j < sk ? q[sp[j]] : 0;
-                        if (j < sk and sown < 0 and qs >= remp and (qs - remp) % kBM == 0)
-                            sown = j;
-                    }
-                    if (sown >= 0) {
-                        #pragma unroll
-                        for (int j = 0; j < 4; ++ j)
-                            su[j] = j < sk ? (q[sp[j]] - (j == sown ? remp : 0)) / kBM + (j == sown) : 0;
-                    }
-                }
-            }
+        for (int g = tid; g < NS; g += kPlanThreads) {   // one lane per small expert
+            const int se = small_ids[g], sk = ecnt[se], so = eoff[se], stot = counts[se];
+            int s4[4];
             #pragma unroll
             for (int j = 0; j < 4; ++ j)
-                if (j < sk) {
-                    const int yy = sown >= 0 ? su[j] - (j == sown) : 0, pp = j == sown;
-                    y[sp[j]] = yy; pf[sp[j]] = pp;
-                    atomicAdd(&T0[sp[j] / kS], pcost(yy, pp, stot > 0 ? stot - ((stot + kBM - 1) / kBM - 1) * kBM : 0));
+                s4[j] = (j < sk) ? cslot[so + j] : -1;
+            const int npv = stot > 0 ? pcnt[se] : 0, kp = (npv + kBM - 1) / kBM;
+            const int remp = npv - (kp - 1) * kBM;
+            int sown = -1;
+            #pragma unroll
+            for (int j = 0; j < 4; ++ j) {   // the previous partial's owner: first copy with a congruent quota
+                const int qs = s4[j] >= 0 ? q[s4[j]] : 0;
+                if (sown < 0 and s4[j] >= 0 and kp > 0 and qs >= remp and (qs - remp) % kBM == 0)
+                    sown = j;
+            }
+            const int rm = stot > 0 ? stot - ((stot + kBM - 1) / kBM - 1) * kBM : 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++ j)
+                if (s4[j] >= 0) {
+                    const int qs = q[s4[j]];
+                    const int suj = sown >= 0 ? (qs - (j == sown ? remp : 0)) / kBM + (j == sown) : 0;
+                    const int yy = suj - (j == sown), pp = j == sown;
+                    y[s4[j]] = yy; pf[s4[j]] = pp;
+                    atomicAdd(&T0[s4[j] / kS], pcost(yy, pp, rm));
                 }
         }
         int bu[kBigPerWarp], bown[kBigPerWarp];
@@ -477,61 +485,142 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             }
         }
         plan_sync();
-        if (sm_on and stot > 0) {
-            int add[4] = {0, 0, 0, 0}, tr[4];
+        if (tid == 0)
+            milestone(32);
+        // The picks are the delta smallest elements of the copies' merged arithmetic sequences
+        // (tr + i*kUnit, lowest index on ties): closed form via the threshold T*. Each lane replays its whole
+        // expert locally — loads all copies from shared memory, then a plain binary search with no collectives.
+        for (int g = tid; g < NS; g += kPlanThreads) {
+            const long long tt0 = clock64();
+            const int se = small_ids[g], sk = ecnt[se], so = eoff[se], stot = counts[se];
+            int s4[4], trj[4], suj[4], sown = -1;
             #pragma unroll
-            for (int j = 0; j < 4; ++ j)
-                tr[j] = j < sk ? T0[sp[j] / kS] : 0;
-            int delta = (stot + kBM - 1) / kBM - (su[0] + su[1] + su[2] + su[3]);
-            for (; delta > 0; -- delta) {
-                int jb = -1, vb = 0;
-                #pragma unroll
-                for (int j = 0; j < 4; ++ j) {
-                    const int v = tr[j] + add[j] * kUnit;
-                    if (j < sk and (jb < 0 or v < vb)) {
-                        jb = j; vb = v;
-                    }
-                }
-                #pragma unroll
-                for (int j = 0; j < 4; ++ j)
-                    if (j == jb) {
-                        ++ su[j]; ++ add[j];
-                    }
+            for (int j = 0; j < 4; ++ j) {
+                s4[j] = (j < sk) ? cslot[so + j] : -1;
+                const bool on = s4[j] >= 0;
+                trj[j] = on ? T0[s4[j] / kS] : 0;
+                suj[j] = on ? y[s4[j]] + (pf[s4[j]] != 0 ? 1 : 0) : 0;
+                if (on and pf[s4[j]] and sown < 0)
+                    sown = j;
             }
-            for (; delta < 0; ++ delta) {
-                int jb = -1, vb = 0;
-                #pragma unroll
-                for (int j = 0; j < 4; ++ j) {
-                    const int v = tr[j] + add[j] * kUnit;
-                    if (j < sk and su[j] > 0 and (jb < 0 or v > vb)) {
-                        jb = j; vb = v;
-                    }
-                }
-                #pragma unroll
-                for (int j = 0; j < 4; ++ j)
-                    if (j == jb) {
-                        -- su[j]; -- add[j];
-                    }
-            }
-            bool keep = false;
+            const int delta = ((stot > 0) ? (stot + kBM - 1) / kBM : 0) - (suj[0] + suj[1] + suj[2] + suj[3]);
+            const bool pos = delta > 0, neg = delta < 0;
+            // Copy j's elements live on levels m = trj/kUnit + i (residue rj = trj - n*kUnit orders
+            // same-level picks). The add/remove thresholds are found with a fixed-trip binary search
+            // over the small level domain — fully unrolled straight-line code, no loop.
+            int nn[4], rr[4], nmax = 0, dmin = 0x40000000;
             #pragma unroll
-            for (int j = 0; j < 4; ++ j)
-                keep |= j == sown and su[j] > 0;
-            if (not keep) {
-                int jb = -1, vb = 0;
-                #pragma unroll
-                for (int j = 0; j < 4; ++ j)
-                    if (j < sk and su[j] > 0 and (jb < 0 or tr[j] > vb)) {
-                        jb = j; vb = tr[j];
-                    }
-                sown = jb;
-            }
-            #pragma unroll
-            for (int j = 0; j < 4; ++ j)
+            for (int j = 0; j < 4; ++ j) {
+                nn[j] = static_cast<int>(static_cast<uint32_t>(trj[j]) / kUnit);
+                rr[j] = trj[j] - nn[j] * kUnit;
                 if (j < sk) {
-                    y[sp[j]] = su[j] - (j == sown); pf[sp[j]] = j == sown;
+                    nmax = max(nmax, nn[j]);
+                    dmin = min(dmin, nn[j] - suj[j]);
                 }
+            }
+            int ap[4] = {0, 0, 0, 0}, an[4] = {0, 0, 0, 0};
+            const long long tt1 = clock64();
+            if (pos) {
+                // smallest m with count_below(m+1) = sum_j max(0, m+1-n_j) >= delta
+                int lo = -1, hi = nmax + delta;
+                #pragma unroll
+                for (int it = 0; it < 8; ++ it) {
+                    const int mid = lo + (hi - lo) / 2;
+                    int f = 0;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++ j)
+                        f += (j < sk) ? max(0, mid + 1 - nn[j]) : 0;
+                    if (f >= delta)
+                        hi = mid;
+                    else
+                        lo = mid;
+                }
+                const int L = hi;
+                int cbe = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++ j)
+                    cbe += (j < sk) ? max(0, L - nn[j]) : 0;
+                const int rho = delta - cbe - 1;
+                #pragma unroll
+                for (int j = 0; j < 4; ++ j) {
+                    if (j < sk and nn[j] <= L) {
+                        int rk = 0;
+                        #pragma unroll
+                        for (int i = 0; i < 4; ++ i)
+                            rk += (i != j and i < sk and nn[i] <= L and (rr[i] < rr[j] or (rr[i] == rr[j] and i < j)));
+                        ap[j] = L - nn[j] + (rk <= rho);
+                    }
+                }
+            } else if (neg) {
+                const int D = -delta;
+                // largest m with count_ge(m) = sum_j min(su_j, max(0, n_j-m+1)) >= D
+                int lo = dmin - 1, hi = nmax + 1;
+                #pragma unroll
+                for (int it = 0; it < 8; ++ it) {
+                    const int mid = lo + (hi - lo) / 2;
+                    int f = 0;
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++ j)
+                        f += (j < sk) ? max(0, min(suj[j], nn[j] - mid + 1)) : 0;
+                    if (f >= D)
+                        lo = mid;
+                    else
+                        hi = mid;
+                }
+                const int M = lo;
+                int cab = 0;
+                #pragma unroll
+                for (int j = 0; j < 4; ++ j)
+                    cab += (j < sk) ? min(suj[j], max(0, nn[j] - M)) : 0;
+                const int rho = D - cab;
+                #pragma unroll
+                for (int j = 0; j < 4; ++ j) {
+                    if (j < sk) {
+                        an[j] = min(suj[j], max(0, nn[j] - M));
+                        if (M <= nn[j] and nn[j] - suj[j] + 1 <= M) {
+                            int rk = 0;
+                            #pragma unroll
+                            for (int i = 0; i < 4; ++ i)
+                                rk += (i != j and i < sk and M <= nn[i] and nn[i] - suj[i] + 1 <= M and
+                                       (rr[i] > rr[j] or (rr[i] == rr[j] and i < j)));
+                            an[j] += rk < rho;
+                        }
+                    }
+                }
+            }
+            int sun[4];
+            #pragma unroll
+            for (int j = 0; j < 4; ++ j)
+                sun[j] = suj[j] + ap[j] - an[j];
+            const bool lost = stot > 0 and
+                              not ((sown == 0 and sun[0] > 0) or (sown == 1 and sun[1] > 0) or
+                                   (sown == 2 and sun[2] > 0) or (sown == 3 and sun[3] > 0));
+            uint32_t pk = 0;
+            pk = max(pk, (0 < sk and sun[0] > 0) ? (static_cast<uint32_t>(trj[0]) << 2 | 3u) : 0u);
+            pk = max(pk, (1 < sk and sun[1] > 0) ? (static_cast<uint32_t>(trj[1]) << 2 | 2u) : 0u);
+            pk = max(pk, (2 < sk and sun[2] > 0) ? (static_cast<uint32_t>(trj[2]) << 2 | 1u) : 0u);
+            pk = max(pk, (3 < sk and sun[3] > 0) ? (static_cast<uint32_t>(trj[3]) << 2 | 0u) : 0u);
+            if (lost)   // partial's owner lost all its units: it goes to the holding copy with the highest estimate
+                sown = 3 - static_cast<int>(pk & 3u);
+            #pragma unroll
+            for (int j = 0; j < 4; ++ j)
+                if (s4[j] >= 0) {
+                    y[s4[j]] = sun[j] - (j == sown); pf[s4[j]] = j == sown;
+                }
+            if (stats != nullptr) {
+                const long long tt2 = clock64();
+                stats[kP / kR + 400 + tid] = static_cast<int>(tt2 - tt0);   // whole expert, per lane
+                stats[kP / kR + 1400 + tid] = static_cast<int>(tt1 - tt0);
+                stats[kP / kR + 2000 + tid] = static_cast<int>(tt2 - tt1);                  // search+tails
+            }
         }
+        if (tid == 0)
+            milestone(37);
+        if (stats != nullptr and lane == 0)
+            atomicMax(stats + kP / kR + 52 + warp, static_cast<int>((clock64() - t_entry) / 16));
+        plan_sync();
+        if (tid == 0)
+            milestone(34);
         #pragma unroll
         for (uint32_t i = 0; i < kBigPerWarp; ++ i) {
             if (not bvalid[i] or btot[i] == 0)
@@ -539,17 +628,44 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             const int tr = bon[i] ? T0[bp[i] / kS] : 0;
             int add = 0, u = bu[i];
             int delta = (btot[i] + kBM - 1) / kBM - __reduce_add_sync(~0u, bon[i] ? u : 0);
-            for (; delta > 0; -- delta) {
-                const uint32_t mk = __reduce_min_sync(~0u, bon[i] ? ((static_cast<uint32_t>(tr + add * kUnit) << 5) | lane) : ~0u);
-                if (lane == (mk & 31)) {
-                    ++ u; ++ add;
+            // Same closed form as the small experts: the picks are the delta smallest (largest, when removing)
+            // elements of the lanes' merged arithmetic sequences, the threshold found by binary search
+            if (delta > 0) {
+                int lo = __reduce_min_sync(~0u, bon[i] ? tr : 0x7fffffff), hi = lo + delta * kUnit;
+                while (lo < hi) {
+                    const int mid = lo + (hi - lo) / 2;
+                    if (__reduce_add_sync(~0u, (bon[i] and tr <= mid) ? static_cast<uint32_t>(mid - tr) / kUnit + 1 : 0) >= delta)
+                        hi = mid;
+                    else
+                        lo = mid + 1;
                 }
-            }
-            for (; delta < 0; ++ delta) {
-                const uint32_t mk = __reduce_max_sync(~0u, (bon[i] and u > 0) ? ((static_cast<uint32_t>(tr + add * kUnit) << 5) | (31 - lane)) : 0u);
-                if (lane == 31 - (mk & 31)) {
-                    -- u; -- add;
+                const int tt = lo;
+                add = (bon[i] and tr <= tt - 1) ? static_cast<uint32_t>(tt - 1 - tr) / kUnit + 1 : 0;
+                int rem = delta - __reduce_add_sync(~0u, add);
+                const uint32_t bal = __ballot_sync(~0u, bon[i] and tr + add * kUnit == tt);
+                if (bon[i] and tr + add * kUnit == tt and static_cast<int>(__popc(bal & ((1u << lane) - 1))) < rem)
+                    ++ add;
+                u += add;
+            } else if (delta < 0) {
+                delta = -delta;
+                int lo = __reduce_min_sync(~0u, (bon[i] and u > 0) ? tr - (u - 1) * kUnit : 0x7fffffff);
+                int hi = __reduce_max_sync(~0u, (bon[i] and u > 0) ? tr : 0);
+                while (lo < hi) {
+                    const int mid = lo + (hi - lo + 1) / 2;
+                    if (__reduce_add_sync(~0u, (bon[i] and u > 0 and tr >= mid) ? min(u, static_cast<int>(static_cast<uint32_t>(tr - mid) / kUnit + 1)) : 0) >=
+                        delta)
+                        lo = mid;
+                    else
+                        hi = mid - 1;
                 }
+                const int tt = lo;
+                add = (bon[i] and u > 0 and tr >= tt + 1) ? min(u, static_cast<int>(static_cast<uint32_t>(tr - tt - 1) / kUnit + 1)) : 0;
+                int rem = delta - __reduce_add_sync(~0u, add);
+                const uint32_t bal = __ballot_sync(~0u, bon[i] and add < u and tr - add * kUnit == tt);
+                if (bon[i] and add < u and tr - add * kUnit == tt and
+                    static_cast<int>(__popc(bal & ((1u << lane) - 1))) < rem)
+                    ++ add;
+                u -= add;
             }
             int own = bown[i];
             if (not __any_sync(~0u, static_cast<int>(lane) == own and u > 0)) {
@@ -561,11 +677,17 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             }
         }
         plan_sync();
+        if (tid == 0)
+            milestone(33);
     } else {   // cold: an even split rounded to units
-        const int b0 = sk ? stot / sk : 0;
-        #pragma unroll
-        for (int j = 0; j < 4; ++ j)
-            sq[j] = j < sk ? b0 + (j == 0 ? stot - b0 * sk : 0) : 0;
+        for (int g = tid; g < NS; g += kPlanThreads) {
+            const int se = small_ids[g], sk = ecnt[se], so = eoff[se], stot = counts[se];
+            const int b0 = sk ? stot / sk : 0;
+            #pragma unroll
+            for (int j = 0; j < 4; ++ j)
+                if (j < sk)
+                    q[cslot[so + j]] = b0 + (j == 0 ? stot - b0 * sk : 0);
+        }
         #pragma unroll
         for (uint32_t i = 0; i < kBigPerWarp; ++ i) {
             bq[i] = 0;
@@ -574,10 +696,6 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 bq[i] = bb + (lane == 0 ? btot[i] - bb * bk[i] : 0);
             }
         }
-        #pragma unroll
-        for (int j = 0; j < 4; ++ j)
-            if (j < sk)
-                q[sp[j]] = sq[j];
         #pragma unroll
         for (uint32_t i = 0; i < kBigPerWarp; ++ i)
             if (bon[i])
@@ -590,34 +708,45 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 atomicAdd(&T0[s / kS], kWB * ((x + kBM - 1) / kBM) + kWA + x);
         }
         plan_sync();
+        if (stats != nullptr) {
+            if (tid < kR)
+                stats[kP / kR + 160 + tid] = T0[tid];
+            for (uint32_t s = tid; s < kP; s += kPlanThreads)
+                stats[kP / kR + 3000 + s] = q[s];
+        }
         // Load-aware rounding to units: round up the copies with the smallest (rank time * bm - leftover * (wb + bm));
         // the partial unit goes to the rounded-up copy with the smallest leftover
-        if (sm_on) {
+        for (int g = tid; g < NS; g += kPlanThreads) {
+            const int se = small_ids[g], sk = ecnt[se], so = eoff[se], stot = counts[se];
+            int s4[4], sqv[4], key[4], g2[4];
             const int kk = (stot + kBM - 1) / kBM;
-            int g[4], key[4], left = kk;
+            int gsum = 0;
             #pragma unroll
             for (int j = 0; j < 4; ++ j) {
-                g[j] = j < sk ? sq[j] / kBM : 0;
-                left -= g[j];
-                key[j] = j < sk ? T0[sp[j] / kS] * kBM - (sq[j] % kBM) * (kWB + kBM) : 0x7fffffff;
+                s4[j] = (j < sk) ? cslot[so + j] : -1;
+                sqv[j] = s4[j] >= 0 ? q[s4[j]] : 0;
+                key[j] = s4[j] >= 0 ? T0[s4[j] / kS] * kBM - (sqv[j] % kBM) * (kWB + kBM) : 0x7fffffff;
+                g2[j] = s4[j] >= 0 ? sqv[j] / kBM : 0;
+                gsum += g2[j];
             }
-            int jp = -1, bv = 0, gp[4];
+            const int left = kk - gsum;
+            uint32_t pk = 0;
+            int gp[4];
             #pragma unroll
             for (int j = 0; j < 4; ++ j) {
                 int rk = 0;
                 #pragma unroll
-                for (int i2 = 0; i2 < 4; ++ i2)
-                    rk += (i2 != j and i2 < sk and (key[i2] < key[j] or (key[i2] == key[j] and i2 < j)));
-                gp[j] = g[j] + (j < sk and rk < left);
-                const int v = gp[j] * kBM - sq[j];
-                if (j < sk and gp[j] > 0 and (jp < 0 or v > bv)) {
-                    jp = j; bv = v;
-                }
+                for (int j2 = 0; j2 < 4; ++ j2)
+                    rk += j2 < sk and (key[j2] < key[j] or (key[j2] == key[j] and j2 < j));
+                gp[j] = g2[j] + (s4[j] >= 0 and rk < left);
+                if (s4[j] >= 0 and gp[j] > 0)
+                    pk = max(pk, (static_cast<uint32_t>(gp[j] * kBM - sqv[j] + (1 << 22)) << 2) | (3u - static_cast<uint32_t>(j)));
             }
+            const int jp = pk ? 3 - static_cast<int>(pk & 3u) : -1;
             #pragma unroll
             for (int j = 0; j < 4; ++ j)
-                if (j < sk) {
-                    y[sp[j]] = gp[j] - (j == jp); pf[sp[j]] = j == jp;
+                if (s4[j] >= 0) {
+                    y[s4[j]] = gp[j] - (j == jp); pf[s4[j]] = j == jp;
                 }
         }
         #pragma unroll
@@ -648,8 +777,10 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             atomicAdd(&T[s / kS], c);
     }
     plan_sync();
-    if (tid == 0)
+    if (tid == 0) {
+        milestone(30);
         trace_point(buffer, 17);
+    }
 
     // ---- auction rounds -----------------------------------------------------------------------------------------
     const auto mv = [&](const int& a, const int& b) {   // one unit (the partial if `a` owns it) from slot a to slot b

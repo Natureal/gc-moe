@@ -54,6 +54,10 @@
             s_noff = 0;
         for (uint32_t i = tid; i < kP; i += kPlanThreads)
             sclaim[i] = 0u;   // per slot: offered this round
+        for (uint32_t i = tid; i < kR * kEmW; i += kPlanThreads)
+            emask[i] = 0;
+        if (tid < kR)
+            ecntr[tid] = 0;
         {   // warp w owns ranks [w kRW, (w + 1) kRW): one strided loop over their pairs, per-rank minima; lane i decodes
             static constexpr uint32_t kRW = (kR + kPlanWarps - 1) / kPlanWarps;
             const uint32_t rlo = warp * kRW, rhi = min(rlo + kRW, kR);
@@ -131,6 +135,10 @@
                                      (static_cast<uint64_t>(hops - 1) << 22) | (static_cast<uint64_t>(s1) << 11) | static_cast<uint64_t>(s0);
                 atomicMin(reinterpret_cast<unsigned long long*>(&ckey[s0]), static_cast<unsigned long long>(key));
                 csh[s0] = -d0;
+                const int soff = s0 - r0 * kS;
+                const uint32_t eb = 1u << (soff & 31);
+                if ((atomicOr(&emask[r0 * kEmW + soff / 32], eb) & eb) == 0)
+                    elist[r0 * kS + atomicAdd(&ecntr[r0], 1)] = static_cast<uint16_t>(s0);
             }
         }
         plan_sync();
@@ -144,8 +152,12 @@
             if (key != ~0ull) {
                 const int r0 = static_cast<int>(s0 / kS), tmax = T[r0];
                 int excl = 0;
-                for (int j = rfirst[r0]; j < static_cast<int>((r0 + 1) * kS); ++ j)
+                const int eb = r0 * kS, en = eb + ecntr[r0];
+                #pragma unroll 4
+                for (int i = eb; i < en; ++ i) {   // only the rank's emitted slots can have a smaller key
+                    const int j = elist[i];
                     excl += ckey[j] < key ? csh[j] : 0;
+                }
                 if (excl * static_cast<int>(kR) < tmax * static_cast<int>(kR) - tot) {
                     const int v = static_cast<int>((key >> 23) & kMaxV);
                     hops = static_cast<int>((key >> 22) & 1u) + 1;
@@ -271,6 +283,10 @@
         ckey2[i] = ~0ull;
 #endif
     }
+    for (uint32_t i = tid; i < kR * kEmW; i += kPlanThreads)
+        emask[i] = 0;
+    if (tid < kR)
+        ecntr[tid] = 0;
     plan_sync();
     for (; k < nr_cap; ++ k) {
         // (C1) a thread per pair (s0 -> s1) out of a source slot; per slot the min key (== min (value, s1))
@@ -298,9 +314,17 @@
                                      (static_cast<uint64_t>(s1) << 11) | static_cast<uint64_t>(s0);
                 atomicMin(reinterpret_cast<unsigned long long*>(&kc[s0]), static_cast<unsigned long long>(key));
                 csh[s0] = -d0;
+                const int soff = s0 - r0 * kS;
+                const uint32_t eb = 1u << (soff & 31);
+                if ((atomicOr(&emask[r0 * kEmW + soff / 32], eb) & eb) == 0)
+                    elist[r0 * kS + atomicAdd(&ecntr[r0], 1)] = static_cast<uint16_t>(s0);
             }
         }
         plan_sync();
+        if (tid == 0)
+            milestone(26);
+        if (stats != nullptr and tid < kR)
+            stats[kP / kR + 2100 + tid] = ecntr[tid];
         // (C2) offered while the shed of the source's smaller keys is below its excess
         for (uint32_t sb0 = warp * 32; sb0 < kP; sb0 += kPlanThreads) {   // warp-uniform: one offer index atomic per warp
             const uint32_t s0 = sb0 + lane;
@@ -311,8 +335,12 @@
             if (key != ~0ull) {
                 const int r0 = static_cast<int>(s0 / kS), tmax = T[r0];
                 int excl = 0;
-                for (int j = rfirst[r0]; j < static_cast<int>((r0 + 1) * kS); ++ j)
+                const int eb = r0 * kS, en = eb + ecntr[r0];
+                #pragma unroll 4
+                for (int i = eb; i < en; ++ i) {   // only the rank's emitted slots can have a smaller key
+                    const int j = elist[i];
                     excl += kc[j] < key ? csh[j] : 0;
+                }
                 if (excl * static_cast<int>(kR) < tmax * static_cast<int>(kR) - tot) {
                     const int v = static_cast<int>((key >> 23) & kMaxV), s1 = static_cast<int>((key >> 11) & 2047u);
                     const int ip = pf[s0], rr = rm[s0], y1 = y[s1], p1 = pf[s1];
@@ -336,6 +364,8 @@
             }
         }
         plan_sync();
+        if (tid == 0)
+            milestone(27);
         // (F1) offers grouped by receiver (ckey / csh space: keys / adds); the next round's candidates reset after
         const int noff = s_noff;
         uint64_t* const gkey = kc;
@@ -362,6 +392,10 @@
 #if ECO_R <= 32
         for (uint32_t i = tid; i < kP; i += kPlanThreads)   // the next round's candidate buffer
             kn[i] = ~0ull;
+        for (uint32_t i = tid; i < kR * kEmW; i += kPlanThreads)   // and the next round's candidate mask
+            emask[i] = 0;
+        if (tid < kR)
+            ecntr[tid] = 0;
 #endif
         for (int i0 = static_cast<int>(warp * 32); i0 < noff; i0 += static_cast<int>(kPlanThreads)) {   // warp-uniform
             const int i = i0 + static_cast<int>(lane);
@@ -374,6 +408,8 @@
             }
         }
         plan_sync();
+        if (tid == 0)
+            milestone(28);
         // (F2) per offer: its receiver segment's smaller adds -> prefix acceptance; accepted offers move (typed)
         bool won = false;
         for (int i = static_cast<int>(tid); i < noff; i += static_cast<int>(kPlanThreads)) {
@@ -392,6 +428,8 @@
         }
         if (plan_sync_count(won) == 0)
             break;
+        if (tid == 0)
+            milestone(29);
 #if ECO_R <= 32
         uint64_t* const tb = kc;
         kc = kn; kn = tb;
@@ -399,6 +437,10 @@
         if (k + 1 < nr_cap) {   // one buffer (shared memory): clean it for the next round
             for (uint32_t i = tid; i < kP; i += kPlanThreads)
                 ckey[i] = ~0ull;
+            for (uint32_t i = tid; i < kR * kEmW; i += kPlanThreads)
+                emask[i] = 0;
+            if (tid < kR)
+                ecntr[tid] = 0;
             plan_sync();
         }
 #endif

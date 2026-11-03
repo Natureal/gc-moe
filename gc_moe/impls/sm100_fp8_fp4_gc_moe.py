@@ -555,7 +555,6 @@ class GCMoERoleKernel:
             pass
         if elect_one_sync():
             self._eco_trace_ring(signals, 2, True)  # field 2: last dispatch warp saw the plan
-        self._eco_wait_sources(signals, 'eco_reps_ready', epoch, lane)
         if elect_one_sync():
             self._eco_trace(signals, 7, 2)
             self._eco_trace_ring(signals, 5, True)  # field 5: last dispatch warp saw every source's replica indices
@@ -966,11 +965,9 @@ class GCMoERoleKernel:
                         if expert < Uint64(self.route_experts):
                             slot = atom_shared_add_u32(
                                 expert_token_count + Uint32(expert), Uint32(1))
-                            # Eight copies (16 bytes of i16 entries) per load; -1 ends the list. Only an expert with
-                            # one active copy is written here: the plan CTA writes every replicated expert's indices
+                            # Eight copies (16 bytes of i16 entries) per load; -1 ends the list. Every active copy
+                            # gets the index at the same list position (one writer per token), before the rank barrier
                             group = Uint32(0)
-                            active = Uint32(0)
-                            target = Uint32(0)
                             copying = True
                             while copying:
                                 words = ld_global_u32x4(tensor_maps.iterator + self.eco_copies_words +
@@ -979,22 +976,19 @@ class GCMoERoleKernel:
                                     raw = (words[k // 2] >> Uint32(16 * (k % 2))) & Uint32(0xffff)
                                     if raw == Uint32(0xffff):
                                         copying = False
-                                    elif (raw & Uint32(0x8000)) == Uint32(0):
-                                        active += Uint32(1)
-                                        target = raw
+                                    elif copying and (raw & Uint32(0x8000)) == Uint32(0):
+                                        dst_rank = raw // Uint32(self.local_experts)
+                                        dst_local = raw % Uint32(self.local_experts)
+                                        dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
+                                        dst_index = cute.make_ptr(
+                                            Uint32, dst_base + Uint64(SIGNAL_OFFSETS['size']) +
+                                            Uint64(((dst_local * Uint32(self.num_ranks) + rank_idx) *
+                                                    Uint32(self.capacity) + slot) * Uint32(4)),
+                                            cute.AddressSpace.gmem)
+                                        dst_index[0] = token_topk
                                 group += Uint32(1)
-                                if group == Uint32(4) or active > Uint32(1):
+                                if group == Uint32(4):
                                     copying = False
-                            if active == Uint32(1):
-                                dst_rank = target // Uint32(self.local_experts)
-                                dst_local = target % Uint32(self.local_experts)
-                                dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
-                                dst_index = cute.make_ptr(
-                                    Uint32, dst_base + Uint64(SIGNAL_OFFSETS['size']) +
-                                    Uint64(((dst_local * Uint32(self.num_ranks) + rank_idx) *
-                                            Uint32(self.capacity) + slot) * Uint32(4)),
-                                    cute.AddressSpace.gmem)
-                                dst_index[0] = token_topk
                     elif expert < Uint64(self.num_ranks * self.local_experts):
                         dst_rank = Uint32(expert) // Uint32(self.local_experts)
                         dst_local = Uint32(expert) % Uint32(self.local_experts)

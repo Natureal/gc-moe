@@ -82,7 +82,7 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 uint32_t rank, uint32_t num_tokens) {
     // Count gathering
     __shared__ alignas(16) uint16_t counts[kE];
-    __shared__ alignas(16) uint32_t route_count[kE], index_count[kE];
+    __shared__ alignas(16) uint32_t route_count[kE];
     // Static tables: active copies expert-major ascending in `cslot`; per slot: logical expert, active copy count of
     // its expert (0: passive), start of its expert's list; replicated experts split into small (<= 4 copies) / big
     __shared__ alignas(16) int phy[kP], clen[kP], cst[kP], cslot[kP], ecnt[kE], eoff[kE];
@@ -267,76 +267,8 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             milestone(22);
     }
 
-    if (warp >= kFirstIndexWarp) {
-        // Replicated experts' source indices into every active copy (one writer per (source, expert) keeps the list
-        // order identical on every copy); list positions from shared counters, copy lists as 16-byte vectors
-        constexpr uint32_t kLocal = kP / kR;
-        const uint32_t ilane = tid - kPlanThreads;
-        for (uint32_t e = ilane; e < kE; e += 32 * kIndexWarps)
-            index_count[e] = 0;
-        index_sync();
-        const auto* copies = reinterpret_cast<const uint4*>(meta + layout::EcoMeta::kHeaderSize);
-        constexpr uint32_t kGroups = layout::EcoMeta::kMaxCopies / 8;
-        const auto write_copies = [&](const uint32_t& i, const uint32_t& pos, const uint32_t& raw) {
-            const uint32_t p = raw & 0x7fffu, dst_rank = p / kLocal, dst_local = p % kLocal;
-            reinterpret_cast<uint32_t*>(peers[dst_rank] + OFF_SOURCE_IDX)[(dst_local * kR + rank) * ECO_CAPACITY + pos] = i;
-        };
-        constexpr uint32_t kRouteBatch = 8;
-        for (uint32_t i0 = ilane; i0 < num_routes; i0 += 32 * kIndexWarps * kRouteBatch) {
-            uint32_t e[kRouteBatch];
-            uint4 v[kRouteBatch];
-            #pragma unroll
-            for (uint32_t b = 0; b < kRouteBatch; ++ b) {
-                const uint32_t i = i0 + b * 32 * kIndexWarps;
-                const uint64_t r = i < num_routes ? static_cast<uint64_t>(__ldg(routes + i)) : kE;
-                e[b] = static_cast<uint32_t>(r < kE ? r : kE);
-            }
-            #pragma unroll
-            for (uint32_t b = 0; b < kRouteBatch; ++ b)
-                v[b] = e[b] < kE ? __ldg(copies + e[b] * kGroups) : make_uint4(~0u, ~0u, ~0u, ~0u);
-            #pragma unroll 1
-            for (uint32_t b = 0; b < kRouteBatch; ++ b) {
-                if (e[b] >= kE)
-                    continue;
-                uint32_t active = 0;
-                bool more = true;
-                for (uint32_t g = 0; more and g < kGroups; ++ g) {
-                    const uint4 w = g == 0 ? v[b] : __ldg(copies + e[b] * kGroups + g);
-                    const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
-                    #pragma unroll
-                    for (uint32_t k = 0; k < 8; ++ k) {
-                        const uint32_t raw = (ws[k / 2] >> (16 * (k % 2))) & 0xffffu;
-                        more &= raw != 0xffffu;
-                        active += more and (raw & 0x8000u) == 0;
-                    }
-                }
-                if (active < 2)
-                    continue;
-                const uint32_t pos = atomicAdd(index_count + e[b], 1u);
-                more = true;
-                for (uint32_t g = 0; more and g < kGroups; ++ g) {
-                    const uint4 w = g == 0 ? v[b] : __ldg(copies + e[b] * kGroups + g);
-                    const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
-                    #pragma unroll
-                    for (uint32_t k = 0; k < 8; ++ k) {
-                        const uint32_t raw = (ws[k / 2] >> (16 * (k % 2))) & 0xffffu;
-                        more &= raw != 0xffffu;
-                        if (more and (raw & 0x8000u) == 0)
-                            write_copies(i0 + b * 32 * kIndexWarps, pos, raw);
-                    }
-                }
-            }
-        }
-        __threadfence_system();
-        index_sync();
-        for (uint32_t r = ilane; r < kR; r += 32 * kIndexWarps)
-            st_release_sys(reinterpret_cast<uint32_t*>(peers[r] + OFF_ECO_REPS_READY) + rank, epoch + 1);
-        if (ilane == 0) {
-            milestone(23);
-            trace_point(buffer, 19);
-        }
+    if (warp >= kFirstIndexWarp)   // replicated experts' indices: written by the dispatch role's routing phase
         return;
-    }
 
     if (warp >= 1) {
         // ---- counts (warps 1..15): this rank's row into every peer, then every source's row summed ------------
@@ -440,6 +372,8 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             q[s] = v;
             y[s] = single and n > 0 ? (n + kBM - 1) / kBM - 1 : 0;
             pf[s] = single and n > 0;
+            if (warm and single and n > 0)   // warm start: the rank-time estimate T0, single-copy part
+                atomicAdd(&T0[s / kS], pcost(y[s], pf[s], rm[s]));
         }
     }
     // Small replicated experts: one thread each (registers); big ones: a warp each (lane = copy)
@@ -491,7 +425,9 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             #pragma unroll
             for (int j = 0; j < 4; ++ j)
                 if (j < sk) {
-                    y[sp[j]] = sown >= 0 ? su[j] - (j == sown) : 0; pf[sp[j]] = j == sown;
+                    const int yy = sown >= 0 ? su[j] - (j == sown) : 0, pp = j == sown;
+                    y[sp[j]] = yy; pf[sp[j]] = pp;
+                    atomicAdd(&T0[sp[j] / kS], pcost(yy, pp, stot > 0 ? stot - ((stot + kBM - 1) / kBM - 1) * kBM : 0));
                 }
         }
         int bu[kBigPerWarp], bown[kBigPerWarp];
@@ -512,19 +448,11 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 }
             }
             if (bon[i]) {
-                y[bp[i]] = bown[i] >= 0 ? bu[i] - (static_cast<int>(lane) == bown[i]) : 0;
-                pf[bp[i]] = static_cast<int>(lane) == bown[i];
+                const int yy = bown[i] >= 0 ? bu[i] - (static_cast<int>(lane) == bown[i]) : 0;
+                const int pp = static_cast<int>(lane) == bown[i];
+                y[bp[i]] = yy; pf[bp[i]] = pp;
+                atomicAdd(&T0[bp[i] / kS], pcost(yy, pp, btot[i] > 0 ? btot[i] - ((btot[i] + kBM - 1) / kBM - 1) * kBM : 0));
             }
-        }
-        plan_sync();
-        for (uint32_t sb0 = warp * 32; sb0 < kP; sb0 += kPlanThreads) {   // estimate T0 (lanes pre-reduce per rank)
-            const uint32_t sl = sb0 + lane;
-            const int rk = sl < kP ? static_cast<int>(sl / kS) : -1;
-            const int c = sl < kP ? pcost(y[sl], pf[sl], rm[sl]) : 0;
-            const uint32_t grp = __match_any_sync(~0u, rk);
-            const int sum = __reduce_add_sync(grp, c);
-            if (rk >= 0 and lane == static_cast<uint32_t>(__ffs(grp) - 1))
-                atomicAdd(&T0[rk], sum);
         }
         plan_sync();
         if (sm_on and stot > 0) {
@@ -720,19 +648,20 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     }
 
     // ---- publish: quotas, canonical starts within each expert's copies (ascending slots) -------------------------
-    for (uint32_t p = tid; p < kP; p += kPlanThreads)
-        y[p] = y[p] * kBM + pf[p] * rm[p];   // quota
-    plan_sync();
+    // Quotas (full units * bm + the partial unit) computed where they are read: no rewrite pass and barrier
+    const auto quota = [&](const int& c) { return y[c] * kBM + pf[c] * rm[c]; };
     auto* out_quota = signals + OFF_ECO_QUOTA / 4;
     auto* out_start = signals + OFF_ECO_QUOTA_START / 4;
     for (uint32_t p = tid; p < kP; p += kPlanThreads) {
         const int o = cst[p], k = ecnt[phy[p]];
         int start = 0;
-        for (int j = 0; j < k; ++ j) {
+        for (int j = 0; j < k; ++ j) {   // active copies ascend: the copies below p (passive copies hold nothing)
             const int c = cslot[o + j];
-            start += c < static_cast<int>(p) ? y[c] : 0;   // passive copies hold nothing
+            if (c >= static_cast<int>(p))
+                break;
+            start += quota(c);
         }
-        out_quota[p] = static_cast<uint32_t>(y[p]);
+        out_quota[p] = static_cast<uint32_t>(quota(static_cast<int>(p)));
         out_start[p] = static_cast<uint32_t>(start);
     }
     plan_sync();
@@ -753,7 +682,7 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     // slots, then the counts
     if (state != nullptr) {
         for (uint32_t p = tid; p < kP; p += kPlanThreads)
-            state[p] = static_cast<uint16_t>(clen[p] >= 2 ? y[p] : 0);
+            state[p] = static_cast<uint16_t>(clen[p] >= 2 ? quota(static_cast<int>(p)) : 0);
         for (uint32_t e = tid; e < kE; e += kPlanThreads)
             state[kP + e] = counts[e];
     }

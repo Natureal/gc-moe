@@ -74,7 +74,7 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
                   recipe: tuple[int, int, int], activation: str,
                   activation_clamp: Optional[float], fast_math: bool,
                   shared_recipe: Optional[tuple[int, int, int]],
-                  activation_alpha: Optional[float]) -> ValidatedCall:
+                  activation_alpha: Optional[float], block_m_experts: int = 0) -> ValidatedCall:
     weights = (l1_weights, l2_weights, *(weight for weight in
                (shared_l1_weights, shared_l2_weights) if weight is not None))
     if any(not isinstance(pair, (tuple, list)) or len(pair) != 2 or
@@ -123,7 +123,8 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
         if stats.dtype != torch.int32 or stats.numel() != local_e or \
                 not stats.is_cuda or not stats.is_contiguous():
             raise ValueError('stats must be contiguous CUDA int32 [local_experts]')
-    bm = get_block_m_for_gc_moe(ranks, sym_buffer.num_experts,
+    # ECO calls size blocks by the logical experts (about one active copy each); native calls by the slots
+    bm = get_block_m_for_gc_moe(ranks, block_m_experts or sym_buffer.num_experts,
                                 sym_buffer.num_max_tokens_per_rank, tokens,
                                 sym_buffer.num_topk)
     call_layout = GCBufferLayout(
@@ -162,7 +163,7 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
                            shared_l1_weights, shared_l2_weights,
                            cumulative_local_expert_recv_stats, recipe, activation,
                            activation_clamp, fast_math, shared_recipe,
-                           activation_alpha)
+                           activation_alpha, eco_logical_experts if eco_meta is not None else 0)
     call_buffer = sym_buffer._for_call(config.shared_experts)
     from ..jit_kernels.impls.sm100_fp8_fp4_gc_moe import launch_gc_moe
     launch_gc_moe(config, y, l1_weights, l2_weights, call_buffer,

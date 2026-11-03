@@ -48,6 +48,7 @@ __device__ __forceinline__ uint32_t plan_sync_count(const bool& pred) {
 __device__ __forceinline__ void helper_sync() { __syncwarp(); asm volatile("bar.sync 2, 480;" ::: "memory"); }
 __device__ __forceinline__ void index_sync() { __syncwarp(); asm volatile("bar.sync 3, 64;" ::: "memory"); }
 __device__ __forceinline__ void stage_sync() { __syncwarp(); asm volatile("bar.sync 4, 96;" ::: "memory"); }
+__device__ __forceinline__ void rows_sync() { __syncwarp(); asm volatile("bar.sync 5, 544;" ::: "memory"); }
 
 __device__ __forceinline__ void st_release_gpu(uint32_t* ptr, const uint32_t& value) {
     asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
@@ -268,8 +269,23 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             milestone(22);
     }
 
-    if (warp >= kFirstIndexWarp)   // replicated experts' indices: written by the dispatch role's routing phase
-        return;
+    if (warp >= kFirstIndexWarp) {
+        // The count rows go out on the two index warps (idle after staging): their posted remote stores' fabric
+        // drain then stalls only these warps' LSU path, not the helpers' polls and shared-memory plan work.
+        rows_sync();   // route_count[] complete (helpers arrive once counting is done)
+        constexpr uint32_t kVectors = kE / 8;
+        const uint32_t tag = (epoch / 2) % 3 + 1, tag2 = (tag << 14) | (tag << 30);
+        const auto pack = [&](const uint32_t& e) { return tag2 | route_count[e] | (route_count[e + 1] << 16); };
+        const uint32_t iw = tid - kFirstIndexWarp * 32;
+        for (uint32_t v = iw; v < kR * kVectors; v += 64) {
+            const uint32_t peer = v / kVectors, first = (v % kVectors) * 8;
+            *reinterpret_cast<uint4*>(peers[peer] + OFF_ECO_COUNTS + ((gen * kR + rank) * kP + first) * 2) =
+                make_uint4(pack(first), pack(first + 2), pack(first + 4), pack(first + 6));
+        }
+        if (tid == kFirstIndexWarp * 32)
+            milestone(17);
+        return;   // replicated experts' indices: written by the dispatch role's routing phase
+    }
 
     if (warp >= 1) {
         // ---- counts (warps 1..15): this rank's row into every peer, then every source's row summed ------------
@@ -284,18 +300,11 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 atomicAdd(route_count + e, 1u);
         }
         helper_sync();
+        rows_sync();   // hand route_count[] to the index warps; they issue this rank's remote row stores
         if (helper == 0)
             milestone(16);
         // Entries `(tag << 14) | count`, eight per 16-byte store
         const uint32_t tag = (epoch / 2) % 3 + 1, tag2 = (tag << 14) | (tag << 30);
-        const auto pack = [&](const uint32_t& e) { return tag2 | route_count[e] | (route_count[e + 1] << 16); };
-        for (uint32_t v = helper; v < kR * kVectors; v += kHelpers) {
-            const uint32_t peer = v / kVectors, first = (v % kVectors) * 8;
-            *reinterpret_cast<uint4*>(peers[peer] + OFF_ECO_COUNTS + ((gen * kR + rank) * kP + first) * 2) =
-                make_uint4(pack(first), pack(first + 2), pack(first + 4), pack(first + 6));
-        }
-        if (helper == 0)
-            milestone(17);
         // A thread owns one 8-expert column (16-byte loads, polled until all eight entries carry this call's tag)
         // over a strided subset of the sources; no barrier after the row writes so early threads poll immediately
         const auto* table = reinterpret_cast<const uint4*>(buffer + OFF_ECO_COUNTS + gen * kR * kP * 2);
@@ -359,17 +368,20 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         if (helper == 0)
             signals[OFF_ECO_NUM_FIXED / 4] = num_fixed;
         helper_sync();
-        if (helper == 0) {
-            __threadfence();
-            st_release_gpu(signals + OFF_ECO_COUNTS_READY / 4, epoch + 1);
+        if (helper == 0)
             milestone(19);
-        }
     }
 
     // ---- plan (warps 0..15) ------------------------------------------------------------------------------------
     plan_sync();
-    if (tid == 0)
+    if (tid == 0) {
+        // COUNTS_READY published by tid0 (no remote stores of its own): bar.sync makes the helpers' local signal
+        // writes CTA-visible and this fence then orders them device-wide; helper0's remote row stores stay out of
+        // the ordering so the release no longer waits for them to drain through the routing flood.
+        __threadfence();
+        st_release_gpu(signals + OFF_ECO_COUNTS_READY / 4, epoch + 1);
         trace_point(buffer, 4);
+    }
     const bool warm = s_warm != 0;
     const int NS = s_ns, NB = s_nb;
     // Single-copy slots whole (their units too); passive slots empty

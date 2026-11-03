@@ -142,7 +142,58 @@
             }
         }
         plan_sync();
-        // (C2)
+        // (C2) offer order is free (the grouping and the acceptance compare keys, not positions). With few ranks
+        // a warp per rank wins: uniform-trip shed scans whose loads all broadcast; with many ranks the lists are
+        // too short to fill a warp, so the slot-parallel scan is cheaper
+        if (kR <= 16)
+        for (uint32_t r0 = warp; r0 < kR; r0 += kPlanWarps) {
+            const int eb = static_cast<int>(r0) * kS, n = ecntr[r0], tmax = T[r0];
+            for (int base = 0; base < n; base += 32) {
+                const int i = base + static_cast<int>(lane);
+                const int s0 = i < n ? elist[eb + i] : -1;
+                const uint64_t key = s0 >= 0 ? ckey[s0] : ~0ull;
+                int excl = 0;
+                for (int j = 0; j < n; ++ j) {   // only the rank's emitted slots can have a smaller key
+                    const int jt = elist[eb + j];
+                    excl += ckey[jt] < key ? csh[jt] : 0;
+                }
+                bool emit = false;
+                uint64_t ok = 0;
+                int add = 0, r1 = 0, hops = 0;
+                if (s0 >= 0 and excl * static_cast<int>(kR) < tmax * static_cast<int>(kR) - tot) {
+                    const int v = static_cast<int>((key >> 23) & kMaxV);
+                    hops = static_cast<int>((key >> 22) & 1u) + 1;
+                    const int s1 = static_cast<int>((key >> 11) & 2047u);
+                    r1 = s1 / kS;
+                    int rcv;
+                    if (hops == 1) {
+                        const int ip = pf[s0], rr = rm[s0], y1 = y[s1], p1 = pf[s1];
+                        rcv = r1; add = pcost(y1 + (ip ? 0 : 1), p1 + ip, rr) - pcost(y1, p1, rr);
+                    } else {
+                        rcv = dr2[r1]; add = din2[r1];
+                    }
+                    ok = (static_cast<uint64_t>(rcv) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(tmax)) << 40) |
+                         (static_cast<uint64_t>(v) << 22) | (static_cast<uint64_t>(s0) << 11) | static_cast<uint64_t>(s1);
+                    emit = true;
+                }
+                const uint32_t bal = __ballot_sync(~0u, emit);
+                if (bal == 0)
+                    continue;
+                int ob = 0;
+                if (lane == static_cast<uint32_t>(__ffs(bal) - 1))
+                    ob = atomicAdd(&s_noff, __popc(bal));
+                ob = __shfl_sync(~0u, ob, __ffs(bal) - 1);
+                if (emit) {
+                    const int idx = ob + __popc(bal & ((1u << lane) - 1));
+                    okey[idx] = ok; oadd[idx] = add | (pf[s0] << 30);   // + the source unit's type
+                    sclaim[s0] = 1u;
+                    atomicAdd(&rcnt[ok >> 58], 1);
+                    if (hops == 2)
+                        atomicMin(&imin[r1], (static_cast<uint32_t>((ok >> 40) & kMaxV) << 11) | static_cast<uint32_t>((ok >> 11) & 2047u));
+                }
+            }
+        }
+        else
         for (uint32_t sb0 = warp * 32; sb0 < kP; sb0 += kPlanThreads) {   // warp-uniform: one offer index atomic per warp
             const uint32_t s0 = sb0 + lane;
             const uint64_t key = s0 < kP ? ckey[s0] : ~0ull;
@@ -178,12 +229,12 @@
             const uint32_t bal = __ballot_sync(~0u, emit);
             if (bal == 0)
                 continue;
-            int base = 0;
+            int ob = 0;
             if (lane == static_cast<uint32_t>(__ffs(bal) - 1))
-                base = atomicAdd(&s_noff, __popc(bal));
-            base = __shfl_sync(~0u, base, __ffs(bal) - 1);
+                ob = atomicAdd(&s_noff, __popc(bal));
+            ob = __shfl_sync(~0u, ob, __ffs(bal) - 1);
             if (emit) {
-                const int idx = base + __popc(bal & ((1u << lane) - 1));
+                const int idx = ob + __popc(bal & ((1u << lane) - 1));
                 okey[idx] = ok; oadd[idx] = add | (pf[s0] << 30);   // + the source unit's type
                 sclaim[s0] = 1u;
                 atomicAdd(&rcnt[ok >> 58], 1);
@@ -325,7 +376,45 @@
             milestone(26);
         if (stats != nullptr and tid < kR)
             stats[kP / kR + 2100 + tid] = ecntr[tid];
-        // (C2) offered while the shed of the source's smaller keys is below its excess
+        // (C2) offered while the shed of the source's smaller keys is below its excess (same few/many-rank split)
+        if (kR <= 16)
+        for (uint32_t r0 = warp; r0 < kR; r0 += kPlanWarps) {
+            const int eb = static_cast<int>(r0) * kS, n = ecntr[r0], tmax = T[r0];
+            for (int base = 0; base < n; base += 32) {
+                const int i = base + static_cast<int>(lane);
+                const int s0 = i < n ? elist[eb + i] : -1;
+                const uint64_t key = s0 >= 0 ? kc[s0] : ~0ull;
+                int excl = 0;
+                for (int j = 0; j < n; ++ j) {   // only the rank's emitted slots can have a smaller key
+                    const int jt = elist[eb + j];
+                    excl += kc[jt] < key ? csh[jt] : 0;
+                }
+                bool emit = false;
+                uint64_t ok = 0;
+                int add = 0;
+                if (s0 >= 0 and excl * static_cast<int>(kR) < tmax * static_cast<int>(kR) - tot) {
+                    const int v = static_cast<int>((key >> 23) & kMaxV), s1 = static_cast<int>((key >> 11) & 2047u);
+                    const int ip = pf[s0], rr = rm[s0], y1 = y[s1], p1 = pf[s1];
+                    add = (pcost(y1 + (ip ? 0 : 1), p1 + ip, rr) - pcost(y1, p1, rr)) | (ip << 30);   // + the unit type
+                    ok = (static_cast<uint64_t>(s1 / kS) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(tmax)) << 40) |
+                         (static_cast<uint64_t>(v) << 22) | (static_cast<uint64_t>(s0) << 11) | static_cast<uint64_t>(s1);
+                    emit = true;
+                }
+                const uint32_t bal = __ballot_sync(~0u, emit);
+                if (bal == 0)
+                    continue;
+                int ob = 0;
+                if (lane == static_cast<uint32_t>(__ffs(bal) - 1))
+                    ob = atomicAdd(&s_noff, __popc(bal));
+                ob = __shfl_sync(~0u, ob, __ffs(bal) - 1);
+                if (emit) {
+                    const int idx = ob + __popc(bal & ((1u << lane) - 1));
+                    okey[idx] = ok; oadd[idx] = add;
+                    atomicAdd(&rcnt[ok >> 58], 1);
+                }
+            }
+        }
+        else
         for (uint32_t sb0 = warp * 32; sb0 < kP; sb0 += kPlanThreads) {   // warp-uniform: one offer index atomic per warp
             const uint32_t s0 = sb0 + lane;
             const uint64_t key = s0 < kP ? kc[s0] : ~0ull;
@@ -353,12 +442,12 @@
             const uint32_t bal = __ballot_sync(~0u, emit);
             if (bal == 0)
                 continue;
-            int base = 0;
+            int ob = 0;
             if (lane == static_cast<uint32_t>(__ffs(bal) - 1))
-                base = atomicAdd(&s_noff, __popc(bal));
-            base = __shfl_sync(~0u, base, __ffs(bal) - 1);
+                ob = atomicAdd(&s_noff, __popc(bal));
+            ob = __shfl_sync(~0u, ob, __ffs(bal) - 1);
             if (emit) {
-                const int idx = base + __popc(bal & ((1u << lane) - 1));
+                const int idx = ob + __popc(bal & ((1u << lane) - 1));
                 okey[idx] = ok; oadd[idx] = add;
                 atomicAdd(&rcnt[ok >> 58], 1);
             }

@@ -205,10 +205,10 @@ class _ChildGraph:
         self.kernels = []
         self.arguments = tuple(arguments)
         # Role contexts: dispatch on the communication partition, compute and finalize on the compute partition.
-        # The ECO plan (one CTA) shares the communication partition: with ECO, dispatch launches one CTA fewer
-        # than the partition's SMs (one full-shared-memory CTA per SM), which leaves the plan its own SM.
+        # The ECO plan (one CTA) shares the compute partition: with ECO, compute launches one cluster fewer than
+        # the partition's SMs, which leaves the plan its own SM.
         # Finalize depends on every other role; the others run concurrently.
-        role_context = {1: 0, 2: 1, 3: 1, 4: 0}
+        role_context = {1: 0, 2: 1, 3: 1, 4: 1}
         order = [index for role in (1, 2, 4, 3) for index, x in enumerate(binaries) if x.role == role]
         try:
             self.graph = _ok(cu.cuGraphCreate(0))

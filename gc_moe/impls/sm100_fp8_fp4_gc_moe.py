@@ -499,28 +499,6 @@ class GCMoERoleKernel:
         return entry & Uint32(0x3fff)
 
     @cute.jit
-    def _eco_table_sum(self, signals: cute.Tensor, gen: Uint32, expert: Uint32, tag: Uint32) -> Uint32:
-        """ECO: sum of an expert's count table entries over every source; batches of 8 independent loads, only stale
-        entries (tag of an older call) are polled again"""
-        total = Uint32(0)
-        # u16 entries: the row stride (physical slots, a multiple of 8) keeps the expert's half-word position
-        element = gen * Uint32(self.num_ranks * self.num_ranks * self.local_experts) + expert
-        base = signals.iterator + self.eco_counts_bytes // 4 + element // Uint32(2)
-        shift = (element & Uint32(1)) * Uint32(16)
-        row_words = self.num_ranks * self.local_experts // 2
-        batch = min(self.num_ranks, 8)
-        for src0 in cutlass.range_constexpr(0, self.num_ranks, batch):
-            words = cute.make_rmem_tensor((batch,), Uint32)
-            for b in cutlass.range_constexpr(batch):
-                words[b] = ld_volatile_u32(base + Uint32((src0 + b) * row_words))
-            for b in cutlass.range_constexpr(batch):
-                entry = (words[b] >> shift) & Uint32(0xffff)
-                while (entry >> Uint32(14)) != tag:
-                    entry = (ld_volatile_u32(base + Uint32((src0 + b) * row_words)) >> shift) & Uint32(0xffff)
-                total += entry & Uint32(0x3fff)
-        return total
-
-    @cute.jit
     def _eco_slot_total(self, signals: cute.Tensor, rank_idx: Uint32, slot_idx: Uint32,
                         num_fixed: Uint32) -> Uint32:
         """ECO token total of a local slot: role1's count for single-copy slots, the plan's quota for replicas"""
@@ -531,17 +509,6 @@ class GCMoERoleKernel:
             total = Uint32(signals[(self.eco_base + ECO_SIGNAL_OFFSETS['eco_quota']) // 4 +
                                    rank_idx * Uint32(self.local_experts) + slot_idx])
         return total
-
-    @cute.jit
-    def _eco_wait_sources(self, signals: cute.Tensor, field: cutlass.Constexpr, epoch: Uint32, lane: Uint32) -> None:
-        """ECO: wait (whole warp) until every source rank's plan CTA released `field[source] = epoch + 1`"""
-        for wave in cutlass.range_constexpr((self.num_ranks + 31) // 32):
-            ready_rank = Uint32(wave * 32) + lane
-            if ready_rank < Uint32(self.num_ranks):
-                while ld_acquire_sys_u32(signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS[field]) // 4 + ready_rank) != \
-                        epoch + Uint32(1):
-                    pass
-        cute.arch.sync_warp()
 
     @cute.jit
     def _eco_load_plan(self, signals: cute.Tensor, rank_idx: Uint32, epoch: Uint32,
@@ -1055,15 +1022,19 @@ class GCMoERoleKernel:
                 eco_epoch = ld_volatile_u32(signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4)
                 eco_num_fixed = Uint32(tensor_maps[self.eco_num_fixed_words + rank_idx])
                 eco_tag = (eco_epoch // Uint32(2)) % Uint32(3) + Uint32(1)
+                # Single-copy slot totals: the plan CTA's sums of every source's row, released with eco_counts_ready
+                if lane == Uint32(0):
+                    while ld_acquire_gpu_u32(signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_counts_ready']) //
+                                             4) != eco_epoch + Uint32(1):
+                        pass
+                cute.arch.sync_warp()
                 lane_tokens = Uint32(0)
                 for wave in cutlass.range_constexpr(
                         (self.local_experts + 31) // 32):
                     slot_idx = Uint32(wave * 32) + lane
                     total = Uint32(0)
                     if slot_idx < eco_num_fixed:
-                        expert = Uint32(tensor_maps[self.eco_phy2log_words +
-                                                    rank_idx * Uint32(self.local_experts) + slot_idx])
-                        total = self._eco_table_sum(signals, gen, expert, eco_tag)
+                        total = Uint32(signals[(self.eco_base + ECO_SIGNAL_OFFSETS['eco_slot_count']) // 4 + slot_idx])
                     expert_counts[wave] = total
                     lane_tokens += total
                 eco_fixed_tokens = cute.arch.warp_redux_sync(lane_tokens, 'add')

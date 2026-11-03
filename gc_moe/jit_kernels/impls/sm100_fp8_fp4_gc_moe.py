@@ -556,8 +556,10 @@ def prepare_role_binaries(config, y: torch.Tensor,
             raise ValueError('ECO state must be int16 [physical + logical experts]')
     if context is None:
         context = get_context()
-    # ECO: dispatch keeps one SM of its partition free for the plan CTA (one CTA per SM either way)
-    dispatch_sms = context.dispatch_sms - 1 if eco else context.dispatch_sms
+    # ECO: the plan CTA takes one cluster (two SMs) of the compute partition and dispatch keeps its whole partition
+    # (dispatch-bound pulls lose more to one dispatch SM than compute loses to one cluster)
+    dispatch_sms = context.dispatch_sms
+    compute_sms = context.compute_sms - 2 if eco else context.compute_sms
     device = sym_buffer.buffer.device
     weight_pairs = (l1_weights, l2_weights)
     if shared_l1_weights is not None:
@@ -568,7 +570,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     if (device.type != 'cuda' or torch.cuda.current_device() != device.index or
             int(context.device) != device.index or any(tensor.device != device for tensor in tensors)):
         raise ValueError('role tensors and Green contexts must use the current CUDA device')
-    _check_ring_capacity(config, sym_buffer, context.compute_sms)
+    _check_ring_capacity(config, sym_buffer, compute_sms)
     compiler_target = _device_compile_target(sym_buffer.buffer.device)
     compiler_identity = _compiler_identity(compiler_target)
     nvlink_timeout_secs = _get_gc_moe_nvlink_barrier_timeout_secs()
@@ -615,7 +617,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                 role_kernels = []
                 for index, role in enumerate((1, 2, 3)):
                     role_kernel = GCMoERoleKernel(
-                        role, dispatch_sms, context.compute_sms,
+                        role, dispatch_sms, compute_sms,
                         config.block_m, config.hidden, config.intermediate,
                         config.tokens, sym_buffer.group.size(), config.local_experts,
                         config.shared_experts,
@@ -676,7 +678,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                             role, cubin, role_config.dynamic_smem,
                             role_config.threads,
                             dispatch_sms if role == 1 else
-                            context.compute_sms if role == 2 else
+                            compute_sms if role == 2 else
                             role_kernel.finalize_sms))
                     if eco:
                         # ECO plan role: nvcc cubin, static shared memory, one CTA on the dispatch SM left free

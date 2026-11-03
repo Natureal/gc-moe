@@ -1161,9 +1161,8 @@ class GCMoERoleKernel:
 
                 # Each lane owns one source rank in each 32-rank wave.
                 # Reduce across its register waves before the warp reduction.
-                remaining = cute.make_rmem_tensor((rank_waves,), Uint32)
-                for wave in cutlass.range_constexpr(rank_waves):
-                    remaining[wave] = stored_rank_count[wave]
+                # A source's remaining count after the peeled rounds is max(count - peel_offset, 0); derive it
+                # instead of mutating a copy, so the cached counts stay read-only for the expert's later tokens.
                 peel_slot = Uint32(pull_token) + eco_peel_start
                 peel_offset = Uint32(0)
                 selected = False
@@ -1173,7 +1172,7 @@ class GCMoERoleKernel:
                     lane_active = Uint32(0)
                     lane_minimum = Uint32(0xffffffff)
                     for wave in cutlass.range_constexpr(rank_waves):
-                        count = remaining[wave]
+                        count = stored_rank_count[wave] - min(stored_rank_count[wave], peel_offset)
                         lane_active += Uint32(1) if count > Uint32(0) else Uint32(0)
                         if count > Uint32(0):
                             lane_minimum = min(lane_minimum, count)
@@ -1185,7 +1184,7 @@ class GCMoERoleKernel:
                         seen = Uint32(0)
                         for wave in cutlass.range_constexpr(rank_waves):
                             mask = Uint32(cute.arch.vote_ballot_sync(
-                                remaining[wave] > Uint32(0)))
+                                stored_rank_count[wave] > peel_offset))
                             wave_active = Uint32(cute.arch.popc(mask))
                             if position >= seen and position < seen + wave_active:
                                 src_rank = Uint32(wave * 32) + warp_nth_set_bit(
@@ -1196,8 +1195,6 @@ class GCMoERoleKernel:
                     else:
                         peel_slot -= round_tokens
                         peel_offset += minimum
-                        for wave in cutlass.range_constexpr(rank_waves):
-                            remaining[wave] -= min(remaining[wave], minimum)
                 token_topk = source_idx[(Uint32(current_expert) * Uint32(self.num_ranks) +
                                          src_rank) * Uint32(self.capacity) + src_slot]
                 src_token = token_topk // Uint32(self.topk)

@@ -189,7 +189,7 @@ def _get_or_compile_binaries(key: tuple, identity: CompilerIdentity,
         binaries = _BINARY_CACHE.get(key)
         if binaries is None:
             binaries = tuple(compile_roles())
-            if tuple(item.role for item in binaries) not in ((1, 2, 3), (1, 2, 3, 4)):
+            if tuple(item.role for item in binaries) not in ((1, 2, 3), (1, 2, 3, 4), (1, 2, 3, 4, 5)):
                 raise RuntimeError('GC role compilation did not produce all three roles (and the ECO plan)')
             if _compiler_identity(target) != identity:
                 raise RuntimeError('compiler identity changed while compiling role binaries')
@@ -561,6 +561,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
     # cluster). GC_MOE_ECO_PLAN_DISPATCH=1 instead takes one dispatch SM and leaves compute whole - better
     # when dispatch finishes well before the compute role ends.
     _eco_plan_dispatch = eco and os.environ.get('GC_MOE_ECO_PLAN_DISPATCH', '0') == '1'
+    _eco_helper = eco and os.environ.get('GC_MOE_ECO_HELPER') == '1'
     dispatch_sms = context.dispatch_sms - (1 if _eco_plan_dispatch else 0)
     compute_sms = context.compute_sms - (0 if _eco_plan_dispatch else (2 if eco else 0))
     device = sym_buffer.buffer.device
@@ -640,8 +641,34 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         combine_geometry=combine_geometry if role == 3 else None,
                         eco_logical_experts=eco_logical, eco_trace=eco and _eco_trace_enabled())
                     role_kernels.append(role_kernel)
+                helper_kernel = None
+                if _eco_helper:
+                    # Tail helper (role 5): a second compute kernel, one extra cluster that the graph
+                    # starts when the plan CTA exits. cta_base shifts its cluster index past the resident
+                    # clusters so the static shared phase publishes nothing it would duplicate.
+                    helper_kernel = GCMoERoleKernel(
+                        2, dispatch_sms, compute_sms,
+                        config.block_m, config.hidden, config.intermediate,
+                        config.tokens, sym_buffer.group.size(), config.local_experts,
+                        config.shared_experts,
+                        sym_buffer.num_max_tokens_per_rank,
+                        finalize_output=False,
+                        ring_tokens=layout.ring_tokens,
+                        sf_ring_tokens=layout.sf_ring_tokens,
+                        topk=sym_buffer.num_topk,
+                        shared_weight_gran_k=config.shared_weight_gran_k,
+                        activation_clamp=0.0 if config.clamp != inf else inf,
+                        fast_math=config.fast_math,
+                        has_stats=stats is not None,
+                        nvlink_timeout_secs=nvlink_timeout_secs,
+                        role_config=role_configs[1],
+                        eco_logical_experts=eco_logical,
+                        eco_trace=eco and _eco_trace_enabled(),
+                        cta_base=compute_sms)
                 binary_key = _binary_key(
-                    compiler_identity, tuple(role_kernels), role_resources,
+                    compiler_identity,
+                    tuple(role_kernels) + ((helper_kernel,) if helper_kernel is not None else ()),
+                    role_resources,
                     combine_resources, sym_buffer, y, weights, stats)
                 def compile_roles():
                     signal_view = from_dlpack(sym_buffer.buffer.view(torch.int32))
@@ -696,6 +723,21 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                              trace=_eco_trace_enabled()),
                             0,
                             ECO_UNIT_THREADS, 1))
+                    if helper_kernel is not None:
+                        helper_cubin = compile_kernel(
+                            helper_kernel,
+                            (signal_view, peer_view, rank_view, token_view,
+                             map_views[0], None, None,
+                             clamp_view, alpha_view, *map_views[1:]),
+                            compiler_identity,
+                            lambda ptx, dump_dir: _assemble_role_value_params(
+                                ptx, 2, dump_dir, target=compiler_target,
+                                ptxas_options=compiler_identity.ptxas_options,
+                                eco=False))
+                        role2_config = role_configs[1]
+                        compiled_binaries.append(RoleBinary(
+                            5, helper_cubin, role2_config.dynamic_smem,
+                            role2_config.threads, 2))
                     return compiled_binaries
 
                 binaries = _get_or_compile_binaries(
@@ -738,6 +780,9 @@ def prepare_role_binaries(config, y: torch.Tensor,
                        ctypes.c_void_p(eco_state.data_ptr() if eco_state is not None else 0),
                        ctypes.c_void_p(0), ctypes.c_void_p(peers.data_ptr()),
                        ctypes.c_uint32(sym_buffer.rank_idx), ctypes.c_uint32(config.tokens)),)
+        if _eco_helper:
+            arguments += ((signal_arg, peer_arg, rank_arg, token_arg,
+                           clamp_arg, alpha_arg, *map_args),)
     return list(prepared.binaries), arguments
 
 def launch_gc_moe(config, y, l1_weights, l2_weights, sym_buffer,

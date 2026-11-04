@@ -263,7 +263,8 @@ class GCMoERoleKernel:
                  has_stats: bool = False,
                  nvlink_timeout_secs: int = DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS,
                  *, role_config, combine_geometry: tuple[int, int, int, int] | None = None,
-                 eco_logical_experts: int = 0, eco_trace: bool = False):
+                 eco_logical_experts: int = 0, eco_trace: bool = False,
+                 cta_base: int = 0):
         if role_config.role != role or role_config.block_m != block_m:
             raise ValueError('kernel role/block M differs from its host configuration')
         math_stages = role_config.num_stages
@@ -297,6 +298,7 @@ class GCMoERoleKernel:
         self.eco_trace = bool(eco_trace) and self.eco
         self.dispatch_sms = dispatch_sms
         self.compute_sms = compute_sms
+        self.cta_base = cta_base
         self.block_m = block_m
         self.num_tokens = num_tokens
         self.hidden = hidden
@@ -1356,7 +1358,7 @@ class GCMoERoleKernel:
                 schedule_tasks(
                     task, full, empty, recv_ptr, l1_count_ptr, l2_count_ptr,
                     shared_l1_count_ptr, shared_l2_count_ptr, expert_counts,
-                    iteration, Int32(lane), Int32(block), num_tokens,
+                    iteration, Int32(lane), Int32(block + self.cta_base), num_tokens,
                     self.block_m,
                     self.compute_sms,
                     self.dispatch_sms,

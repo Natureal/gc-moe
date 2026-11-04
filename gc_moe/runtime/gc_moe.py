@@ -196,8 +196,8 @@ class _ChildGraph:
     def __init__(self, owner: 'GreenContextPair', binaries: Sequence[RoleBinary],
                  arguments: Sequence[_KernelArgs]):
         roles = [x.role for x in binaries]
-        if roles not in ([1, 2, 3], [1, 2, 3, 4]):
-            raise ValueError('expected dispatch, compute, finalize (and ECO plan) cubins')
+        if roles not in ([1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4, 5]):
+            raise ValueError('expected dispatch, compute, finalize (and ECO plan/helper) cubins')
         if len(arguments) != len(binaries):
             raise ValueError('expected one argument vector per role')
         self.graph = None
@@ -208,12 +208,15 @@ class _ChildGraph:
         # The ECO plan (one CTA) shares the compute partition: with ECO, compute launches one cluster fewer than
         # the partition's SMs, which leaves the plan its own SM.
         # Finalize depends on every other role; the others run concurrently.
-        role_context = {1: 0, 2: 1, 3: 1,
+        role_context = {1: 0, 2: 1, 3: 1, 5: 1,
                         4: 0 if os.environ.get('GC_MOE_ECO_PLAN_DISPATCH') == '1' else 1}
-        order = [index for role in (1, 2, 4, 3) for index, x in enumerate(binaries) if x.role == role]
+        roles_order = (1, 4, 2, 3) if os.environ.get('GC_MOE_ECO_PLAN_EARLY') == '1' \
+            else (1, 2, 4, 5, 3) if 5 in roles else (1, 2, 4, 3)
+        order = [index for role in roles_order for index, x in enumerate(binaries) if x.role == role]
         try:
             self.graph = _ok(cu.cuGraphCreate(0))
             nodes = []
+            plan_node = None
             for index in order:
                 binary = binaries[index]
                 loaded = owner._get_loaded_kernel(binary)
@@ -232,10 +235,15 @@ class _ChildGraph:
                 params.kernel.blockDimY = params.kernel.blockDimZ = 1
                 params.kernel.sharedMemBytes = binary.smem_bytes
                 params.kernel.kernelParams = arguments[index].pointer
-                dependencies = list(nodes) if binary.role == 3 else []
+                # The tail helper (role 5) launches when the plan CTA exits and its SMs free up;
+                # finalize still depends on every other role.
+                dependencies = list(nodes) if binary.role == 3 else \
+                    ([plan_node] if binary.role == 5 and plan_node is not None else [])
                 node = _ok(cu.cuGraphAddNode(self.graph, dependencies, None,
                                              len(dependencies), params))
-                if binary.role == 2:
+                if binary.role == 4:
+                    plan_node = node
+                if binary.role in (2, 5):
                     attr = cu.CUkernelNodeAttrValue()
                     attr.clusterDim.x, attr.clusterDim.y, attr.clusterDim.z = 2, 1, 1
                     _ok(cu.cuGraphKernelNodeSetAttribute(

@@ -556,14 +556,11 @@ def prepare_role_binaries(config, y: torch.Tensor,
             raise ValueError('ECO state must be int16 [physical + logical experts]')
     if context is None:
         context = get_context()
-    # ECO: the plan CTA takes one cluster (two SMs) of the compute partition by default and dispatch keeps
-    # its whole partition (dispatch-bound pulls lose more to one dispatch SM than compute loses to one
-    # cluster). GC_MOE_ECO_PLAN_DISPATCH=1 instead takes one dispatch SM and leaves compute whole - better
-    # when dispatch finishes well before the compute role ends.
-    _eco_plan_dispatch = eco and os.environ.get('GC_MOE_ECO_PLAN_DISPATCH', '0') == '1'
+    # ECO: the plan CTA takes one cluster (two SMs) of the compute partition and dispatch keeps its whole partition
+    # (one dispatch SM costs far more than one compute cluster, measured on B300 and L20)
     _eco_helper = eco and os.environ.get('GC_MOE_ECO_HELPER') == '1'
-    dispatch_sms = context.dispatch_sms - (1 if _eco_plan_dispatch else 0)
-    compute_sms = context.compute_sms - (0 if _eco_plan_dispatch else (2 if eco else 0))
+    dispatch_sms = context.dispatch_sms
+    compute_sms = context.compute_sms - 2 if eco else context.compute_sms
     device = sym_buffer.buffer.device
     weight_pairs = (l1_weights, l2_weights)
     if shared_l1_weights is not None:

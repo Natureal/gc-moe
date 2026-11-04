@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from ctypes import c_float
 from dataclasses import dataclass
 from math import inf
@@ -127,6 +128,12 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
     bm = get_block_m_for_gc_moe(ranks, block_m_experts or sym_buffer.num_experts,
                                 sym_buffer.num_max_tokens_per_rank, tokens,
                                 sym_buffer.num_topk)
+    # ECO calls: GC_MOE_ECO_BLOCK_M pins block M (a block costs about the same from 32 to 96 rows on L20, so the
+    # best choice is the smallest block that holds a typical expert's tokens; pick it offline per EP size / GPU)
+    if block_m_experts and os.environ.get('GC_MOE_ECO_BLOCK_M'):
+        bm = int(os.environ['GC_MOE_ECO_BLOCK_M'])
+        if bm not in (16, 32, 64, 96, 128):
+            raise ValueError('GC_MOE_ECO_BLOCK_M must be one of 16, 32, 64, 96, 128')
     call_layout = GCBufferLayout(
         ranks, sym_buffer.num_experts, sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk, h, i,

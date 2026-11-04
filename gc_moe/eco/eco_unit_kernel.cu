@@ -14,8 +14,8 @@
 // UNIT_NR / UNIT_NRC (warm / cold auction rounds), UNIT_HOP2 (two-hop rounds).
 //
 // Warp roles: warps 0..15 plan (named barrier 1, 512 threads); warps 1..15 first gather the count table (barrier 2,
-// 480 threads); warp 0 and the two index warps 16, 17 stage the static tables (barrier 4, 96 threads), then the index
-// warps write the replicated experts' source indices into every active copy's rank (barrier 3, 64 threads).
+// 480 threads); the two index warps 16, 17 first fan this rank's count row out to every peer (barrier 5, 544 threads:
+// their arrival plus the helpers'), then stage the static tables with warp 0 (barrier 4, 96 threads).
 
 #include <cstdint>
 
@@ -132,6 +132,26 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         trace_point(buffer, 3);
     const auto* routes = reinterpret_cast<const int64_t*>(buffer + OFF_TOPK);
     const uint32_t num_routes = num_tokens * ECO_TOPK;
+
+    if (warp >= kFirstIndexWarp) {
+        // The count rows go out FIRST on the two index warps: route_count[] is ready a few us in, and rows sent
+        // this early drain ahead of the dispatch role's routing flood instead of queueing behind a ~10us staging
+        // phase; their posted remote stores' fabric drain then stalls only these warps' LSU path.
+        rows_sync();   // route_count[] complete (helpers arrive once counting is done)
+        if (stats != nullptr and lane == 0)
+            stats[kP / kR + 44 + warp] = 21;
+        constexpr uint32_t kVectors = kE / 8;
+        const uint32_t tag = (epoch / 2) % 3 + 1, tag2 = (tag << 14) | (tag << 30);
+        const auto pack = [&](const uint32_t& e) { return tag2 | route_count[e] | (route_count[e + 1] << 16); };
+        const uint32_t iw = tid - kFirstIndexWarp * 32;
+        for (uint32_t v = iw; v < kR * kVectors; v += 64) {
+            const uint32_t peer = v / kVectors, first = (v % kVectors) * 8;
+            *reinterpret_cast<uint4*>(peers[peer] + OFF_ECO_COUNTS + ((gen * kR + rank) * kP + first) * 2) =
+                make_uint4(pack(first), pack(first + 2), pack(first + 4), pack(first + 6));
+        }
+        if (tid == kFirstIndexWarp * 32)
+            milestone(17);
+    }
 
     // ---- static tables and the warm start (warp 0 + index warps, while the counts warps gather) ----------------
     if (warp == 0 or warp >= kFirstIndexWarp) {
@@ -272,25 +292,8 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             milestone(22);
     }
 
-    if (warp >= kFirstIndexWarp) {
-        // The count rows go out on the two index warps (idle after staging): their posted remote stores' fabric
-        // drain then stalls only these warps' LSU path, not the helpers' polls and shared-memory plan work.
-        rows_sync();   // route_count[] complete (helpers arrive once counting is done)
-        if (stats != nullptr and lane == 0)
-            stats[kP / kR + 44 + warp] = 21;
-        constexpr uint32_t kVectors = kE / 8;
-        const uint32_t tag = (epoch / 2) % 3 + 1, tag2 = (tag << 14) | (tag << 30);
-        const auto pack = [&](const uint32_t& e) { return tag2 | route_count[e] | (route_count[e + 1] << 16); };
-        const uint32_t iw = tid - kFirstIndexWarp * 32;
-        for (uint32_t v = iw; v < kR * kVectors; v += 64) {
-            const uint32_t peer = v / kVectors, first = (v % kVectors) * 8;
-            *reinterpret_cast<uint4*>(peers[peer] + OFF_ECO_COUNTS + ((gen * kR + rank) * kP + first) * 2) =
-                make_uint4(pack(first), pack(first + 2), pack(first + 4), pack(first + 6));
-        }
-        if (tid == kFirstIndexWarp * 32)
-            milestone(17);
+    if (warp >= kFirstIndexWarp)
         return;   // replicated experts' indices: written by the dispatch role's routing phase
-    }
 
     if (warp >= 1) {
         // ---- counts (warps 1..15): this rank's row into every peer, then every source's row summed ------------

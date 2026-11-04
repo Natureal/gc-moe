@@ -396,6 +396,16 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                                       Uint32(2 * intermediate), Uint32(hidden))
                     iteration = Uint32(iteration + Uint32(1))
                     fetching = False
+                    if cutlass.const_expr(eco):
+                        # ECO: take the plan as soon as it is published (non-blocking poll after a publish, while
+                        # the consumers are busy), not at the claim that first needs a replica slot
+                        if eco_plan_loaded == Uint32(0):
+                            if ld_volatile_u32(signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_plan_ready']) // 4) == \
+                                    eco_epoch + Uint32(1):
+                                routed_m_blocks = eco_load_replicas(
+                                    signals, rank_idx, eco_epoch, eco_num_fixed, expert_counts, Int32(lane),
+                                    local_experts, block_m, eco_base, eco_trace, block)
+                                eco_plan_loaded = Uint32(1)
             else:
                 task_idx = claim_task(l2_count_ptr, Int32(lane))
                 if cutlass.const_expr(eco):
@@ -425,6 +435,16 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                                       Uint32(hidden), Uint32(intermediate))
                     iteration = Uint32(iteration + Uint32(1))
                     fetching = False
+                    if cutlass.const_expr(eco):
+                        # ECO: take the plan as soon as it is published (non-blocking poll after a publish, while
+                        # the consumers are busy), not at the claim that first needs a replica slot
+                        if eco_plan_loaded == Uint32(0):
+                            if ld_volatile_u32(signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_plan_ready']) // 4) == \
+                                    eco_epoch + Uint32(1):
+                                routed_m_blocks = eco_load_replicas(
+                                    signals, rank_idx, eco_epoch, eco_num_fixed, expert_counts, Int32(lane),
+                                    local_experts, block_m, eco_base, eco_trace, block)
+                                eco_plan_loaded = Uint32(1)
     if cutlass.const_expr(shared_experts > 0):
         if not shared_l2_early:
             iteration = publish_shared_phase(

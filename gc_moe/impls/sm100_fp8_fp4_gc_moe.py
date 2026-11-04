@@ -862,9 +862,9 @@ class GCMoERoleKernel:
             expert_token_count = cute.recast_ptr(
                 slab + self.shared_layout.expert_counts, dtype=Uint32)
             if cutlass.const_expr(self.eco):
-                # ECO: per logical expert's packed primary copy: low16 = physical slot id,
-                # bit31 = list needs the global-memory walk (multi-copy / passive / empty).
-                # Followed by this rank's phy2log slice (physical slot -> logical expert).
+                # ECO: per logical expert's packed first two copy-list entries, verbatim u16s
+                # (0xffff = list end, high bit = passive); 0xffffffff = the list is longer and
+                # needs the global-memory walk. Followed by this rank's phy2log slice.
                 copies_pk = cute.recast_ptr(
                     dispatch_smem.allocate(self.route_experts * 4 +
                                            self.local_experts * 2, 16), dtype=Uint32)
@@ -904,17 +904,24 @@ class GCMoERoleKernel:
                                 tokens_per_warp)
             route_stride = self.dispatch_sms * self.dispatch_warps * tokens_per_warp
             if cutlass.const_expr(self.eco):
-                # ECO: pack each logical expert's first copy-list word into smem. The loads
-                # overlap the counting pass below; consumed by the source-index writes.
+                # ECO: pack each logical expert's first two copy-list entries into smem (verbatim;
+                # longer lists become the 0xffffffff walk sentinel). The loads overlap the
+                # counting pass below; consumed by the source-index writes.
                 for pk_iter in cutlass.range(
                         Uint32(tid), Uint32(self.route_experts),
                         self.dispatch_warps * 32, unroll_full=True):
                     e01 = Uint32(tensor_maps[
                         self.eco_copies_words + Uint32(pk_iter) * Uint32(16)])
-                    e0 = e01 & Uint32(0xffff)
-                    packed = e0
-                    if (e01 >> Uint32(16)) != Uint32(0xffff) or e0 >= Uint32(0x8000):
-                        packed = e0 | Uint32(0x80000000)
+                    e23 = Uint32(tensor_maps[
+                        self.eco_copies_words + Uint32(pk_iter) * Uint32(16) + Uint32(1)])
+                    # The two packed entries suffice unless a third entry needs a write:
+                    # e2 absent, or e2 passive (high bit) with the list ending there.
+                    e2, e3 = e23 & Uint32(0xffff), e23 >> Uint32(16)
+                    fits = e2 == Uint32(0xffff) or \
+                        ((e2 & Uint32(0x8000)) != Uint32(0) and e3 == Uint32(0xffff))
+                    packed = Uint32(0xffffffff)
+                    if fits:
+                        packed = e01
                     copies_pk[Uint32(pk_iter)] = packed
                 for pl_iter in cutlass.range(
                         Uint32(tid), Uint32(self.local_experts),
@@ -966,17 +973,22 @@ class GCMoERoleKernel:
                             slot = atom_shared_add_u32(
                                 expert_token_count + Uint32(expert), Uint32(1))
                             packed = copies_pk[Uint32(expert)]
-                            if (packed & Uint32(0x80000000)) == Uint32(0):
-                                # Single active copy: one remote index write, identical to the non-ECO path
-                                dst_rank = packed // Uint32(self.local_experts)
-                                dst_local = packed % Uint32(self.local_experts)
-                                dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
-                                dst_index = cute.make_ptr(
-                                    Uint32, dst_base + Uint64(SIGNAL_OFFSETS['size']) +
-                                    Uint64(((dst_local * Uint32(self.num_ranks) + rank_idx) *
-                                            Uint32(self.capacity) + slot) * Uint32(4)),
-                                    cute.AddressSpace.gmem)
-                                dst_index[0] = token_topk
+                            if packed != Uint32(0xffffffff):
+                                # Up to two list entries inline: every active copy (high bit clear,
+                                # != 0xffff) gets the index at the same list position — identical
+                                # to the walk's writes below
+                                for k in cutlass.range_constexpr(2):
+                                    raw = (packed >> Uint32(16 * k)) & Uint32(0xffff)
+                                    if raw != Uint32(0xffff) and (raw & Uint32(0x8000)) == Uint32(0):
+                                        dst_rank = raw // Uint32(self.local_experts)
+                                        dst_local = raw % Uint32(self.local_experts)
+                                        dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
+                                        dst_index = cute.make_ptr(
+                                            Uint32, dst_base + Uint64(SIGNAL_OFFSETS['size']) +
+                                            Uint64(((dst_local * Uint32(self.num_ranks) + rank_idx) *
+                                                    Uint32(self.capacity) + slot) * Uint32(4)),
+                                            cute.AddressSpace.gmem)
+                                        dst_index[0] = token_topk
                             else:
                                 # Eight copies (16 bytes of i16 entries) per load; -1 ends the list. Every active copy
                                 # gets the index at the same list position (one writer per token), before the rank barrier

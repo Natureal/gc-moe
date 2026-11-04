@@ -861,6 +861,15 @@ class GCMoERoleKernel:
                 dispatch_smem.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
             expert_token_count = cute.recast_ptr(
                 slab + self.shared_layout.expert_counts, dtype=Uint32)
+            if cutlass.const_expr(self.eco):
+                # ECO: per logical expert's packed primary copy: low16 = physical slot id,
+                # bit31 = list needs the global-memory walk (multi-copy / passive / empty).
+                # Followed by this rank's phy2log slice (physical slot -> logical expert).
+                copies_pk = cute.recast_ptr(
+                    dispatch_smem.allocate(self.route_experts * 4 +
+                                           self.local_experts * 2, 16), dtype=Uint32)
+                phy2log_smem = cute.recast_ptr(
+                    copies_pk + Uint32(self.route_experts), dtype=Uint16)
             pull = cute.recast_ptr(slab + self.shared_layout.pull, dtype=Uint32)
             pull_bar = cute.recast_ptr(slab + self.shared_layout.dispatch_bars, dtype=Uint64)
             self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane))
@@ -894,6 +903,25 @@ class GCMoERoleKernel:
             route_base = Uint32((block * self.dispatch_warps + physical_warp) *
                                 tokens_per_warp)
             route_stride = self.dispatch_sms * self.dispatch_warps * tokens_per_warp
+            if cutlass.const_expr(self.eco):
+                # ECO: pack each logical expert's first copy-list word into smem. The loads
+                # overlap the counting pass below; consumed by the source-index writes.
+                for pk_iter in cutlass.range(
+                        Uint32(tid), Uint32(self.route_experts),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    e01 = Uint32(tensor_maps[
+                        self.eco_copies_words + Uint32(pk_iter) * Uint32(16)])
+                    e0 = e01 & Uint32(0xffff)
+                    packed = e0
+                    if (e01 >> Uint32(16)) != Uint32(0xffff) or e0 >= Uint32(0x8000):
+                        packed = e0 | Uint32(0x80000000)
+                    copies_pk[Uint32(pk_iter)] = packed
+                for pl_iter in cutlass.range(
+                        Uint32(tid), Uint32(self.local_experts),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    phy2log_smem[Uint32(pl_iter)] = Uint16(tensor_maps[
+                        self.eco_phy2log_words + rank_idx * Uint32(self.local_experts) +
+                        Uint32(pl_iter)])
             for route_iter in cutlass.range(
                     route_base, num_tokens, route_stride, unroll_full=True):
                 route_base = Uint32(route_iter)
@@ -908,6 +936,9 @@ class GCMoERoleKernel:
                             # ECO: warm the route's copy list in L2 for the source-index writes below
                             prefetch_global_l2(tensor_maps.iterator + self.eco_copies_words + Uint32(expert) * Uint32(16))
                 cute.arch.sync_warp()
+            if cutlass.const_expr(self.eco):
+                if lane == Uint32(0):
+                    self._eco_trace(signals, 30, 2)
             cute.arch.sync_threads()
             # ECO: counts and source-slot spans are per logical expert
             for expert_iter in cutlass.range(
@@ -934,30 +965,43 @@ class GCMoERoleKernel:
                         if expert < Uint64(self.route_experts):
                             slot = atom_shared_add_u32(
                                 expert_token_count + Uint32(expert), Uint32(1))
-                            # Eight copies (16 bytes of i16 entries) per load; -1 ends the list. Every active copy
-                            # gets the index at the same list position (one writer per token), before the rank barrier
-                            group = Uint32(0)
-                            copying = True
-                            while copying:
-                                words = ld_global_u32x4(tensor_maps.iterator + self.eco_copies_words +
-                                                        Uint32(expert) * Uint32(16) + group * Uint32(4))
-                                for k in cutlass.range_constexpr(8):
-                                    raw = (words[k // 2] >> Uint32(16 * (k % 2))) & Uint32(0xffff)
-                                    if raw == Uint32(0xffff):
+                            packed = copies_pk[Uint32(expert)]
+                            if (packed & Uint32(0x80000000)) == Uint32(0):
+                                # Single active copy: one remote index write, identical to the non-ECO path
+                                dst_rank = packed // Uint32(self.local_experts)
+                                dst_local = packed % Uint32(self.local_experts)
+                                dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
+                                dst_index = cute.make_ptr(
+                                    Uint32, dst_base + Uint64(SIGNAL_OFFSETS['size']) +
+                                    Uint64(((dst_local * Uint32(self.num_ranks) + rank_idx) *
+                                            Uint32(self.capacity) + slot) * Uint32(4)),
+                                    cute.AddressSpace.gmem)
+                                dst_index[0] = token_topk
+                            else:
+                                # Eight copies (16 bytes of i16 entries) per load; -1 ends the list. Every active copy
+                                # gets the index at the same list position (one writer per token), before the rank barrier
+                                group = Uint32(0)
+                                copying = True
+                                while copying:
+                                    words = ld_global_u32x4(tensor_maps.iterator + self.eco_copies_words +
+                                                            Uint32(expert) * Uint32(16) + group * Uint32(4))
+                                    for k in cutlass.range_constexpr(8):
+                                        raw = (words[k // 2] >> Uint32(16 * (k % 2))) & Uint32(0xffff)
+                                        if raw == Uint32(0xffff):
+                                            copying = False
+                                        elif copying and (raw & Uint32(0x8000)) == Uint32(0):
+                                            dst_rank = raw // Uint32(self.local_experts)
+                                            dst_local = raw % Uint32(self.local_experts)
+                                            dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
+                                            dst_index = cute.make_ptr(
+                                                Uint32, dst_base + Uint64(SIGNAL_OFFSETS['size']) +
+                                                Uint64(((dst_local * Uint32(self.num_ranks) + rank_idx) *
+                                                        Uint32(self.capacity) + slot) * Uint32(4)),
+                                                cute.AddressSpace.gmem)
+                                            dst_index[0] = token_topk
+                                    group += Uint32(1)
+                                    if group == Uint32(4):
                                         copying = False
-                                    elif copying and (raw & Uint32(0x8000)) == Uint32(0):
-                                        dst_rank = raw // Uint32(self.local_experts)
-                                        dst_local = raw % Uint32(self.local_experts)
-                                        dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
-                                        dst_index = cute.make_ptr(
-                                            Uint32, dst_base + Uint64(SIGNAL_OFFSETS['size']) +
-                                            Uint64(((dst_local * Uint32(self.num_ranks) + rank_idx) *
-                                                    Uint32(self.capacity) + slot) * Uint32(4)),
-                                            cute.AddressSpace.gmem)
-                                        dst_index[0] = token_topk
-                                group += Uint32(1)
-                                if group == Uint32(4):
-                                    copying = False
                     elif expert < Uint64(self.num_ranks * self.local_experts):
                         dst_rank = Uint32(expert) // Uint32(self.local_experts)
                         dst_local = Uint32(expert) % Uint32(self.local_experts)
@@ -972,6 +1016,9 @@ class GCMoERoleKernel:
                                    Uint32(4)), cute.AddressSpace.gmem)
                         dst_index[0] = token_topk
                 cute.arch.sync_warp()
+            if cutlass.const_expr(self.eco):
+                if lane == Uint32(0):
+                    self._eco_trace(signals, 31, 2)
             grid_sync(signals, Uint32(block), Uint32(tid), self.dispatch_sms, 0)
             if cutlass.const_expr(not self.eco):
                 if block == 0:
@@ -1030,6 +1077,9 @@ class GCMoERoleKernel:
                                              4) != eco_epoch + Uint32(1):
                         pass
                 cute.arch.sync_warp()
+                if cutlass.const_expr(self.eco_trace):
+                    if tid == Uint32(0):
+                        self._eco_trace(signals, 32, 0)
                 lane_tokens = Uint32(0)
                 for wave in cutlass.range_constexpr(
                         (self.local_experts + 31) // 32):
@@ -1093,9 +1143,7 @@ class GCMoERoleKernel:
                     if cutlass.const_expr(self.eco):
                         # Per-source counts of the slot's logical expert; a replica slot pulls its quota span
                         # of the expert's canonical (min-peeled) order
-                        slot_expert = Uint32(tensor_maps[self.eco_phy2log_words +
-                                                         rank_idx * Uint32(self.local_experts) +
-                                                         Uint32(current_expert)])
+                        slot_expert = Uint32(phy2log_smem[Uint32(current_expert)])
                         eco_peel_start = Uint32(0)
                         if Uint32(current_expert) >= eco_num_fixed:
                             eco_peel_start = Uint32(signals[(self.eco_base + ECO_SIGNAL_OFFSETS['eco_quota_start']) // 4 +

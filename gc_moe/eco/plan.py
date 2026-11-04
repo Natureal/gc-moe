@@ -51,6 +51,9 @@ ECO_TRACE_SLOTS = {
     23: ('acc_role3_end_b0', 'sum'), 24: ('role1_start_b0', 'store'), 25: ('acc_plan_published', 'sum'),
     26: ('acc_role2_plan_stall', 'sum'), 27: ('acc_role1_plan_stall', 'sum'), 28: ('acc_role2_stalls', 'sum'),
     29: ('acc_role1_stalls', 'sum'),
+    # role1 phase decomposition: counting done / source-index writes done (max over dispatch warps),
+    # counts_ready seen by role1 block0
+    30: ('r1_counted', 'max'), 31: ('r1_srcwrote', 'max'), 32: ('r1_counts_seen', 'store'),
 }
 _SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 _SOURCES = ('eco_unit_kernel.cu', 'eco_unit_auction.cuh', 'include/eco_meta.cuh', 'include/eco_compat.cuh')

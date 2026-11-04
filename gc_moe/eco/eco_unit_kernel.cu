@@ -343,6 +343,9 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                 for (uint32_t b = 0; b < kBatchSrc; ++ b)
                     pending |= stale(w[b]) ? (1u << b) : 0u;
                 while (pending != 0) {
+                    // Back off between re-polls: hundreds of helper lanes spinning on ld.volatile
+                    // hammer the L2 slices the dispatch role's remote count/index writes land on.
+                    __nanosleep(192);
                     #pragma unroll
                     for (uint32_t b = 0; b < kBatchSrc; ++ b)
                         if (pending & (1u << b))

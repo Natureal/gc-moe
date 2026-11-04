@@ -208,7 +208,8 @@ class _ChildGraph:
         # The ECO plan (one CTA) shares the compute partition: with ECO, compute launches one cluster fewer than
         # the partition's SMs, which leaves the plan its own SM.
         # Finalize depends on every other role; the others run concurrently.
-        role_context = {1: 0, 2: 1, 3: 1, 4: 1}
+        role_context = {1: 0, 2: 1, 3: 1,
+                        4: 0 if os.environ.get('GC_MOE_ECO_PLAN_DISPATCH') == '1' else 1}
         order = [index for role in (1, 2, 4, 3) for index, x in enumerate(binaries) if x.role == role]
         try:
             self.graph = _ok(cu.cuGraphCreate(0))

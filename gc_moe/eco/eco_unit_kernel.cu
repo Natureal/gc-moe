@@ -1741,6 +1741,51 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         reinterpret_cast<uint32_t*>(buffer + OFF_ECO_TRACE_RING)[entry * ECO_TRACE_RING_FIELDS + 3] = static_cast<uint32_t>(since);
 #endif
     }
+#if ECO_COMBINE_EXACT
+    // ---- exact combine readiness (off the critical path): every rank's plan is identical, so this rank derives
+    // which rank computes each of its own routes. Route (token, k) to logical expert e sits at slot j of this
+    // rank's row in e's canonical order (recorded by role1); its canonical position is
+    // p = sum_s min(c_s, j) + #{s < rank : c_s > j} (round-robin over sources, ascending rank), computed by the
+    // active copy whose [start, start + quota) holds p. Result overwrites j; role3 waits for that rank only.
+    if (tid < kPlanThreads) {
+        const uint32_t lane = tid & 31u, warp = tid >> 5;
+        const auto* done = reinterpret_cast<const volatile uint32_t*>(signals + OFF_ECO_ROUTES_DONE / 4);
+        for (uint32_t b = lane; b < ECO_DISPATCH_SMS; b += 32)
+            while (done[b] != epoch + 1u) {}
+        __syncwarp();
+        __threadfence();
+        auto* route_peer = reinterpret_cast<volatile uint32_t*>(signals + OFF_ECO_ROUTE_PEER / 4);
+        const auto* ctab = reinterpret_cast<const volatile uint32_t*>(buffer + OFF_ECO_COUNTS + gen * kR * kP * 2u);
+        const auto* xroutes = reinterpret_cast<const int64_t*>(buffer + OFF_TOPK);
+        for (uint32_t r = warp; r < num_tokens * ECO_TOPK; r += kPlanWarps) {
+            const int64_t e = xroutes[r];
+            if (e < 0 or e >= static_cast<int64_t>(kE))
+                continue;
+            const int k = ecnt[e], o = eoff[e];
+            int dst = cslot[o];
+            if (k > 1) {
+                const uint32_t j = route_peer[r];
+                uint32_t part = 0;
+                for (uint32_t s = lane; s < kR; s += 32) {
+                    const uint32_t c = (ctab[s * (kP / 2) + static_cast<uint32_t>(e) / 3u] >>
+                                        ((static_cast<uint32_t>(e) % 3u) * 10u)) & 0x3ffu;
+                    part += min(c, j) + ((s < rank and c > j) ? 1u : 0u);
+                }
+                const uint32_t pos = __reduce_add_sync(0xffffffffu, part);
+                int hit = -1;
+                for (int jj = static_cast<int>(lane); jj < k; jj += 32) {
+                    const int c = cslot[o + jj];
+                    const uint32_t st = out_start[c], q = out_quota[c];
+                    if (pos >= st and pos < st + q)
+                        hit = c;
+                }
+                dst = __reduce_max_sync(0xffffffffu, hit);
+            }
+            if (lane == 0)
+                route_peer[r] = static_cast<uint32_t>(dst) / kS;
+        }
+    }
+#endif
     // ---- next call's warm state (after the release, off the critical path): this plan's quotas of the replicated
     // slots, then the counts
     if (state != nullptr) {

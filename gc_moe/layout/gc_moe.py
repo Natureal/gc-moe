@@ -192,6 +192,8 @@ def _eco_signal_offsets() -> dict[str, int]:
         ('eco_route_peer', ECO_MAX_ROUTES, 4),
         # verification only (GC_MOE_ECO_ROUTE_VERIFY=1): the rank that actually pulled each source route
         ('eco_route_dbg', ECO_MAX_ROUTES, 4),
+        # per dispatch CTA: epoch + 1 once its routes' canonical slots are recorded (plan CTA then derives the peers)
+        ('eco_routes_done', ECO_MAX_DISPATCH_CTAS, 4),
     )
     offset = 0
     result = {}

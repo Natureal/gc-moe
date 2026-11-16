@@ -613,6 +613,11 @@ def prepare_role_binaries(config, y: torch.Tensor,
     # Timing probe: replica pulls/tasks run on the previous call's published
     # quotas without waiting for this call's plan. Wrong output — never check.
     eco_spec = eco and os.environ.get('GC_MOE_ECO_SPEC') == '1'
+    # must match GCMoERoleKernel.eco_combine_exact: 2 = the plan CTA derives each route's computing rank
+    from ...layout.gc_moe import ECO_MAX_ROUTES as _max_routes
+    eco_combine_exact = (int(os.environ.get('GC_MOE_ECO_COMBINE_EXACT', '2'))
+                         if eco and os.environ.get('GC_MOE_ECO_COMBINE_PROBE') != '1' and
+                         sym_buffer.num_max_tokens_per_rank * sym_buffer.num_topk <= _max_routes else 0)
     # Measurement only: GC_MOE_DBG_COMPUTE_MINUS=<even n> leaves n compute SMs idle in plain calls, pricing the ECO
     # plan cluster's SM reservation on plain loads
     dbg_compute_minus = 0 if eco else int(os.environ.get('GC_MOE_DBG_COMPUTE_MINUS', '0'))
@@ -663,7 +668,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                        nvlink_timeout_secs, routed_weight_linger,
                        role_resources, combine_resources,
                        compiler_identity) + ((eco_logical, eco_rows_after_pub, eco_split_counts, eco_route_prep,
-                                              eco_spec) if eco else ()) + (
+                                              eco_spec, eco_combine_exact) if eco else ()) + (
                                                  (dbg_compute_minus,) if dbg_compute_minus else ())
     prepared = _CACHE.get(key)
     if prepared is None:
@@ -805,6 +810,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                              spec=eco_spec,
                                              dispatch_sms=dispatch_sms,
                                              dispatch_warps=role_configs[0].routing_warps,
+                                             combine_exact=eco_combine_exact == 2,
                                              recv_mode=int(os.environ.get(
                                                  'GC_MOE_ECO_RECV_COUNTS', '3'))),
                             0,

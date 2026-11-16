@@ -457,9 +457,10 @@ class GCMoERoleKernel:
         # Exact combine readiness (default): each route waits only for the rank that computes it. Every rank's plan
         # is identical, so the source derives it locally: canonical position (round-robin over sources) of its
         # slot, then the copy whose [quota_start, quota_start + quota) holds it.
-        self.eco_combine_exact = (self.eco and not self.eco_combine_probe and
-                                  __import__('os').environ.get('GC_MOE_ECO_COMBINE_EXACT', '1') == '1' and
-                                  capacity * topk <= ECO_MAX_ROUTES)
+        # 2 (default): the plan CTA derives the peers after its publish; 1: role1 after its pulls; 0: all peers
+        _exact = int(__import__('os').environ.get('GC_MOE_ECO_COMBINE_EXACT', '2'))
+        self.eco_combine_exact = (_exact if self.eco and not self.eco_combine_probe and
+                                  capacity * topk <= ECO_MAX_ROUTES else 0)
         self.eco_route_verify = self.eco_combine_exact and \
             __import__('os').environ.get('GC_MOE_ECO_ROUTE_VERIFY') == '1'
         self.topk_offset_words = layout.views['topk_idx'].offset // 4
@@ -1740,7 +1741,7 @@ class GCMoERoleKernel:
                                         Uint32(self.capacity) + slot) * Uint32(4)),
                                 cute.AddressSpace.gmem)
                             dst_index[0] = token_topk
-                            if cutlass.const_expr(self.eco_combine_exact):
+                            if cutlass.const_expr(self.eco_combine_exact > 0):
                                 signals[(self.eco_base + ECO_SIGNAL_OFFSETS['eco_route_peer']) // 4 +
                                         token_topk] = slot
                     elif expert < Uint64(self.num_ranks * self.local_experts):
@@ -1757,6 +1758,12 @@ class GCMoERoleKernel:
                                    Uint32(4)), cute.AddressSpace.gmem)
                         dst_index[0] = token_topk
                 cute.arch.sync_warp()
+            if cutlass.const_expr(self.eco_combine_exact == 2):
+                # this CTA's route slots are recorded: the plan CTA may derive their computing ranks
+                cute.arch.sync_threads()
+                if tid == Uint32(0):
+                    st_release_u32(signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_routes_done']) // 4 +
+                                   block, recv_epoch + Uint32(1), False)
             if cutlass.const_expr(self.eco):
                 if lane == Uint32(0):
                     self._eco_trace(signals, 31, 2)
@@ -2279,7 +2286,7 @@ class GCMoERoleKernel:
                 if elect_one_sync():
                     self._eco_trace(signals, 8, 2)
                     self._eco_trace_ring(signals, 6, True)
-            if cutlass.const_expr(self.eco_combine_exact):
+            if cutlass.const_expr(self.eco_combine_exact == 1):
                 self._eco_route_peers(signals, tensor_maps, routes, rank_idx, num_tokens, lane,
                                       Uint32(block * self.dispatch_warps + physical_warp), gen, eco_epoch)
         elif cutlass.const_expr(self.role == 2):

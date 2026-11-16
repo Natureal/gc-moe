@@ -1,4 +1,4 @@
-"""Independent SM90 CUDA driver Green Context resources and role graph with optional isolated shared compute.
+"""Independent SM90 CUDA driver Green Context resources and role graphs.
 
 The role kernels are CuTe DSL SM90 cubins.  A CUDA library kernel plus an explicit
 context is required for Graph kernel nodes: ``func`` remains null.
@@ -18,6 +18,7 @@ from typing import Sequence
 
 import torch
 from cuda.bindings import driver as cu
+from ..jit_kernels.heuristics.sm90_gc_moe import select_sm90_schedule_policy
 
 
 def _ok(result):
@@ -133,12 +134,15 @@ def _green_resources():
 
 @dataclass(frozen=True)
 class RoleBinary:
+    # 1 dispatch, 2 routed, 3 finalize, 4 shared (or L1), 5 split shared L2.
     role: int
     cubin: bytes
     smem_bytes: int
     threads: int
     grid: int
     wait_for: tuple[int, ...] = ()
+    # (upstream role, outgoing port, incoming port, dependency type).
+    launch_after: tuple[tuple[int, int, int, int], ...] = ()
 
 
 class _KernelArgs:
@@ -166,6 +170,10 @@ def _child_key(binaries: Sequence[RoleBinary], arguments: Sequence[_KernelArgs])
         prerequisites = getattr(binary, 'wait_for', ())
         key.update(len(prerequisites).to_bytes(4, 'little'))
         key.update(bytes(prerequisites))
+        launch_edges = getattr(binary, 'launch_after', ())
+        key.update(len(launch_edges).to_bytes(4, 'little'))
+        for edge in launch_edges:
+            key.update(bytes(edge))
         key.update(binary.smem_bytes.to_bytes(8, 'little'))
         key.update(binary.threads.to_bytes(4, 'little'))
         key.update(binary.grid.to_bytes(4, 'little'))
@@ -201,7 +209,7 @@ def _runtime_locked(function):
 class _ChildGraph:
     def __init__(self, owner: 'GreenContextPair', binaries: Sequence[RoleBinary],
                  arguments: Sequence[_KernelArgs]):
-        if tuple(x.role for x in binaries) not in ((1, 2, 3), (1, 2, 4, 3), (1, 4, 2, 3)):
+        if tuple(x.role for x in binaries) not in ((1, 2, 3), (1, 2, 4, 3), (1, 4, 2, 3), (1, 4, 5, 2, 3)):
             raise ValueError('expected dispatch, routed, optional shared, finalize cubins')
         if len(arguments) != len(binaries):
             raise ValueError('expected one argument vector per role')
@@ -223,27 +231,49 @@ class _ChildGraph:
                 params = cu.CUgraphNodeParams()
                 params.type = cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL
                 params.kernel.kern = kernel
-                params.kernel.ctx = owner.contexts[0 if index == 0 else 1]
+                params.kernel.ctx = (owner.primary_context
+                                     if owner.primary_ctx_roles else
+                                     owner.contexts[0 if index == 0 else 1])
                 params.kernel.gridDimX = binary.grid
                 params.kernel.gridDimY = params.kernel.gridDimZ = 1
                 params.kernel.blockDimX = binary.threads
                 params.kernel.blockDimY = params.kernel.blockDimZ = 1
                 params.kernel.sharedMemBytes = binary.smem_bytes
                 params.kernel.kernelParams = arguments[index].pointer
-                # Dispatch remains an independent root. A compute policy may
-                # retire local SE before routed begins; its original device
-                # queues still acquire every required dispatch publication.
-                # Finalize/cleanup always joins every local producer.
+                # In the primary context, compute roots wait until every
+                # dispatch CTA has started, without waiting for completion.
+                # Existing shared dependencies carry this order transitively.
+                # Device acquires still protect every dispatch publication;
+                # finalize/cleanup always joins every local producer.
                 prerequisites = getattr(binary, 'wait_for', ())
-                if any(role not in role_nodes for role in prerequisites):
+                launch_edges = getattr(binary, 'launch_after', ())
+                if (owner.primary_ctx_roles and binary.role in (2, 4, 5)
+                        and not prerequisites and not launch_edges):
+                    launch_edges = ((1, cu.CU_GRAPH_KERNEL_NODE_PORT_LAUNCH_ORDER, 0,
+                                     cu.CUgraphDependencyType.CU_GRAPH_DEPENDENCY_TYPE_PROGRAMMATIC),)
+                launch_roles = tuple(edge[0] for edge in launch_edges)
+                if any(role not in role_nodes for role in (*prerequisites, *launch_roles)):
                     raise ValueError('kernel dependency must reference an earlier graph node')
+                if (len(set((*prerequisites, *launch_roles))) != len(prerequisites) + len(launch_roles)
+                        or (binary.role == 3 and launch_edges)
+                        or any(edge[1:] != (2, 0, 1) for edge in launch_edges)):
+                    raise ValueError('invalid launch-order kernel dependency')
                 dependencies = (list(nodes) if binary.role == 3 else
                                 [role_nodes[role] for role in prerequisites])
-                node = _ok(cu.cuGraphAddNode(self.graph, dependencies, None,
+                edge_data = None
+                if launch_edges:
+                    edge_data = [cu.CUgraphEdgeData() for _ in dependencies]
+                    for role, from_port, to_port, dependency_type in launch_edges:
+                        edge = cu.CUgraphEdgeData()
+                        edge.from_port = from_port
+                        edge.to_port = to_port
+                        edge.type = dependency_type
+                        dependencies.append(role_nodes[role])
+                        edge_data.append(edge)
+                node = _ok(cu.cuGraphAddNode(self.graph, dependencies, edge_data,
                                              len(dependencies), params))
                 nodes.append(node)
                 role_nodes[binary.role] = node
-            self.instantiate()
         except Exception:
             try:
                 self.close()
@@ -269,7 +299,11 @@ class _ChildGraph:
 
 
 class GreenContextPair:
-    """SM90 communication/compute split; exact partition is queried from CUDA."""
+    """SM90 communication/compute split; exact partition is queried from CUDA.
+
+    GC_MOE_PRIMARY_CTX=1 binds all role kernels to the primary context and
+    uses the split for grid sizes only.
+    """
 
     @_runtime_locked
     def __init__(self, device_index: int | None = None,
@@ -278,6 +312,7 @@ class GreenContextPair:
             raise RuntimeError(f"kernel runtime is {_RUNTIME_STATE}")
         torch.cuda.init()
         self.primary_context = _ok(cu.cuCtxGetCurrent())
+        self.primary_ctx_roles = _get_env_int('GC_MOE_PRIMARY_CTX', 0) != 0
         if requested_dispatch_sms is None:
             requested_dispatch_sms = _get_env_int('GC_MOE_SM90_DISPATCH_SMS', 4)
         if device_index is None:
@@ -286,12 +321,15 @@ class GreenContextPair:
         green_resources = _green_resources()
         total, compute, communication = green_resources.get_sm_split(
             self.device, requested_dispatch_sms)
-        workqueue = (green_resources.get_balanced_workqueue()
-                     if _get_env_int('GC_MOE_SM90_BALANCED_WORKQUEUES', 1)
-                     else None)
+        # Resolve once, before partition sizes affect launch geometry. Captured
+        # graph replay and role preparation only use this cached resource class.
+        self.schedule_policy = select_sm90_schedule_policy(total)
+        workqueue = None
+        if not self.primary_ctx_roles and _get_env_int('GC_MOE_SM90_BALANCED_WORKQUEUES', 1):
+            workqueue = green_resources.get_balanced_workqueue()
         self.compute_sms = compute.sm.smCount
         self.dispatch_sms = communication.sm.smCount
-        parts = (communication, compute)
+        parts = () if self.primary_ctx_roles else (communication, compute)
         if self.compute_sms < 32 or self.compute_sms % 2 or \
                 self.dispatch_sms <= 1 or self.compute_sms + self.dispatch_sms != total:
             raise RuntimeError('unsupported Green SM partition')
@@ -416,14 +454,26 @@ class GreenContextPair:
             raise RuntimeError(f"Green context pair is {self._state}")
         self._state = 'closing'
         try:
-            # Callers retire outer captured graphs first. These events then
-            # retire work on each Green context before any child graph unload.
-            for green, event in zip(self.green, self.retirement):
-                status = cu.cuGreenCtxRecordEvent(green, event)[0]
-                if status == cu.CUresult.CUDA_SUCCESS:
-                    _ok(cu.cuEventSynchronize(event))
-                else:
-                    raise RuntimeError(f"cannot retire Green context work: {status}")
+            # Callers retire outer captured graphs first. Primary-role work
+            # belongs to the caller's context, which may no longer be current
+            # during thread-local teardown.
+            if self.primary_ctx_roles:
+                current = _ok(cu.cuCtxGetCurrent())
+                switch_context = int(current) != int(self.primary_context)
+                if switch_context:
+                    _ok(cu.cuCtxPushCurrent(self.primary_context))
+                try:
+                    _ok(cu.cuCtxSynchronize())
+                finally:
+                    if switch_context:
+                        _ok(cu.cuCtxPopCurrent())
+            else:
+                for green, event in zip(self.green, self.retirement):
+                    status = cu.cuGreenCtxRecordEvent(green, event)[0]
+                    if status == cu.CUresult.CUDA_SUCCESS:
+                        _ok(cu.cuEventSynchronize(event))
+                    else:
+                        raise RuntimeError(f"cannot retire Green context work: {status}")
             for graph in self.graphs.values():
                 graph.close()
             for graph in self._failed_children:

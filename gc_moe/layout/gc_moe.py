@@ -16,6 +16,12 @@ MAX_EXPERTS = 2048
 MAX_EXPERTS_PER_RANK = 512
 MAX_RING_BLOCKS = 1 << 20
 MAX_SHARED_L2_BLOCKS = 1 << 15
+# Accumulator barriers reserved here; the compute role indexes them by
+# tile.epilogue_stages, so the two depths must agree.
+ACCUM_BARRIER_STAGES = 2
+# Role 3 uses one dispatch warpgroup and two combine warpgroups.
+COMBINE_WARPS = 8
+FINALIZE_THREADS = (4 + COMBINE_WARPS) * 32
 
 
 def align(value: int, multiple: int) -> int:
@@ -76,18 +82,24 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
         reserve('pull', dispatch_warps * pull_stages * pull_bytes, 1024)
     reserve('cd', max(2 * 2 * store_m_l1 * (block_n // 2),
                       2 * store_m_l2 * block_n * 2), 1024)
-    reserve('data_a', stages * (block_m // 2) * block_k, 1024)
-    reserve('data_b', stages * block_n * block_k, 1024)
-    reserve('data_sfa', stages * sf_block_m * 4, 4)
-    reserve('data_sfb', stages * block_n * 4, 4)
+    if role == 1:
+        # Dispatch only pulls remote tokens into the ring; MMA stage planes
+        # belong to the compute role.
+        values['data_a'] = values['data_b'] = 0
+        values['data_sfa'] = values['data_sfb'] = 0
+    else:
+        reserve('data_a', stages * (block_m // 2) * block_k, 1024)
+        reserve('data_b', stages * block_n * block_k, 1024)
+        reserve('data_sfa', stages * sf_block_m * 4, 4)
+        reserve('data_sfb', stages * block_n * 4, 4)
     reserve('amax', 8 * store_m_l1 * 4, 8)
     reserve('tasks', 2 * 32, 16)
     reserve('dispatch_bars', dispatch_warps * pull_stages * 8, 8)
     reserve('data_full', stages * 8, 8)
     reserve('data_empty', stages * 8, 8)
-    reserve('accum_full', 2 * 8, 8)
-    reserve('accum_empty', 2 * 8, 8)
-    reserve('combine_bars', 16 * 8, 8)
+    reserve('accum_full', ACCUM_BARRIER_STAGES * 8, 8)
+    reserve('accum_empty', ACCUM_BARRIER_STAGES * 8, 8)
+    reserve('combine_bars', COMBINE_WARPS * 8, 8)
     reserve('task_full', 2 * 8, 8)
     reserve('task_empty', 2 * 8, 8)
     reserve('tmem_ptr', 4, 4)
@@ -98,8 +110,6 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
 def _signal_offsets() -> dict[str, int]:
     fields = (
         ('grid_sync_count', 4, 4),
-        ('nvl_barrier_counter', 1, 4),
-        ('nvl_barrier_signals', 2, 4),
         ('l1_task_count', 2, 4),
         ('l2_task_count', 2, 4),
         ('shared_l1_task_count', 2, 4),
@@ -107,11 +117,16 @@ def _signal_offsets() -> dict[str, int]:
         # Persistent receive-generation parity: replay N reads/writes
         # generation parity & 1 of expert_recv_count/expert_recv_count_sum
         # (slot range [gen * count, (gen + 1) * count) inside each field's
-        # dual-generation region); role 3 flips this word once per replay
-        # after the finalize grid sync.  Lives in the header padding.
+        # dual-generation region); role 3 flips this word once per replay.
+        # Lives in the header padding.  Role 1 publishes the role 3 epoch
+        # at its entry, so role 3 reads it instead of a grid barrier.
         ('recv_parity', 1, 4),
+        ('role3_epoch', 1, 4),
+        ('routed_pool_blocks', 1, 4),
+        # ECO keeps the dispatch rank barrier (replica pulls read canonical index rows on their owner rank)
+        ('nvl_barrier_counter', 1, 4),
+        ('nvl_barrier_signals', 2, 4),
         ('combine_ready_grid_idx', MAX_RANKS, 8),
-        ('peer_grid_idx', MAX_RANKS, 8),
         ('expert_send_count', MAX_EXPERTS, 8),
         ('expert_recv_count', 2 * MAX_EXPERTS, 8),
         ('expert_recv_count_sum', 2 * MAX_EXPERTS_PER_RANK, 8),
@@ -125,7 +140,7 @@ def _signal_offsets() -> dict[str, int]:
     result = {}
     for name, count, element_bytes in fields:
         field_alignment = 128 if name in (
-            'combine_ready_grid_idx', 'peer_grid_idx', 'expert_send_count'
+            'combine_ready_grid_idx', 'expert_send_count'
         ) else element_bytes
         offset = align(offset, field_alignment)
         result[name] = offset

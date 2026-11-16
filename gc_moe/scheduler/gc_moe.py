@@ -27,6 +27,7 @@ from ..ptx.ld_st import (
     ld_volatile_u64,
     warp_wait_count_u64,
     st_global_u32,
+    ld_acquire_sys_u64,
     atom_add_u32,
     st_async_cluster_u32x4,
 )
@@ -368,6 +369,9 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
             expert_counts[wave] = warp_wait_count_u64(
                 recv_ptr + slot_idx * Uint32(2), Uint32(1) if slot_idx < eco_num_fixed else Uint32(0),
                 dispatch_sms * num_ranks)
+            # Without the dispatch rank barrier, the acquire imports every rank's route/count stores
+            if slot_idx < eco_num_fixed:
+                expert_counts[wave] = Uint32(ld_acquire_sys_u64(recv_ptr + slot_idx * Uint32(2)))
         eco_trace_point(signals, 10, False, eco_trace, eco_base)
         eco_trace_ring_point(signals, 4, block, eco_trace, eco_base)
     else:
@@ -379,6 +383,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                 while Uint32(count >> 32) != Uint32(
                         dispatch_sms * num_ranks):
                     count = ld_volatile_u64(recv_ptr + local_expert * 2)
+                count = ld_acquire_sys_u64(recv_ptr + local_expert * 2)
             expert_counts[wave] = Uint32(count)
         eco_trace_ring_point(signals, 4, block, eco_trace, eco_base)
     cute.arch.sync_warp()

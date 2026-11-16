@@ -4,41 +4,62 @@ GC MoE is a CuTe DSL implementation of FP8/FP4 mixture-of-experts inference
 with CUDA Green Contexts for NVIDIA Hopper and Blackwell GPUs. It overlaps
 expert-parallel token dispatch with
 Tensor Core computation, then combines the expert outputs through a CUDA Graph
-with three kernel nodes (four for SM90 fused SE).
+with three kernel nodes (four or five for SM90 fused SE).
 The operator supports routed experts and optional fused shared
 experts (SE), with FP8 activations, packed FP4 routed weights, FP8 shared
 weights and BF16 outputs.
 
 GPU kernels are JIT compiled on first use. Installation builds a Python wheel;
-it does not compile CUDA kernels. The current package version is `0.3.1`.
+it does not compile CUDA kernels.
 
 ## Performance
 
 Decode latency comparing GC MoE with Mega MoE using CUDA Graph replay on eight
-GPUs. Each point uses 1–256 tokens per rank; total tokens equal eight times the
-per-rank count. The figures use the measurements recorded in the linked reports.
+or 32 GPUs. Each point uses 1–256 tokens per rank; total tokens equal eight or
+32 times the per-rank count. The figures use the measurements recorded in the
+linked reports.
 
 ### Hopper
 
+#### H20
+
 DSV4.1-Flash on eight NVIDIA H20 GPUs.
 
-#### Routed experts (non-SE)
+##### Routed experts (non-SE)
 
 ![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on eight H20 GPUs](docs/h20_dsv41_flash_gc_moe.png)
 
 [Full H20 non-SE accuracy and performance data](docs/h20_gc_moe.md).
 
-#### Fused shared experts (SE)
+##### Fused shared experts (SE)
 
 ![DSV4.1-Flash fused SE: gc_se versus gc_unfused and mega_unfused on eight H20 GPUs](docs/h20_dsv41_flash_gc_moe_se.png)
 
 [Full H20 SE accuracy and performance data](docs/h20_gc_moe_se.md).
 
+#### H100 / L20Z
+
+DSV4.1-Flash on eight NVIDIA L20Z (H100) GPUs.
+
+##### Routed experts (non-SE)
+
+![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on eight H100 GPUs](docs/h100_dsv41_flash_gc_moe.png)
+
+[Full H100 non-SE accuracy and performance data](docs/h100_gc_moe.md).
+
+##### Fused shared experts (SE)
+
+![DSV4.1-Flash fused SE: gc_se versus gc_unfused and mega_unfused on eight H100 GPUs](docs/h100_dsv41_flash_gc_moe_se.png)
+
+[Full H100 SE accuracy and performance data](docs/h100_gc_moe_se.md).
+
 ### Blackwell
 
-GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
+#### B300 / L20D
 
-#### Routed experts (non-SE)
+GLM5.2 and DSV4.1-Flash on eight NVIDIA L20D (B300) GPUs.
+
+##### Routed experts (non-SE)
 
 ![GLM5.2 non-SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_glm52_gc_moe.png)
 
@@ -46,7 +67,7 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
 
 [Full B300 non-SE accuracy and performance data](docs/b300_gc_moe.md).
 
-#### Fused shared experts (SE)
+##### Fused shared experts (SE)
 
 ![GLM5.2 fused SE: GC MoE versus Mega MoE latency and speedup on eight B300 GPUs](docs/b300_glm52_gc_moe_se.png)
 
@@ -54,19 +75,60 @@ GLM5.2 and DSV4.1-Flash on eight NVIDIA B300 GPUs.
 
 [Full B300 SE accuracy and performance data](docs/b300_gc_moe_se.md).
 
+#### GB200 / L20A
+
+GLM5.2 and DSV4.1-Flash on 32 NVIDIA L20A (GB200) GPUs.
+
+##### Routed experts (non-SE)
+
+![GLM5.2 non-SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_glm52_gc_moe.png)
+
+![DSV4.1-Flash non-SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_dsv41_flash_gc_moe.png)
+
+[Full GB200 non-SE accuracy and performance data](docs/gb200_gc_moe.md).
+
+##### Fused shared experts (SE)
+
+![GLM5.2 fused SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_glm52_gc_moe_se.png)
+
+![DSV4.1-Flash fused SE: GC MoE versus Mega MoE latency and speedup on 32 GB200 GPUs](docs/gb200_dsv41_flash_gc_moe_se.png)
+
+[Full GB200 SE accuracy and performance data](docs/gb200_gc_moe_se.md).
+
+#### RTX PRO 5000
+
+GLM5.2 and DSV4.1-Flash on eight NVIDIA RTX PRO 5000 72GB Blackwell GPUs.
+
+##### Routed experts (non-SE)
+
+![GLM5.2 non-SE: GC MoE versus FlashInfer Cake and CuTeDSL on eight RTX PRO 5000 GPUs](docs/pro5000_glm52_gc_moe.png)
+
+![DSV4.1-Flash non-SE: GC MoE versus FlashInfer Cake and CuTeDSL on eight RTX PRO 5000 GPUs](docs/pro5000_dsv41_flash_gc_moe.png)
+
+[Full RTX PRO 5000 non-SE accuracy and performance data](docs/pro5000_gc_moe.md).
+
+##### Fused shared experts (SE)
+
+![GLM5.2 fused SE latency and speedup over Cake on eight RTX PRO 5000 GPUs](docs/pro5000_glm52_gc_moe_se.png)
+
+![DSV4.1-Flash fused SE latency and speedup over Cake on eight RTX PRO 5000 GPUs](docs/pro5000_dsv41_flash_gc_moe_se.png)
+
+[Full RTX PRO 5000 SE accuracy and performance data](docs/pro5000_gc_moe_se.md).
+
 ## Quick start
 
 ### Requirements
 
 - Linux and an NVIDIA Hopper or Blackwell GPU. The Hopper SM90 path uses
-  `sm_90a` kernels and is validated on H20; the Blackwell path is validated
-  on B300 (compute capability 10.3) and selects `sm_103f`.
+  `sm_90a` kernels and is validated on H20 and H100. The Blackwell SM100 path
+  supports compute capabilities 10.0 and 10.3, selecting `sm_100f` or
+  `sm_103f`, respectively. The SM120 path uses `sm_120a` kernels and is
+  validated on RTX PRO 5000 (compute capability 12.0).
 - A CUDA driver supporting Green Contexts. Multi-GPU execution also requires
   peer-accessible GPUs and PyTorch symmetric memory, with one process per GPU.
 - Python 3.10 or later.
-- A system CUDA Toolkit providing `/usr/local/cuda/bin/ptxas`. The validated
-  toolchain is CUDA 13.2 with ptxas 13.2.78; the assembler must support the PTX
-  emitted by the installed CuTe DSL.
+- A CUDA Toolkit assembler, resolved at `/usr/local/cuda/bin/ptxas` by default. The validated
+  assembler is ptxas 13.2.78.
 
 Runtime dependencies are constrained by [setup.py](setup.py):
 
@@ -80,7 +142,7 @@ Runtime dependencies are constrained by [setup.py](setup.py):
 [requirements.txt](requirements.txt) records the exact versions used for the
 runtime, build, tests and benchmarks. It also includes `deep-gemm==2.8.2`, which
 is used by the comparison scripts. Use a reference build exposing
-`deep_gemm.fp8_fp4_mega_moe` for Blackwell comparisons or
+`deep_gemm.fp8_fp4_mega_moe` for SM100 comparisons or
 `deep_gemm.sm90_fp8_fp4_mega_moe` for Hopper comparisons.
 
 ### Installation
@@ -98,27 +160,27 @@ python -m pip install dist/*.whl
 
 `build.sh` uses `python` from `PATH` and replaces the existing `build/`, `dist/`
 and package metadata directories. Kernel compilation happens when the operator
-first encounters a new configuration. The JIT path uses the system assembler
-at `/usr/local/cuda/bin/ptxas` and checks its compatibility with the generated
-PTX.
+first encounters a new configuration. The JIT uses the assembler at
+`/usr/local/cuda/bin/ptxas` by default. Set `GC_MOE_PTXAS` to select another
+assembler compatible with the generated PTX.
 
 For editable development, use `python -m pip install -e .` instead of installing
 the wheel. Wheel versions include the Git revision for a clean tree, or
 `+local` for a dirty tree or a source copy without Git metadata. Set
-`GC_MOE_USE_LOCAL_VERSION=0` to build the plain `0.3.1` version.
+`GC_MOE_USE_LOCAL_VERSION=0` to build the plain public version.
 
 ## Interfaces
 
-The public entry points are exported from `gc_moe`. The following interfaces
-target Blackwell:
+The public entry points are exported from `gc_moe`. SM100 uses the following
+allocation, weight transform and execution interfaces.
 
 | Interface | Purpose |
 | --- | --- |
 | `get_symm_buffer_for_gc_moe` | Allocate and rendezvous the symmetric input and workspace buffers. |
 | `transform_weights_for_gc_moe` | Convert quantized routed or shared weights to the required layout. |
 | `fp8_fp4_gc_moe` | Write routed-expert output, optionally including shared experts, into `y`. |
-| `get_block_m_for_gc_moe` | Query the token block size, including for shared-input scale staging. |
-| `GCSymmBuffer` | Own input views, peer addresses and workspace storage. |
+| `get_block_m_for_gc_moe` | Query the token block size for SM100 and SM120 shared-input scale staging. |
+| `GCSymmBuffer` | Own SM100 input views, peer addresses and workspace storage. |
 
 Hopper uses separate SM90 interfaces, also exported from `gc_moe`:
 
@@ -136,7 +198,38 @@ use E4M3FN with contiguous FP32 K128 scales. Pass `shared_l1_weights` and
 [routed-expert test](tests/test_sm90_gc_moe.py) and
 [shared-expert test](tests/test_sm90_gc_moe_se.py) for complete preparation.
 
-The input contract and examples below describe the Blackwell interfaces.
+The SM90 Green Context selects and caches its scheduling policy from CUDA's
+device-visible total SM count before splitting communication and compute:
+devices with at least 128 SMs, including full 132-SM H100 devices, use
+the small-batch pipelined schedule; smaller devices, including 78-SM H20, keep
+the legacy schedule. This selection covers routed and
+shared launch geometry and shared-memory budgets and does not tune during graph
+replay.
+
+For calls with shared experts, the high-SM policy uses one routed compute CTA
+per compute SM at 1–16 tokens/rank. Its shared grid covers the shared task count
+with a floor of half the compute SM count. Routed-only calls use two routed
+compute CTAs per compute SM in this range. These rules apply to all supported
+expert-parallel group sizes and model shapes.
+
+SM120 (compute capability 12.0) has separate interfaces.
+
+| Interface | Purpose |
+| --- | --- |
+| `get_symm_buffer_for_gc_moe_sm120` | Allocate and rendezvous the SM120 workspace. |
+| `transform_weights_for_gc_moe_sm120` | Convert quantized routed or shared weights for SM120. |
+| `sm120_fp8_fp4_gc_moe` | Write SM120 routed and optional fused shared output into `y`. |
+| `SM120GCSymmBuffer` | Own SM120 input views, peer addresses and workspace storage. |
+
+The SM120 entry points use the SM100 weight formats described below, including
+packed `torch.int32` UE8M0 scales for both routed and shared experts.
+Shared-input scale staging also uses the same layout.
+If supplying `num_tokens_bound`, use the same positive bound on all ranks and
+cover every rank's token count. Valid expert IDs within each token must be
+distinct. If repeated IDs exhaust a source's capacity for an expert, SM120
+returns NaN for the affected output rows and counts only admitted routes.
+See the [SM120 test](tests/test_sm120_gc_moe.py)
+for complete routed and shared-expert examples.
 
 ### Input contract
 
@@ -335,6 +428,26 @@ cosine thresholds are 0.97 for non-SE and 0.99 for SE. Additional eight-rank
 readiness checks are available in [the non-SE readiness test](tests/test_gc_moe_readiness.py)
 and [the SE readiness test](tests/test_gc_moe_se_readiness.py).
 
+The SM90 wrappers use the DSV4.1-Flash preset. Pass `--gc-only` when the
+DeepGEMM build lacks the SM90 comparison kernels. The SE wrapper then tests
+the fused shared expert against the independent reference and times the fused
+operator. The DeepGEMM quantization utilities are still required.
+
+```bash
+bash scripts/run_sm90.sh 4 both --gc-only
+bash scripts/run_sm90_se.sh 4 both --gc-only
+```
+
+The SM120 benchmarks use FlashInfer Cake MegaMoE and optionally FlashInfer
+CuTe DSL W4A8 MegaMoE for routed experts. Pass `--arms gc` to the benchmark
+stage when FlashInfer is unavailable.
+
+```bash
+bash scripts/run_sm120.sh 8 test
+bash scripts/run_sm120.sh 8 bench --arms baseline,cake,gc
+bash scripts/run_sm120_se.sh 8 both
+```
+
 Each accuracy or benchmark stage waits for all selected GPUs to be idle:
 utilization 0%, no compute processes and at least 51200 MiB free per GPU,
 observed over at least three samples and ten seconds. `GC_MOE_PYTHON_BIN` selects the
@@ -355,7 +468,9 @@ ranks. Decode average speedup is the arithmetic mean of the per-point ratios
 | --- | --- | --- |
 | `GC_MOE_USE_LOCAL_VERSION` | `1` | Include a local revision in the wheel version; use `0` for the public version. |
 | `GC_MOE_WHEEL_CUDA_VERSION` | Unset | Append a user-provided CUDA label to the local wheel version. |
-| `GC_MOE_DISPATCH_SMS` | `16` | Request dispatch SMs; the driver determines the aligned dispatch/compute partition. |
+| `GC_MOE_PTXAS` | `/usr/local/cuda/bin/ptxas` | Select the assembler used by the JIT. |
+| `GC_MOE_DISPATCH_SMS` | `8` for ≤8 ranks; otherwise `16` | Override the SM100 dispatch SM request for the operator's communication group; the driver determines the aligned dispatch/compute partition. |
+| `GC_MOE_PRIMARY_CTX` | `0` | Run the role kernels in the primary context instead of Green contexts; the SM split then fixes grid sizes only. |
 | `GC_MOE_BALANCED_WORKQUEUES` | `1` | Request balanced Green workqueues when supported by the driver. |
 | `GC_MOE_NVLINK_BARRIER_TIMEOUT_SECS` | `3600` | Set the positive cross-rank barrier timeout in seconds. |
 

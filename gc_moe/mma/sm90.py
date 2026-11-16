@@ -43,21 +43,21 @@ def wgmma_rs_k128(frag: tuple, desc_b: Uint64, n: cutlass.Constexpr,
 
 
 @dsl_user_op
-def decode_fragment(words: cute.Pointer, scales: cute.Pointer, *, loc=None, ip=None):
-    """Four K32 register-A fragments from two aligned LDS128 vectors."""
-    body = '{ .reg .b32 sf0, sf1, o, lo, hi, mag, tmp, sign; '
+def decode_fragment_nib4(words: cute.Pointer, scales: cute.Pointer, *, loc=None, ip=None):
+    """Four K32 register-A fragments; one 4-bit packed exponent word.
+
+    Weight exponents are stored two per byte (even index in the low nibble).
+    One aligned 32-bit LDS carries all eight exponents, and each group/row
+    nibble is extracted with a compile-time ``bfe`` position.
+    """
+    body = '{ .reg .b32 sf, o, lo, hi, mag, tmp, sign; '
     body += '.reg .b32 p<8>; '
-    body += 'ld.shared.v2.u32 {sf0, sf1}, [$16]; '
+    body += 'ld.shared.u32 sf, [$16]; '
     body += 'ld.shared.v4.u32 {p0,p1,p2,p3}, [$17]; '
     body += 'ld.shared.v4.u32 {p4,p5,p6,p7}, [$17+512]; '
     for g in range(4):
         for r in range(2):
-            if g == 0:
-                body += f'and.b32 o, sf{r}, 255; '
-            elif g == 3:
-                body += f'shr.u32 o, sf{r}, 24; '
-            else:
-                body += f'prmt.b32 o, sf{r}, 0, {0x4440 + g}; '
+            body += f'bfe.u32 o, sf, {4 * g + 16 * r}, 4; '
             body += 'mad.lo.u32 lo, o, 0x08080800, 0x0c080000; '
             body += 'mad.lo.u32 hi, o, 0x08080808, 0x1c181410; '
             body += f'and.b32 mag, p{g * 2 + r}, 0x77777777; '
@@ -133,6 +133,38 @@ def wgmma_rs_k32_pair(fragment0: tuple, fragment1: tuple, descriptor: Uint64,
              f'{{{out1}}}, {{{in1}}}, b, 0, 1, 1; '
              'wgmma.commit_group.sync.aligned; ')
     body += 'wgmma.wait_group.sync.aligned 0; '
+    body += '}'
+    types = ['f32'] * count
+    result = llvm.inline_asm(
+        ir.Type.parse('!llvm.struct<(' + ','.join(types) + ')>'),
+        [*(x.ir_value() for x in (*fragment0, *fragment1)), descriptor.ir_value()], body,
+        ','.join(['=f'] * count + ['r'] * 8 + ['l', '~{memory}']),
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    parts = tuple(Float32(llvm.extractvalue(T.f32(), result, [i])) for i in range(count))
+    return parts
+
+
+@dsl_user_op
+def wgmma_rs_k32_pair_issue(fragment0: tuple, fragment1: tuple, descriptor: Uint64,
+                       n: cutlass.Constexpr,
+                       *, loc=None, ip=None):
+    """Issue independent K32 banks; callers must wait before consuming either.
+
+    Keep A source registers unchanged until the paired wait has completed.
+    """
+    count = n
+    out0 = ','.join('$' + str(i) for i in range(n // 2))
+    out1 = ','.join('$' + str(n // 2 + i) for i in range(n // 2))
+    in0 = ','.join('$' + str(count + i) for i in range(4))
+    in1 = ','.join('$' + str(count + 4 + i) for i in range(4))
+    body = '{ .reg .b64 b; '
+    body += (f'mov.b64 b, ${count + 8}; wgmma.fence.sync.aligned; '
+             f'wgmma.mma_async.sync.aligned.m64n{n}k32.f32.e4m3.e4m3 '
+             f'{{{out0}}}, {{{in0}}}, b, 0, 1, 1; '
+             'add.u64 b, b, 2; '
+             f'wgmma.mma_async.sync.aligned.m64n{n}k32.f32.e4m3.e4m3 '
+             f'{{{out1}}}, {{{in1}}}, b, 0, 1, 1; '
+             'wgmma.commit_group.sync.aligned; ')
     body += '}'
     types = ['f32'] * count
     result = llvm.inline_asm(

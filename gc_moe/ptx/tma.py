@@ -1,8 +1,8 @@
-"""Raw-address 1D bulk copies for the GC rank-to-rank token pull.
+"""PTX asynchronous copies and TensorMap operations for GC MoE.
 
-CuTe's tiled TMA atoms require tensor-map descriptors. The reference uses
-the raw-address cp.async.bulk forms for this particular remote token path;
-the matrix load path will use CuTe tensor-map atoms separately.
+Raw-address 1D bulk copies serve the SM90 matrix-staging path.
+TensorMap loads/stores and async-proxy fences serve the SM100 path.
+The helpers expose their barrier and cache-policy operands explicitly.
 """
 
 from __future__ import annotations
@@ -16,6 +16,13 @@ from .ld_st import (
     EVICT_FIRST,
     EVICT_NORMAL,
 )
+
+
+@dsl_user_op
+def global_async_proxy_fence(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], 'fence.proxy.async.global;', '~{memory}',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
+                    loc=loc, ip=ip)
 
 
 @dsl_user_op
@@ -47,13 +54,13 @@ def prefetch_tensormap(desc: cute.Pointer, *, loc=None, ip=None) -> None:
 @dsl_user_op
 def bulk_g2s_1d(dst_smem: cute.Pointer, src_gmem: cute.Pointer,
                 num_bytes: Uint32, mbar_smem: cute.Pointer,
-                *, loc=None, ip=None) -> None:
+                *, cache_hint: int = EVICT_FIRST, loc=None, ip=None) -> None:
     llvm.inline_asm(
         None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
                src_gmem.toint(loc=loc, ip=ip).ir_value(),
                num_bytes.ir_value(loc=loc, ip=ip),
                mbar_smem.toint(loc=loc, ip=ip).ir_value(),
-               Uint64(EVICT_FIRST).ir_value(loc=loc, ip=ip)],
+               Uint64(cache_hint).ir_value(loc=loc, ip=ip)],
         'cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.'
         'L2::cache_hint [$0], [$1], $2, [$3], $4;',
         'r,l,r,r,l,~{memory}', has_side_effects=True,
@@ -92,6 +99,59 @@ def tile_g2s_2cta_2d(dst_smem: cute.Pointer, desc_gmem: cute.Pointer,
         'mbarrier::complete_tx::bytes.L2::cache_hint '
         '[$0], [$1, {$3, $4}], [$2], $5;',
         'r,l,r,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tile_g2s_2d(dst_smem: cute.Pointer, desc_gmem: cute.Pointer,
+                mbar_smem: cute.Pointer, inner: Uint32, outer: Uint32,
+                cache_hint: Uint64, *, loc=None, ip=None) -> None:
+    """Single-CTA 2D TensorMap load (SM120, no cluster)."""
+    llvm.inline_asm(
+        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
+               desc_gmem.toint(loc=loc, ip=ip).ir_value(),
+               mbar_smem.toint(loc=loc, ip=ip).ir_value(),
+               inner.ir_value(loc=loc, ip=ip), outer.ir_value(loc=loc, ip=ip),
+               cache_hint.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.tensor.2d.shared::cluster.global.'
+        'mbarrier::complete_tx::bytes.L2::cache_hint '
+        '[$0], [$1, {$3, $4}], [$2], $5;',
+        'r,l,r,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def tile_g2s_4d(dst_smem: cute.Pointer, desc_gmem: cute.Pointer,
+                mbar_smem: cute.Pointer, k: Uint32, n: Uint32,
+                domain: Uint32, expert: Uint32, cache_hint: Uint64,
+                *, loc=None, ip=None) -> None:
+    """Single-CTA 4D TensorMap load, including FP4->8bit SMEM unpack (SM120)."""
+    llvm.inline_asm(
+        None, [dst_smem.toint(loc=loc, ip=ip).ir_value(),
+               desc_gmem.toint(loc=loc, ip=ip).ir_value(),
+               mbar_smem.toint(loc=loc, ip=ip).ir_value(),
+               k.ir_value(loc=loc, ip=ip), n.ir_value(loc=loc, ip=ip),
+               domain.ir_value(loc=loc, ip=ip), expert.ir_value(loc=loc, ip=ip),
+               cache_hint.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.tensor.4d.shared::cluster.global.'
+        'mbarrier::complete_tx::bytes.L2::cache_hint '
+        '[$0], [$1, {$3, $4, $5, $6}], [$2], $7;',
+        'r,l,r,r,r,r,r,l,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def prefetch_g2s_4d(desc_gmem: cute.Pointer, k: Uint32, n: Uint32,
+                    domain: Uint32, expert: Uint32,
+                    *, loc=None, ip=None) -> None:
+    """Fire-and-forget 4D TensorMap L2 prefetch."""
+    llvm.inline_asm(
+        None, [desc_gmem.toint(loc=loc, ip=ip).ir_value(),
+               k.ir_value(loc=loc, ip=ip), n.ir_value(loc=loc, ip=ip),
+               domain.ir_value(loc=loc, ip=ip), expert.ir_value(loc=loc, ip=ip)],
+        'cp.async.bulk.prefetch.tensor.4d.L2.global.tile '
+        '[$0, {$1, $2, $3, $4}];',
+        'l,r,r,r,r,~{memory}', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
 
 
@@ -135,10 +195,10 @@ def tile_s2g_2d(desc_gmem: cute.Pointer, src_smem: cute.Pointer,
 
 @dsl_user_op
 def tma_store_fence(*, loc=None, ip=None) -> None:
-    """Publish completed STSM/shared stores to the async TMA proxy.
+    """Publish completed generic shared writes to the async proxy.
 
-    Call only after the epilogue warp group's shared-memory synchronization
-    and before issuing ``tile_s2g_2d`` on its elected TMA store lane.
+    Call after copy/store completion and the required thread synchronization,
+    before an async TMA store or WGMMA reads the shared stage.
     """
     llvm.inline_asm(None, [], 'fence.proxy.async.shared::cta;', '',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)

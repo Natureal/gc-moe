@@ -1698,6 +1698,86 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     }
 #endif
 
+#if UNIT_HYDRO and defined(UNIT_HPOST) and UNIT_HPOST > 0
+    // ---- cost post-pass (mirrors hydro.py HydroPlanner._post): the hydro plan balances blocks only; the measured
+    // rank cost f = 2521 * blocks + 541 * active slots + 7 * tokens (EP32 bm96 GEMM-done fit, x1000) also counts
+    // active copies and tokens. Up to UNIT_HPOST rounds: on the costliest rank (lowest index on ties) move one
+    // even unit or the whole copy of a replicated expert to another copy of it, the move that lowers
+    // max(f_src, f_dst) most (ties: lowest source slot, amount, destination slot).
+    {
+        __shared__ int hp_f[kR];
+        __shared__ unsigned long long hp_best;
+        __shared__ int hp_top;
+        const auto hcost = [&](const int& x) { return 2521 * ((x + kBM - 1) / kBM) + 541 * (x > 0) + 7 * x; };
+        for (uint32_t r = tid; r < kR; r += kPlanThreads)
+            hp_f[r] = 0;
+        plan_sync();
+        for (uint32_t s = tid; s < kP; s += kPlanThreads)
+            if (q[s])
+                atomicAdd(&hp_f[s / kS], hcost(q[s]));
+        plan_sync();
+        // the costliest rank, lowest index on ties (warp 0; f < 2^25)
+        const auto pick_top = [&]() {
+            unsigned long long k = 0ull;
+            for (uint32_t r = tid; r < kR; r += 32u)
+                k = max(k, (static_cast<unsigned long long>(hp_f[r]) << 6) | (63u - r));
+            const uint32_t hi = __reduce_max_sync(~0u, static_cast<uint32_t>(k >> 32));
+            const uint32_t lo = __reduce_max_sync(~0u, static_cast<uint32_t>(k >> 32) == hi ? static_cast<uint32_t>(k) : 0u);
+            if (tid == 0) {
+                hp_top = 63 - static_cast<int>(lo & 63u);
+                hp_best = 0ull;
+            }
+        };
+        if (tid < 32)
+            pick_top();
+        plan_sync();
+        for (int it = 0; it < UNIT_HPOST; ++ it) {
+            const int top = hp_top, ftop = hp_f[top];
+            unsigned long long mykey = 0ull;
+            for (uint32_t c = tid; c < kS * 2u * 32u; c += kPlanThreads) {
+                const int a = top * static_cast<int>(kS) + static_cast<int>(c / 64u), ti = (c / 32u) & 1u, jj = c & 31u;
+                const int e = phy[a], qa = q[a];
+                if (qa <= 0 or ecnt[e] < 2 or jj >= ecnt[e])
+                    continue;
+                const int ne = static_cast<int>(counts[e]), nb = (ne + kBM - 1) / kBM;
+                const int t = ti ? qa : ne / nb;
+                const int b = cslot[eoff[e] + jj], rb = b / static_cast<int>(kS);
+                if (t <= 0 or t > qa or b == a or rb == top)
+                    continue;
+                const int fa = ftop - hcost(qa) + hcost(qa - t), fb = hp_f[rb] - hcost(q[b]) + hcost(q[b] + t);
+                const int gain = ftop - max(fa, fb);
+                if (gain > 0) {
+                    const unsigned long long low = (static_cast<unsigned long long>(a) << 22) |
+                                                   (static_cast<unsigned long long>(t) << 11) | static_cast<unsigned long long>(b);
+                    mykey = max(mykey, (static_cast<unsigned long long>(gain) << 33) | ((1ull << 33) - 1ull - low));
+                }
+            }
+            {   // warp max of the 64-bit keys, then one shared atomic per warp
+                const uint32_t hi = __reduce_max_sync(~0u, static_cast<uint32_t>(mykey >> 32));
+                const uint32_t lo = __reduce_max_sync(~0u, static_cast<uint32_t>(mykey >> 32) == hi ? static_cast<uint32_t>(mykey) : 0u);
+                if ((tid & 31u) == 0 and (hi | lo))
+                    atomicMax(&hp_best, (static_cast<unsigned long long>(hi) << 32) | lo);
+            }
+            plan_sync();
+            const unsigned long long best = hp_best;
+            if (best == 0ull)
+                break;
+            if (tid < 32) {
+                if (tid == 0) {
+                    const unsigned long long low = (1ull << 33) - 1ull - (best & ((1ull << 33) - 1ull));
+                    const int a = static_cast<int>(low >> 22), t = static_cast<int>((low >> 11) & 2047u), b = static_cast<int>(low & 2047u);
+                    hp_f[a / kS] += hcost(q[a] - t) - hcost(q[a]);
+                    hp_f[b / kS] += hcost(q[b] + t) - hcost(q[b]);
+                    q[a] -= t;
+                    q[b] += t;
+                }
+                __syncwarp();
+                pick_top();
+            }
+            plan_sync();
+        }
+    }
+#endif
     // ---- publish: quotas, canonical starts within each expert's copies (ascending slots) -------------------------
     // Quotas (full units * bm + the partial unit) computed where they are read: no rewrite pass and barrier
 #if UNIT_HYDRO

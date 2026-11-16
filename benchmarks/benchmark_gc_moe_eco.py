@@ -134,6 +134,11 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--num-shared-experts", type=int, default=1)
     ap.add_argument("--shared-weight-gran-k", type=int, choices=[32, 128], default=32)
+    ap.add_argument("--trace-calls", type=int, default=0,
+                    help="GC_MOE_ECO_TRACE=1 builds: after timing a sampled call, run it eagerly this many times (L2 "
+                         "flushed, trace ring zeroed before each) and record every rank's per-call milestones (us since "
+                         "its role1 start; median over the runs): barrier, pull_end, l1_first, l1_last, l2_last, gemm_done, "
+                         "role2_exit, role3_done. Trace runs are for attribution only, not timing.")
     ap.add_argument("--block-m", type=int, default=0, help="pin block M for every mode (0: gc-moe heuristic)")
     ap.add_argument("--output-json", default="")
     args = ap.parse_args()
@@ -185,7 +190,7 @@ def main():
                else np.asarray(phy2log[0][rank * L:(rank + 1) * L]))
         weights = expert_weights(ids, device)
         buf = gc_moe.get_symm_buffer_for_gc_moe(dist.group.WORLD, P, T, TOPK, HIDDEN, INTER, num_shared_experts=NS,
-                                                **({"eco": True} if kind == "eco" else {}))
+                                                **({"eco": True} if kind == "eco" or args.trace_calls else {}))
         bm = gc_api.get_block_m_for_gc_moe(R, P, buf.num_max_tokens_per_rank, T, TOPK)
         if kind == "eco" and os.environ.get("GC_MOE_ECO_BLOCK_M"):
             bm = int(os.environ["GC_MOE_ECO_BLOCK_M"])
@@ -223,6 +228,41 @@ def main():
             per_rank = [None] * R
             dist.all_gather_object(per_rank, med)
             per_call.append(dict(call=i, slowest_rank_median_us=max(per_rank), per_rank_median_us=per_rank))
+            if args.trace_calls:
+                from gc_moe.layout.gc_moe import ECO_SIGNAL_OFFSETS, ECO_TRACE_RING_FIELDS as RF
+                ring = buf.buffer.view(torch.int32)[(buf.layout.eco_base + ECO_SIGNAL_OFFSETS["eco_trace_ring"]) // 4:][
+                    :64 * RF].view(64, RF)
+                # one graph = L2 flush + ring clear + the call; 3 back-to-back replays per run reach the replay steady
+                # state (no host launch skew between ranks), the last replay's (only) ring entry is read
+                cs = torch.cuda.Stream(device=device)
+                cs.wait_stream(torch.cuda.current_stream(device))
+                tg = torch.cuda.CUDAGraph()
+                with torch.cuda.stream(cs):
+                    with torch.cuda.graph(tg, stream=cs):
+                        flush.zero_()
+                        ring.zero_()
+                        call()
+                torch.cuda.current_stream(device).wait_stream(cs)
+                torch.cuda.synchronize()
+                runs = []
+                for _ in range(args.trace_calls):
+                    dist.barrier()
+                    for _ in range(3):
+                        tg.replay()
+                    torch.cuda.synchronize()
+                    e = ring.to(torch.int64).bitwise_and(0xFFFFFFFF).to(torch.float64) / 1000.0
+                    row = e[int(torch.argmax(e[:, 1]))]
+                    # fields: 0 barrier, 6 pull end, 13 first L1 start (inverted), 3 last L1, 7 last L2, 1 GEMM done
+                    # (role3 start), 8 last role2 CTA exit, 9 last role3 warp (ECO reuses some fields: read 0/1/9)
+                    runs.append([row[0], row[6], 4294967.295 - row[13] if row[13] > 0 else float("nan"),
+                                 row[3], row[7], row[1], row[8], row[9]])
+                del tg
+                loc = torch.tensor(np.nanmedian(np.array([[float(v) for v in r] for r in runs]), 0), device=device)
+                alls = [torch.zeros_like(loc) for _ in range(R)]
+                dist.all_gather(alls, loc)
+                per_call[-1]["trace_us"] = dict(zip(("barrier", "pull_end", "l1_first", "l1_last", "l2_last",
+                                                     "gemm_done", "role2_exit", "role3_done"),
+                                                    torch.stack(alls).T.cpu().numpy().round(2).tolist()))
             if rank == 0:
                 print(f"{name:<10} call {i:5d}  slowest {max(per_rank):8.2f} us  fastest {min(per_rank):8.2f}", flush=True)
         s = [c["slowest_rank_median_us"] for c in per_call]

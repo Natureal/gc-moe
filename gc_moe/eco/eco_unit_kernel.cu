@@ -1747,42 +1747,39 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     // rank's row in e's canonical order (recorded by role1); its canonical position is
     // p = sum_s min(c_s, j) + #{s < rank : c_s > j} (round-robin over sources, ascending rank), computed by the
     // active copy whose [start, start + quota) holds p. Result overwrites j; role3 waits for that rank only.
+    // One route per thread: the per-source count loads are independent (pipelined), unlike a warp-per-route
+    // chain that kept the plan kernel (which role3 waits for) on the critical path.
     if (tid < kPlanThreads) {
-        const uint32_t lane = tid & 31u, warp = tid >> 5;
         const auto* done = reinterpret_cast<const volatile uint32_t*>(signals + OFF_ECO_ROUTES_DONE / 4);
-        for (uint32_t b = lane; b < ECO_DISPATCH_SMS; b += 32)
+        for (uint32_t b = 0; b < ECO_DISPATCH_SMS; ++ b)
             while (done[b] != epoch + 1u) {}
-        __syncwarp();
         __threadfence();
-        auto* route_peer = reinterpret_cast<volatile uint32_t*>(signals + OFF_ECO_ROUTE_PEER / 4);
-        const auto* ctab = reinterpret_cast<const volatile uint32_t*>(buffer + OFF_ECO_COUNTS + gen * kR * kP * 2u);
+        auto* route_peer = signals + OFF_ECO_ROUTE_PEER / 4;
+        const auto* ctab = reinterpret_cast<const uint32_t*>(buffer + OFF_ECO_COUNTS + gen * kR * kP * 2u);
         const auto* xroutes = reinterpret_cast<const int64_t*>(buffer + OFF_TOPK);
-        for (uint32_t r = warp; r < num_tokens * ECO_TOPK; r += kPlanWarps) {
-            const int64_t e = xroutes[r];
+        for (uint32_t r = tid; r < num_tokens * ECO_TOPK; r += kPlanThreads) {
+            const int64_t e = __ldg(xroutes + r);
             if (e < 0 or e >= static_cast<int64_t>(kE))
                 continue;
             const int k = ecnt[e], o = eoff[e];
             int dst = cslot[o];
             if (k > 1) {
-                const uint32_t j = route_peer[r];
-                uint32_t part = 0;
-                for (uint32_t s = lane; s < kR; s += 32) {
-                    const uint32_t c = (ctab[s * (kP / 2) + static_cast<uint32_t>(e) / 3u] >>
-                                        ((static_cast<uint32_t>(e) % 3u) * 10u)) & 0x3ffu;
-                    part += min(c, j) + ((s < rank and c > j) ? 1u : 0u);
+                const uint32_t j = __ldcg(route_peer + r), eu = static_cast<uint32_t>(e);
+                const uint32_t shift = (eu % 3u) * 10u, word = eu / 3u;
+                uint32_t pos = 0;
+#pragma unroll 8
+                for (uint32_t src = 0; src < kR; ++ src) {
+                    const uint32_t c = (__ldcg(ctab + src * (kP / 2) + word) >> shift) & 0x3ffu;
+                    pos += min(c, j) + ((src < rank and c > j) ? 1u : 0u);
                 }
-                const uint32_t pos = __reduce_add_sync(0xffffffffu, part);
-                int hit = -1;
-                for (int jj = static_cast<int>(lane); jj < k; jj += 32) {
+                for (int jj = 0; jj < k; ++ jj) {
                     const int c = cslot[o + jj];
-                    const uint32_t st = out_start[c], q = out_quota[c];
-                    if (pos >= st and pos < st + q)
-                        hit = c;
+                    const uint32_t st = out_start[c];
+                    if (pos >= st and pos < st + out_quota[c])
+                        dst = c;
                 }
-                dst = __reduce_max_sync(0xffffffffu, hit);
             }
-            if (lane == 0)
-                route_peer[r] = static_cast<uint32_t>(dst) / kS;
+            route_peer[r] = static_cast<uint32_t>(dst) / kS;
         }
     }
 #endif

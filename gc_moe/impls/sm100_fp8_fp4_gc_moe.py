@@ -32,6 +32,7 @@ from ..common.math import (
 )
 from ..common.tma_copy import load_mixed_k128_tma, use_small_tile_path
 from ..layout.gc_moe import (
+    ECO_MAX_ROUTES,
     ECO_SIGNAL_OFFSETS,
     ECO_TRACE_RING_FIELDS,
     ACCUM_BARRIER_STAGES,
@@ -115,6 +116,7 @@ from ..ptx.utils import (
     sync_aligned,
     sync_unaligned,
     undefined_u32,
+    warp_first_set_bit,
     warp_nth_set_bit,
     warpgroup_reg_alloc,
     warpgroup_reg_dealloc,
@@ -449,6 +451,17 @@ class GCMoERoleKernel:
         # Split pull (ECO): the last GC_MOE_ECO_SPLIT_PULL dispatch warps of each SM pull only replica tokens (from the
         # plan's arrival, alongside the fixed pulls); the others pull only fixed tokens in the unchanged pool order
         self.eco_split_pull = int(__import__('os').environ.get('GC_MOE_ECO_SPLIT_PULL', '0')) if self.eco else 0
+        # Timing probe only (output may be wrong): ECO combine uses the plain per-token readiness wait
+        # (peer = routed id // local slots) instead of acquiring every peer
+        self.eco_combine_probe = self.eco and __import__('os').environ.get('GC_MOE_ECO_COMBINE_PROBE') == '1'
+        # Exact combine readiness (default): each route waits only for the rank that computes it. Every rank's plan
+        # is identical, so the source derives it locally: canonical position (round-robin over sources) of its
+        # slot, then the copy whose [quota_start, quota_start + quota) holds it.
+        self.eco_combine_exact = (self.eco and not self.eco_combine_probe and
+                                  __import__('os').environ.get('GC_MOE_ECO_COMBINE_EXACT', '1') == '1' and
+                                  capacity * topk <= ECO_MAX_ROUTES)
+        self.eco_route_verify = self.eco_combine_exact and \
+            __import__('os').environ.get('GC_MOE_ECO_ROUTE_VERIFY') == '1'
         self.topk_offset_words = layout.views['topk_idx'].offset // 4
         self.input_x_words = layout.views['x'].offset // 4
         self.input_sf_words = layout.views['x_sf'].offset // 4
@@ -596,6 +609,59 @@ class GCMoERoleKernel:
         while (entry >> Uint32(30)) != tag:
             entry = ld_volatile_u32(ptr)
         return (entry >> ((expert % Uint32(3)) * Uint32(10))) & Uint32(0x3ff)
+
+    @cute.jit
+    def _eco_route_peers(self, signals: cute.Tensor, tensor_maps: cute.Tensor, routes: cute.Tensor,
+                         rank_idx: Uint32, num_tokens: Uint32, lane: Uint32, global_warp: Uint32,
+                         gen: Uint32, epoch: Uint32) -> None:
+        """Exact combine readiness: overwrite each local route's recorded canonical slot j with the rank that
+        computes it. Single-copy expert: its copy's rank. Replicated: canonical position
+        p = sum_r min(c_r, j) + #{r < self : c_r > j} (round-robin over sources, ascending rank), then the active
+        copy with quota_start <= p < quota_start + quota (identical plan on every rank, so purely local)."""
+        eco_wait_plan(signals.iterator, epoch, False, self.eco_base, True)
+        qbank = epoch & Uint32(1)
+        tag = (epoch // Uint32(2)) % Uint32(3) + Uint32(1)
+        peer_off = (self.eco_base + ECO_SIGNAL_OFFSETS['eco_route_peer']) // 4
+        quota_off = (self.eco_base + ECO_SIGNAL_OFFSETS['eco_quota']) // 4 + qbank * Uint32(self.eco_qbank_slots)
+        start_off = (self.eco_base + ECO_SIGNAL_OFFSETS['eco_quota_start']) // 4 + \
+            qbank * Uint32(self.eco_qbank_slots)
+        rp_route = global_warp
+        while rp_route < num_tokens * Uint32(self.topk):
+            rp_expert = routes[rp_route]
+            if rp_expert < Uint64(self.route_experts):
+                rp_e = Uint32(rp_expert)
+                rp_word = Uint32(tensor_maps[Uint32(self.eco_copies_words) + rp_e * Uint32(16) +
+                                             lane // Uint32(2)])
+                rp_copy = (rp_word >> ((lane % Uint32(2)) * Uint32(16))) & Uint32(0xffff)
+                rp_active = rp_copy < Uint32(0x8000)        # -1 padding and passive copies have bit 15 set
+                rp_amask = Uint32(cute.arch.vote_ballot_sync(rp_active))
+                rp_peer = Uint32(0)
+                if Uint32(cute.arch.popc(rp_amask)) == Uint32(1):
+                    rp_peer = cute.arch.shuffle_sync(rp_copy, warp_first_set_bit(rp_amask)) // \
+                        Uint32(self.local_experts)
+                else:
+                    rp_j = Uint32(signals[peer_off + rp_route])
+                    rp_pos = Uint32(0)
+                    for rp_wave in cutlass.range_constexpr((self.num_ranks + 31) // 32):
+                        rp_src = Uint32(rp_wave * 32) + lane
+                        rp_c = Uint32(0)
+                        if rp_src < Uint32(self.num_ranks):
+                            rp_c = self._eco_table_count(signals, gen, rp_src, rp_e, tag)
+                        rp_add = min(rp_c, rp_j)
+                        if rp_src < rank_idx and rp_c > rp_j:
+                            rp_add += Uint32(1)
+                        rp_pos += cute.arch.warp_redux_sync(rp_add, 'add')
+                    rp_hit = False
+                    if rp_active:
+                        rp_st = Uint32(signals[start_off + rp_copy])
+                        rp_hit = rp_pos >= rp_st and rp_pos < rp_st + Uint32(signals[quota_off + rp_copy])
+                    rp_hmask = Uint32(cute.arch.vote_ballot_sync(rp_hit))
+                    rp_peer = cute.arch.shuffle_sync(rp_copy, warp_first_set_bit(rp_hmask)) // \
+                        Uint32(self.local_experts)
+                if lane == Uint32(0):
+                    signals[peer_off + rp_route] = rp_peer
+            cute.arch.sync_warp()
+            rp_route += Uint32(self.dispatch_sms * self.dispatch_warps)
 
     @cute.jit
     def _eco_slot_total(self, signals: cute.Tensor, rank_idx: Uint32, slot_idx: Uint32,
@@ -1120,6 +1186,12 @@ class GCMoERoleKernel:
                 if cutlass.const_expr(self.eco_spec):
                     token_topk = min(token_topk, Uint32(self.num_tokens) *
                                      Uint32(self.topk) - Uint32(1))
+                if cutlass.const_expr(self.eco_route_verify):
+                    if lane == Uint32(0):
+                        st_global_u32(cute.make_ptr(
+                            Uint32, mapped_peer_base(peer_ptrs, src_rank, self.num_ranks) +
+                            Uint64(self.eco_base + ECO_SIGNAL_OFFSETS['eco_route_dbg']) + Uint64(token_topk) * Uint64(4),
+                            cute.AddressSpace.gmem, assumed_align=4), rank_idx)
                 src_token = token_topk // Uint32(self.topk)
                 topk_slot = token_topk % Uint32(self.topk)
                 is_last_token = token_idx == expert_end - Uint32(1)
@@ -1322,7 +1394,8 @@ class GCMoERoleKernel:
         warpgroup_reg_alloc(self.epi_registers)
         epi_warp = Uint32(physical_warp - 4)
         ready = signals.iterator + SIGNAL_OFFSETS['combine_ready_grid_idx'] // 4
-        if cutlass.const_expr(not self.finalize_output or self.eco):
+        if cutlass.const_expr(not self.finalize_output or
+                              (self.eco and not self.eco_combine_probe and not self.eco_combine_exact)):
             # No token reduction exists to carry selected-peer acquires. ECO: a token's replica results come from
             # the copy's rank, not routed_expert // local_experts, so wait for every peer as before.
             peer = epi_warp
@@ -1366,10 +1439,13 @@ class GCMoERoleKernel:
                         Uint64(self.num_ranks * self.local_experts)
                     if lane_valid:
                         routed_peer = Uint32(routed_expert) // Uint32(self.local_experts)
+                        if cutlass.const_expr(self.eco_combine_exact):
+                            routed_peer = Uint32(signals[(self.eco_base + ECO_SIGNAL_OFFSETS['eco_route_peer']) // 4 +
+                                                         token * Uint32(self.topk) + lane])
                 # All lanes vote; invalid routes never form a peer pointer.
                 # Duplicate owners may acquire the same publication twice.
                 peer_ready = not lane_valid
-                if cutlass.const_expr(self.eco):
+                if cutlass.const_expr(self.eco and not self.eco_combine_probe and not self.eco_combine_exact):
                     peer_ready = True   # every peer was acquired above
                 wait_start = read_clock64()
                 while cute.arch.vote_ballot_sync(peer_ready) != Uint32(0xffffffff):
@@ -1664,6 +1740,9 @@ class GCMoERoleKernel:
                                         Uint32(self.capacity) + slot) * Uint32(4)),
                                 cute.AddressSpace.gmem)
                             dst_index[0] = token_topk
+                            if cutlass.const_expr(self.eco_combine_exact):
+                                signals[(self.eco_base + ECO_SIGNAL_OFFSETS['eco_route_peer']) // 4 +
+                                        token_topk] = slot
                     elif expert < Uint64(self.num_ranks * self.local_experts):
                         dst_rank = Uint32(expert) // Uint32(self.local_experts)
                         dst_local = Uint32(expert) % Uint32(self.local_experts)
@@ -2056,6 +2135,12 @@ class GCMoERoleKernel:
                                              src_rank) * Uint32(self.capacity) + src_slot]
                 if cutlass.const_expr(self.eco_spec):
                     token_topk = min(token_topk, Uint32(self.num_tokens) * Uint32(self.topk) - Uint32(1))
+                if cutlass.const_expr(self.eco_route_verify):
+                    if lane == Uint32(0):
+                        st_global_u32(cute.make_ptr(
+                            Uint32, mapped_peer_base(peer_ptrs, src_rank, self.num_ranks) +
+                            Uint64(self.eco_base + ECO_SIGNAL_OFFSETS['eco_route_dbg']) + Uint64(token_topk) * Uint64(4),
+                            cute.AddressSpace.gmem, assumed_align=4), rank_idx)
                 src_token = token_topk // Uint32(self.topk)
                 topk_slot = token_topk % Uint32(self.topk)
                 if generation > 0:
@@ -2194,6 +2279,9 @@ class GCMoERoleKernel:
                 if elect_one_sync():
                     self._eco_trace(signals, 8, 2)
                     self._eco_trace_ring(signals, 6, True)
+            if cutlass.const_expr(self.eco_combine_exact):
+                self._eco_route_peers(signals, tensor_maps, routes, rank_idx, num_tokens, lane,
+                                      Uint32(block * self.dispatch_warps + physical_warp), gen, eco_epoch)
         elif cutlass.const_expr(self.role == 2):
             if physical_warp == 0:
                 # Each descriptor has its own aligned by-value kernel

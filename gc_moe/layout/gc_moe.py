@@ -154,6 +154,8 @@ SIGNAL_OFFSETS = _signal_offsets()
 
 ECO_TRACE_RING_FIELDS = 16
 ECO_MAX_DISPATCH_CTAS = 128
+# per-route records (exact combine readiness): capacity * topk routes
+ECO_MAX_ROUTES = TOKEN_ALIGNMENT * 8   # capacity (aligned to TOKEN_ALIGNMENT) * topk <= 8
 
 
 def _eco_signal_offsets() -> dict[str, int]:
@@ -185,6 +187,11 @@ def _eco_signal_offsets() -> dict[str, int]:
         ('eco_trace', 64, 8),
         # Fields 8..15 audit plan deadlines; times use ns relative to this call's role1 start.
         ('eco_trace_ring', 64 * ECO_TRACE_RING_FIELDS, 4),
+        # per local route (token * topk + k): role1 records its source slot in the logical expert's canonical
+        # order, then (after the plan) the rank that computes it; the combine waits for that rank only
+        ('eco_route_peer', ECO_MAX_ROUTES, 4),
+        # verification only (GC_MOE_ECO_ROUTE_VERIFY=1): the rank that actually pulled each source route
+        ('eco_route_dbg', ECO_MAX_ROUTES, 4),
     )
     offset = 0
     result = {}

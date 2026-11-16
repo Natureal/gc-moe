@@ -214,9 +214,26 @@ def main():
                                       activation_clamp=10.0, fast_math=True, **shared_kw, **extra)
 
             if args.check and i == call_ids[0]:
+                verify = kind == "eco" and os.environ.get("GC_MOE_ECO_ROUTE_VERIFY") == "1"
+                if verify:
+                    from gc_moe.layout.gc_moe import ECO_SIGNAL_OFFSETS
+                    words = buf.buffer.view(torch.int32)
+                    off_p = (buf.layout.eco_base + ECO_SIGNAL_OFFSETS["eco_route_peer"]) // 4
+                    off_d = (buf.layout.eco_base + ECO_SIGNAL_OFFSETS["eco_route_dbg"]) // 4
+                    words[off_d:off_d + T * TOPK].fill_(-1)
+                    torch.cuda.synchronize()
+                    dist.barrier()
                 call()
                 torch.cuda.synchronize()
                 y_first[name] = y.clone()
+                if verify:
+                    dist.barrier()
+                    peer, pulled = words[off_p:off_p + T * TOPK], words[off_d:off_d + T * TOPK]
+                    bad = torch.tensor([int((peer != pulled).sum()), int((pulled < 0).sum())], device=device)
+                    dist.all_reduce(bad)
+                    if rank == 0:
+                        print(f"{name}: route peer verify: {int(bad[0])} mismatches, {int(bad[1])} unpulled "
+                              f"of {T * TOPK * R} routes", flush=True)
             timed = (lambda: (flush.zero_(), call())) if args.cold_l2 else call
             m = base._bench_cuda_graph_ms(timed, warmup=args.warmup, iters=args.iters, inner_iters=args.inner_iters,
                                           device=device, barrier_fn=dist.barrier)

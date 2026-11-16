@@ -2305,6 +2305,7 @@ class GCMoERoleKernel:
                     if running:
                         pool_block = Uint32(task_words[task_stage * 8 + 4])
                         valid_m = Uint32(task_words[task_stage * 8 + 5])
+                        expert_more = Uint32(task_words[task_stage * 8 + 2]) >> Uint32(31)
                         shape_k = Uint32(task_words[task_stage * 8 + 7])
                         n_cluster = Uint32(task_words[task_stage * 8 + 3])
                         local_expert = Uint32(task_words[task_stage * 8 + 1])
@@ -2422,7 +2423,7 @@ class GCMoERoleKernel:
                                 self.shared_weight_gran_k,
                                 self.shared_experts > 0,
                                 self.shared_weight_cache_hint,
-                                self.routed_weight_linger)
+                                self.routed_weight_linger, expert_more)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))
@@ -2443,6 +2444,7 @@ class GCMoERoleKernel:
                     if running:
                         pool_block = Uint32(task_words[task_stage * 8 + 4])
                         valid_m = Uint32(task_words[task_stage * 8 + 5])
+                        expert_more = Uint32(task_words[task_stage * 8 + 2]) >> Uint32(31)
                         shape_k = Uint32(task_words[task_stage * 8 + 7])
                         n_cluster = Uint32(task_words[task_stage * 8 + 3])
                         local_expert = Uint32(task_words[task_stage * 8 + 1])
@@ -2495,7 +2497,7 @@ class GCMoERoleKernel:
                                 self.shared_weight_gran_k,
                                 self.shared_experts > 0,
                                 self.shared_weight_cache_hint,
-                                self.routed_weight_linger)
+                                self.routed_weight_linger, expert_more)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
                             data_phase ^= Uint32(data_stage == Uint32(0))

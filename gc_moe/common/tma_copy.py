@@ -47,7 +47,8 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
                         shared_weight_gran_k: cutlass.Constexpr,
                         has_shared: cutlass.Constexpr,
                         shared_weight_cache_hint: cutlass.Constexpr,
-                        routed_weight_linger: cutlass.Constexpr) -> None:
+                        routed_weight_linger: cutlass.Constexpr,
+                        expert_more: Uint32) -> None:
     """Warp 0/1 stage the same K128 task through 2CTA TensorMaps.
 
     Both CTAs issue their own TMA transfers into local SMEM. The leader's
@@ -82,6 +83,17 @@ def load_mixed_k128_tma(activation_map: cute.Pointer,
         # more M-blocks. Shared FP8 keeps the policy chosen by the host.
         routed_cache_hint = (Uint64(EVICT_NORMAL) if routed_weight_linger
                              else Uint64(EVICT_FIRST))
+        if cutlass.const_expr(routed_weight_linger == 2):
+            # per task: a full M-block (more blocks of this expert likely follow) lingers; the expert's
+            # partial last block streams EVICT_FIRST
+            routed_cache_hint = Uint64(EVICT_FIRST)
+            if valid_m == Uint32(block_m):
+                routed_cache_hint = Uint64(EVICT_NORMAL)
+        if cutlass.const_expr(routed_weight_linger == 3):
+            # per task, exact: linger only when the scheduler knows more M-blocks of this expert follow
+            routed_cache_hint = Uint64(EVICT_FIRST)
+            if expert_more != Uint32(0):
+                routed_cache_hint = Uint64(EVICT_NORMAL)
         weight_cache_hint = routed_cache_hint
         gran = Uint32(32)
         if cutlass.const_expr(has_shared):

@@ -187,6 +187,11 @@ def _routed_weight_linger(config, num_topk: int) -> bool:
     The gate compares average tokens per expert against the tile, so skewed
     routing can leave some experts below one m-block and others above it.
     """
+    forced = os.environ.get('GC_MOE_ROUTED_LINGER')   # experiment: 1 = always EVICT_NORMAL, 0 = always EVICT_FIRST
+    if forced in ('0', '1'):
+        return forced == '1'
+    if forced in ('2', '3'):
+        return int(forced)
     tokens_per_expert = ceil_div(config.tokens * num_topk, config.local_experts)
     return tokens_per_expert >= 2 * config.block_m
 

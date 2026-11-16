@@ -12,6 +12,9 @@ Calls: --calls evenly spaced indices of the routing files; call i uses layer i %
 --cold-l2: every replay first overwrites L2 (memset of 2x L2 bytes inside the graph); a flush-only graph is timed
 the same way and its per-rank median is subtracted (no other layer runs between MoE calls in this harness).
 --check: on the first sampled call, compare every ora / eco mode's output with plain (same per-expert weights).
+Shared experts are fused as in benchmarks/benchmark_gc_moe_se.py (default DSV4.1-Flash preset: 1 shared expert,
+shared weight K granularity 32 -> weight recipe (1, 32, 32), activation recipe (1, 1, 32)); --num-shared-experts 0
+times routed experts only. --block-m pins block M for every mode (the shared-input SF layout follows it).
 
 Usage: torchrun --nproc_per_node=8 benchmarks/benchmark_gc_moe_eco.py --off routing_off.npy --T 128 \
     --mode plain384:plain:384 --mode eco448:eco:448:eco448_metas.npy ...
@@ -23,6 +26,11 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import deep_gemm   # noqa: F401
+except ImportError:   # hosts without a DeepGEMM build: torch-only casts / SF layout (gcbench dg_quant.py on PYTHONPATH)
+    import dg_quant
+    dg_quant.install()
 import benchmark_gc_moe as base   # noqa: E402  (imports deep_gemm / gc_moe from this repo, timing helpers)
 
 import numpy as np   # noqa: E402
@@ -44,6 +52,36 @@ def expert_weights(logical_ids, device):
             w[i], w_sf[i] = base.per_token_cast_to_fp4(bf16, use_ue8m0=True, gran_k=32)
         return w, deep_gemm.transform_sf_into_required_layout(w_sf, n, k, (1, 32), len(logical_ids))
     return gc_moe.transform_weights_for_gc_moe(cast(2 * INTER, HIDDEN, 0), cast(HIDDEN, INTER, 1), activation="swiglu")
+
+
+def shared_weights(n_shared, gran_k, device):
+    """Fused shared experts as tests/test_gc_moe_se.py builds them (seed 11, FP8 weights, block or per-token SF)."""
+    from deep_gemm.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
+    si = INTER * n_shared
+    gen = torch.Generator(device=device).manual_seed(11)
+    raw = (torch.randn((2 * si, HIDDEN), dtype=torch.bfloat16, device=device, generator=gen) * 0.05,
+           torch.randn((HIDDEN, si), dtype=torch.bfloat16, device=device, generator=gen) * 0.05)
+    out = []
+    for w in raw:
+        n, k = w.shape
+        if gran_k == 128:
+            q, sf = per_block_cast_to_fp8(w, use_ue8m0=True, gran_k=128)
+            recipe = (128, 128)
+        else:   # (1, 32, 32) blocks, expanded to per-row (1, 32) scales
+            q, sf = per_block_cast_to_fp8(w, use_ue8m0=True, gran_k=32)
+            sf = sf.repeat_interleave(32, dim=0)[:n]
+            recipe = (1, 32)
+        out.append((q, deep_gemm.transform_sf_into_required_layout(sf, n, k, recipe, num_groups=None)))
+    return gc_moe.transform_weights_for_gc_moe(*out, activation="swiglu")
+
+
+def shared_input_sf(x_sf, like, block_m):
+    """tests/test_gc_moe_se.py make_shared_input_sf: token SF rows in the shared-L1 block layout of `block_m`"""
+    dst = torch.zeros_like(like)
+    t = torch.arange(x_sf.size(0), dtype=torch.long, device=x_sf.device)
+    w = t % block_m
+    dst[t // block_m * ((block_m + 127) // 128 * 128) + (w // 128) * 128 + (w % 32) * 4 + (w % 128) // 32] = x_sf
+    return dst
 
 
 def eco_metas(path, device):
@@ -70,7 +108,10 @@ def align_first_launch():
     aligned = set()
 
     def launch(config, y, l1, l2, sym_buffer, s1, s2, stats, **eco):
-        context = jit_impl.get_context()
+        try:   # upstream >= 7902831 needs the world size
+            context = jit_impl.get_context(num_ranks=sym_buffer.group.size())
+        except TypeError:
+            context = jit_impl.get_context()
         binaries, arguments = jit_impl.prepare_role_binaries(config, y, l1, l2, sym_buffer, s1, s2, stats, context, **eco)
         if id(binaries[0]) not in aligned and not torch.cuda.is_current_stream_capturing():
             aligned.add(id(binaries[0]))
@@ -91,6 +132,9 @@ def main():
     ap.add_argument("--inner-iters", type=int, default=20)
     ap.add_argument("--cold-l2", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--num-shared-experts", type=int, default=1)
+    ap.add_argument("--shared-weight-gran-k", type=int, choices=[32, 128], default=32)
+    ap.add_argument("--block-m", type=int, default=0, help="pin block M for every mode (0: gc-moe heuristic)")
     ap.add_argument("--output-json", default="")
     args = ap.parse_args()
 
@@ -100,6 +144,13 @@ def main():
     dist.init_process_group(backend="nccl", device_id=device)
     rank, R = dist.get_rank(), dist.get_world_size()
     align_first_launch()
+    import gc_moe.apis.gc_moe as gc_api
+    if args.block_m:
+        gc_api.get_block_m_for_gc_moe = lambda *_a, **_k: args.block_m
+    NS = args.num_shared_experts
+    shared = shared_weights(NS, args.shared_weight_gran_k, device) if NS else None
+    shared_kw = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1],
+                     shared_recipe=(1, 128, 128) if args.shared_weight_gran_k == 128 else (1, 1, 32)) if NS else {}
 
     off = np.load(args.off, mmap_mode="r")
     calls_total, r_ranks, T, topk = off.shape
@@ -133,8 +184,12 @@ def main():
         ids = (np.arange(rank * L, (rank + 1) * L) % E if phy2log is None
                else np.asarray(phy2log[0][rank * L:(rank + 1) * L]))
         weights = expert_weights(ids, device)
-        buf = gc_moe.get_symm_buffer_for_gc_moe(dist.group.WORLD, P, T, TOPK, HIDDEN, INTER,
+        buf = gc_moe.get_symm_buffer_for_gc_moe(dist.group.WORLD, P, T, TOPK, HIDDEN, INTER, num_shared_experts=NS,
                                                 **({"eco": True} if kind == "eco" else {}))
+        bm = gc_api.get_block_m_for_gc_moe(R, P, buf.num_max_tokens_per_rank, T, TOPK)
+        if kind == "eco" and os.environ.get("GC_MOE_ECO_BLOCK_M"):
+            bm = int(os.environ["GC_MOE_ECO_BLOCK_M"])
+        sh_sf = shared_input_sf(x_sf, buf.shared_l1_acts_sf, bm) if NS else None
         y = torch.empty((T, HIDDEN), device=device, dtype=torch.bfloat16)
         per_call = []
         for i in call_ids:
@@ -142,6 +197,8 @@ def main():
             buf.x_sf[:T].copy_(x_sf)
             buf.topk_idx[:T].copy_(torch.from_numpy(np.asarray(routing[i, rank]).astype(np.int64)).to(device))
             buf.topk_weights[:T].copy_(topk_w)
+            if NS:
+                buf.shared_l1_acts_sf.copy_(sh_sf)
             extra = {}
             if kind == "eco":
                 layer = i % len(metas)
@@ -149,7 +206,7 @@ def main():
 
             def call():
                 gc_moe.fp8_fp4_gc_moe(y, *weights, buf, recipe=(1, 1, 32), activation="swiglu",
-                                      activation_clamp=10.0, fast_math=True, **extra)
+                                      activation_clamp=10.0, fast_math=True, **shared_kw, **extra)
 
             if args.check and i == call_ids[0]:
                 call()
@@ -169,10 +226,10 @@ def main():
             if rank == 0:
                 print(f"{name:<10} call {i:5d}  slowest {max(per_rank):8.2f} us  fastest {min(per_rank):8.2f}", flush=True)
         s = [c["slowest_rank_median_us"] for c in per_call]
-        results[name] = dict(kind=kind, P=P, block_m=None, mean_us=float(np.mean(s)), median_us=float(np.median(s)),
+        results[name] = dict(kind=kind, P=P, block_m=bm, mean_us=float(np.mean(s)), median_us=float(np.median(s)),
                              per_call=per_call)
         if rank == 0:
-            print(f"== {name}: mean over {len(s)} calls {np.mean(s):8.2f} us (median {np.median(s):8.2f})", flush=True)
+            print(f"== {name} (bm{bm}, shared {NS}): mean over {len(s)} calls {np.mean(s):8.2f} us (median {np.median(s):8.2f})", flush=True)
         buf.destroy()
         del weights
         torch.cuda.empty_cache()
@@ -190,7 +247,8 @@ def main():
             print("check max|diff| vs plain:", check, flush=True)
     if rank == 0 and args.output_json:
         os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
-        json.dump(dict(T=T, ranks=R, calls=call_ids, cold_l2=args.cold_l2, inner_iters=args.inner_iters,
+        json.dump(dict(T=T, ranks=R, calls=call_ids, num_shared_experts=NS, shared_weight_gran_k=args.shared_weight_gran_k,
+                       block_m_pinned=args.block_m, cold_l2=args.cold_l2, inner_iters=args.inner_iters,
                        iters=args.iters, warmup=args.warmup, check=check,
                        summary={n: dict(mean_us=r["mean_us"], median_us=r["median_us"]) for n, r in results.items()},
                        results=results), open(args.output_json, "w"), indent=1)

@@ -135,7 +135,7 @@
                     continue;
                 cem = true;
                 const int d0 = ip ? pcost(ys, 0, rr) - pcost(ys, 1, rr) : pcost(ys - 1, 0, rr) - pcost(ys, 0, rr);
-                const uint64_t key = (static_cast<uint64_t>(max(tmax + d0, v)) << 41) | (static_cast<uint64_t>(v) << 23) |
+                const uint64_t key = (static_cast<uint64_t>(max(tmax + d0, v)) << 41) | (static_cast<uint64_t>(min(v, static_cast<int>(kMaxV))) << 23) |
                                      (static_cast<uint64_t>(hops - 1) << 22) | (static_cast<uint64_t>(s1) << 11) | static_cast<uint64_t>(s0);
                 atomicMin(reinterpret_cast<unsigned long long*>(&ckey[s0]), static_cast<unsigned long long>(key));
                 csh[s0] = -d0;
@@ -181,7 +181,7 @@
                     } else {
                         rcv = dr2[r1]; add = din2[r1];
                     }
-                    ok = (static_cast<uint64_t>(rcv) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(tmax)) << 40) |
+                    ok = (static_cast<uint64_t>(rcv) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(min(max(tmax, 0), static_cast<int>(kMaxV)))) << 40) |
                          (static_cast<uint64_t>(v) << 22) | (static_cast<uint64_t>(s0) << 11) | static_cast<uint64_t>(s1);
                     emit = true;
                 }
@@ -250,7 +250,7 @@
                         } else {
                             rcv = dr2[r1]; add = din2[r1];
                         }
-                        ok = (static_cast<uint64_t>(rcv) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(tmax)) << 40) |
+                        ok = (static_cast<uint64_t>(rcv) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(min(max(tmax, 0), static_cast<int>(kMaxV)))) << 40) |
                              (static_cast<uint64_t>(v) << 22) | (static_cast<uint64_t>(s0) << 11) | static_cast<uint64_t>(s1);
                         emit = true;
                     }
@@ -397,7 +397,7 @@
                     continue;
                 cem = true;
                 const int d0 = ip ? pcost(ys, 0, rr) - pcost(ys, 1, rr) : pcost(ys - 1, 0, rr) - pcost(ys, 0, rr);
-                const uint64_t key = (static_cast<uint64_t>(max(tmax + d0, v)) << 41) | (static_cast<uint64_t>(v) << 23) |
+                const uint64_t key = (static_cast<uint64_t>(max(tmax + d0, v)) << 41) | (static_cast<uint64_t>(min(v, static_cast<int>(kMaxV))) << 23) |
                                      (static_cast<uint64_t>(s1) << 11) | static_cast<uint64_t>(s0);
                 atomicMin(reinterpret_cast<unsigned long long*>(&kc[s0]), static_cast<unsigned long long>(key));
                 csh[s0] = -d0;
@@ -433,7 +433,7 @@
                     const int v = static_cast<int>((key >> 23) & kMaxV), s1 = static_cast<int>((key >> 11) & 2047u);
                     const int ip = pf[s0], rr = rm[s0], y1 = y[s1], p1 = pf[s1];
                     add = (pcost(y1 + (ip ? 0 : 1), p1 + ip, rr) - pcost(y1, p1, rr)) | (ip << 30);   // + the unit type
-                    ok = (static_cast<uint64_t>(s1 / kS) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(tmax)) << 40) |
+                    ok = (static_cast<uint64_t>(s1 / kS) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(min(max(tmax, 0), static_cast<int>(kMaxV)))) << 40) |
                          (static_cast<uint64_t>(v) << 22) | (static_cast<uint64_t>(s0) << 11) | static_cast<uint64_t>(s1);
                     emit = true;
                 }
@@ -479,7 +479,7 @@
                         const int v = static_cast<int>((key >> 23) & kMaxV), s1 = static_cast<int>((key >> 11) & 2047u);
                         const int ip = pf[s0], rr = rm[s0], y1 = y[s1], p1 = pf[s1];
                         add = (pcost(y1 + (ip ? 0 : 1), p1 + ip, rr) - pcost(y1, p1, rr)) | (ip << 30);   // + the unit type
-                        ok = (static_cast<uint64_t>(s1 / kS) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(tmax)) << 40) |
+                        ok = (static_cast<uint64_t>(s1 / kS) << 58) | (static_cast<uint64_t>(kMaxV - static_cast<uint32_t>(min(max(tmax, 0), static_cast<int>(kMaxV)))) << 40) |
                              (static_cast<uint64_t>(v) << 22) | (static_cast<uint64_t>(s0) << 11) | static_cast<uint64_t>(s1);
                         emit = true;
                     }
@@ -503,6 +503,8 @@
             milestone(27);
         // (F1) offers grouped by receiver (ckey / csh space: keys / adds); the next round's candidates reset after
         const int noff = s_noff;
+        if (tid == 0 and stats != nullptr)
+            stats[kP / kR + 100 + k] = noff;
         uint64_t* const gkey = kc;
         int* const gadd = csh;
         int rb_lo = 0, rb_hi = 0;

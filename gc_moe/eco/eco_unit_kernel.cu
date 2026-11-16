@@ -13,17 +13,33 @@
 // the signal field offsets (OFF_*), UNIT_BM (block M), UNIT_WB / UNIT_WA (block / active-slot weights, tokens 1),
 // UNIT_NR / UNIT_NRC (warm / cold auction rounds), UNIT_HOP2 (two-hop rounds).
 //
-// Warp roles: warps 0..15 plan (named barrier 1, 512 threads); warps 1..15 first gather the count table (barrier 2,
-// 480 threads); the two index warps 16, 17 first fan this rank's count row out to every peer (barrier 5, 544 threads:
-// their arrival plus the helpers'), then stage the static tables with warp 0 (barrier 4, 96 threads).
+// Warp roles: warps 0..15 plan (named barrier 1, 512 threads); warps 1..15 gather the count table (barrier 2,
+// 480 threads) and stage the unit tables / reconstruct phy while polling; the two index warps 16, 17 fan this
+// rank's packed count row out to every peer (barrier 5, 544 threads) and return. With dispatch-gated rows
+// (OFF_ECO_PUB_ISSUED) the send waits for this rank's dispatch count publication; otherwise rows go out first.
+// With ECO_SPLIT_COUNTS, CTA 0 counts/sends with all 18 warps; CTA 1 stages/receives/plans with
+// warps 0..15. A two-SM cluster keeps both CTAs inside the existing planner reservation.
+// Neither the count exchange nor planning gates single-copy dispatch/compute.
 
 #include <cstdint>
+
+#ifndef UNIT_HYDRO
+#define UNIT_HYDRO 0   // 1: stateless block-peak waterfill + augmenting repair replaces warm/cold + auction
+#endif
+#ifndef UNIT_HDBG
+#define UNIT_HDBG 0    // 1: bound every serial loop; write a stall marker to stats[kP/kR + 60..63]
+#endif
 
 #include "include/eco_meta.cuh"
 
 using namespace deep_gemm;
 
 static constexpr uint32_t kP = ECO_P, kR = ECO_R, kE = ECO_E, kS = kP / kR, kThreads = ECO_THREADS;
+#if ECO_ROUTE_PREP
+static_assert(ECO_SPLIT_COUNTS, "route preparation needs the producer CTA");
+static constexpr uint32_t kDispatchSms = ECO_DISPATCH_SMS, kDispatchWarps = ECO_DISPATCH_WARPS;
+static constexpr uint32_t kTokensPerDispatchWarp = 32 / ECO_TOPK;
+#endif
 static constexpr uint32_t kPlanWarps = 16, kPlanThreads = 32 * kPlanWarps, kIndexWarps = 2;
 static constexpr uint32_t kFirstIndexWarp = kPlanWarps, kHelpers = kPlanThreads - 32;
 static_assert(kThreads == kPlanThreads + 32 * kIndexWarps, "Unit plan role: 16 plan warps and 2 index warps");
@@ -35,6 +51,35 @@ static constexpr uint32_t kMaxCopy = kR < 32 ? kR : 32;                     // a
 static constexpr uint32_t kMaxPairs = kMaxG * kMaxCopy < 2048 ? kMaxG * kMaxCopy : 2048;   // host-checked (unit_section)
 static constexpr int kBM = UNIT_BM, kWB = UNIT_WB, kWA = UNIT_WA;
 static_assert(kMaxG <= kPlanThreads, "One thread per small replicated expert");
+#if UNIT_HYDRO
+static constexpr int kMaxU = 2 * kP;      // tracked movable block units (overflow: plan degrades to greedy)
+#ifndef UNIT_HREFINE
+#define UNIT_HREFINE 8
+#endif
+#ifndef UNIT_HAUG
+#define UNIT_HAUG 64
+#endif
+#ifndef UNIT_HSPLIT
+#define UNIT_HSPLIT 0  // 1: an expert's tokens spread evenly over its nb units (first n % nb carry +1), not bm + tail
+#endif
+#ifndef UNIT_HPROF
+#define UNIT_HPROF 0   // 1: per-segment clocks of the greedy expert loop into hsc[14..19] (debug)
+#endif
+#ifndef UNIT_HCF
+#define UNIT_HCF 3     // experts with >= UNIT_HCF units deal their picks in closed form (ballot per level)
+#endif
+#ifndef UNIT_HCFLV
+#define UNIT_HCFLV 3   // levels the closed-form deal resolves at once (deeper water: per-unit fallback)
+#endif
+#ifndef UNIT_HORD
+#define UNIT_HORD 0    // 1: greedy order = fewest copies first, then hottest (most constrained first)
+#endif
+#ifndef UNIT_HLB
+#define UNIT_HLB 1     // 1: relocate / BFS stop once the peak sits on max(ceil(total / R), max floor)
+#endif
+static constexpr int kCfLv = UNIT_HCFLV;
+static constexpr int kHydRefine = UNIT_HREFINE, kHydAug = UNIT_HAUG, kHydDepth = 8;
+#endif
 
 // Named barriers count warps: converge the warp first (inline asm is opaque to the compiler's reconvergence)
 __device__ __forceinline__ void plan_sync() { __syncwarp(); asm volatile("bar.sync 1, 512;" ::: "memory"); }
@@ -62,13 +107,31 @@ __device__ __forceinline__ uint4 ld_volatile_v4(const uint4* ptr) {
                  : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(ptr) : "memory");
     return v;
 }
+// Sys-scope acquire for a remote peer's row-tail release flag: orders this thread's later loads of the row data
+__device__ __forceinline__ uint32_t ld_acquire_sys_u32(const uint32_t* ptr) {
+    uint32_t v;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(ptr) : "memory");
+    return v;
+}
 // Timeline trace point (globaltimer ns) into the signals' `eco_trace` slots (ECO_TRACE builds)
-__device__ __forceinline__ void trace_point(uint8_t* buffer, const uint32_t& slot) {
+__device__ __forceinline__ uint64_t trace_point(uint8_t* buffer, const uint32_t& slot,
+                                              const int* sync_state = nullptr) {
+    uint64_t now = 0;
 #if defined(ECO_TRACE) and ECO_TRACE
-    uint64_t now;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+    if (sync_state != nullptr) {
+        // BAR.SYNC.DEFER_BLOCKING can let a clock read run before the barrier actually completes. A shared
+        // load followed by a dependent predicate makes the timer wait too; sync_state is the shared 0/1 flag.
+        const auto addr = static_cast<uint32_t>(__cvta_generic_to_shared(sync_state));
+        asm volatile("{ .reg .u32 ready; .reg .pred valid; "
+                     "ld.volatile.shared.u32 ready, [%1]; setp.le.u32 valid, ready, 1; "
+                     "@valid mov.u64 %0, %%globaltimer; }"
+                     : "+l"(now) : "r"(addr) : "memory");
+    } else {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now) :: "memory");
+    }
     reinterpret_cast<uint64_t*>(buffer + OFF_ECO_TRACE)[slot] = now;
 #endif
+    return now;
 }
 
 // Rank time of a slot holding y full units and pp (0/1) partial units of rr tokens
@@ -77,17 +140,63 @@ __device__ __forceinline__ int pcost(const int& yy, const int& pp, const int& rr
     return kWB * b + (b > 0 ? kWA : 0) + kBM * yy + pp * rr;
 }
 
+#if ECO_SPLIT_COUNTS
+// Each sender writes self-tagged payloads to the receiving rank's local table. The split variant
+// uses a producer CTA in the same two-SM cluster as the planner, without an inter-CTA handshake.
+__device__ __forceinline__ void send_count_rows(uint8_t* buffer, const uint64_t* peers,
+                                               const uint32_t* row, uint32_t rank, uint32_t epoch,
+                                               uint32_t worker, uint32_t workers) {
+#ifdef OFF_ECO_PUB_ISSUED
+    if (worker % 32 == 0)
+        while (ld_acquire_sys_u32(reinterpret_cast<uint32_t*>(buffer + OFF_ECO_PUB_ISSUED)) != epoch + 1) {}
+    __syncwarp();
+#endif
+    if (worker == 0)
+        trace_point(buffer, 37);
+    constexpr uint32_t kVectors = kE / 12;
+    const uint32_t gen = epoch & 1u, taghi = ((epoch / 2) % 3 + 1) << 30;
+    const auto pack3 = [&](uint32_t e) {
+        return taghi | min(row[e], 1023u) | (min(row[e + 1], 1023u) << 10) |
+               (min(row[e + 2], 1023u) << 20);
+    };
+    for (uint32_t v = worker; v < kR * kVectors; v += workers) {
+        uint32_t peer = v / kVectors;
+        const uint32_t first = (v % kVectors) * 12;
+        *reinterpret_cast<uint4*>(peers[peer] + OFF_ECO_COUNTS + (gen * kR + rank) * kP * 2 +
+                                 (v % kVectors) * 16) =
+            make_uint4(pack3(first), pack3(first + 3), pack3(first + 6), pack3(first + 9));
+    }
+    if (worker == 0)
+        trace_point(buffer, 38);
+}
+
+#endif
 extern "C" __global__ void __launch_bounds__(ECO_THREADS, 1)
+#if ECO_SPLIT_COUNTS
+__cluster_dims__(2, 1, 1)
+#endif
 eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, const uint64_t* peers,
                 uint32_t rank, uint32_t num_tokens) {
     // Count gathering
+#if ECO_SPLIT_COUNTS
+    // Direct accumulation avoids a second helper barrier and narrowing copy.
+    __shared__ alignas(16) uint32_t counts[kE];
+#else
     __shared__ alignas(16) uint16_t counts[kE];
+#endif
     __shared__ alignas(16) uint32_t route_count[kE];
+#if ECO_ROUTE_PREP
+    // One local routing pass produces both this rank's expert totals and every dispatch CTA's
+    // source-index start. The dispatch partition consumes the resulting prefix table.
+    __shared__ alignas(16) uint32_t cta_count[kDispatchSms * kE];
+#endif
+#if !ECO_SPLIT_COUNTS
     __shared__ alignas(16) uint32_t sums[kE];   // global per-expert totals (count scan; separate so polling can start while other threads still write rows)
+#endif
     // Static tables: active copies expert-major ascending in `cslot`; per slot: logical expert, active copy count of
     // its expert (0: passive), start of its expert's list; replicated experts split into small (<= 4 copies) / big
     __shared__ alignas(16) int phy[kP], clen[kP], cst[kP], cslot[kP], ecnt[kE], eoff[kE];
-    __shared__ alignas(16) uint64_t ogids[2 * kMaxG];   // replicated expert ids (op 1), then the auction's offers
+    __shared__ alignas(16) uint64_t ogids[2 * kMaxG < kP ? kP : 2 * kMaxG];   // replicated expert ids (op 1), then the auction's offers
     int* const gids = reinterpret_cast<int*>(ogids);
     __shared__ alignas(16) int roff[(kR + 1 + 3) / 4 * 4];
     int* const small_ids = gids;
@@ -99,6 +208,7 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     __shared__ uint32_t Bk[kR];
     __shared__ int dk2[kR], dd1[kR], de1[kR], dr2[kR], ds1b[kR], ds2b[kR];
     __shared__ int s_ns, s_nb, s_warm, s_prev;
+    __shared__ volatile int s_state_ready;
     __shared__ int s_noff, cnt[kP];             // cnt: units per slot (full + partial)
     __shared__ int din2[kR], dip[kR];           // decoded best outflow: receiver time increase, partial flag
     __shared__ int rcnt[kR], rfill[kR], rbs[kR];   // offers per receiver, its segment fill and base
@@ -114,147 +224,250 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
     __shared__ int rfirst[kR];                  // per rank: first active replicated slot
     __shared__ alignas(16) uint64_t ckey[kP];   // per slot: the source candidate's sort key (~0: none)
     __shared__ int csh[kP];                     // per slot: the candidate's shed (source time decrease)
-    __shared__ int oadd[2 * kMaxG];
+    __shared__ int oadd[2 * kMaxG < kP ? kP : 2 * kMaxG];
     __shared__ alignas(16) uint16_t pcnt[kE];   // the previous call's counts (unit-space warm start)
+#if UNIT_HYDRO
+    // Hydro plan state (replaces the warm/cold start + auction), aliased onto the auction's shared
+    // arrays, which are all dead in this mode: per-rank block loads, the movable experts' units
+    // (placement order, bit15 = the expert's partial unit), per-rank unit ordering sequences
+    // (augmenting moves take dense tail positions, matching the reference's remove + append order),
+    // and the multi-source BFS tables. `bedge[r]` is the u32 order key (fseq << 16 | unit position
+    // << 5 | copy) of the best edge into rank r — native ATOMS.MIN.32; the winning edge's unit and
+    // slot are decoded from the key itself via the queue (frk) and the unit lists (ilist/ioff).
+    static_assert(kMaxU <= 2 * kP and kMaxPairs >= kMaxU + 2 * kR, "Hydro scratch must fit the auction buffers");
+    static_assert(kMaxU <= 2 * (kP > 2 * kMaxG ? kP : 2 * kMaxG), "ilist must fit ogids");
+    static_assert(kR * kEmW >= 30, "hsc scalars (hsc[0..29]) must fit emask");
+    static_assert(kE <= (2 * kMaxG < kP ? kP : 2 * kMaxG), "epk must fit oadd");
+    int* const hload = T;
+    int* const ucnt = dk2;
+    int* const mord = csh;
+    auto* const hplaced = reinterpret_cast<uint16_t*>(cnt);
+    int* const upos = reinterpret_cast<int*>(plist);
+    uint32_t* const bedge = reinterpret_cast<uint32_t*>(plist + kMaxU); // u32 order keys: native ATOMS.MIN
+    int* const useq = de1;                                              // per-rank monotone append stamp
+    int* const frk = T0;                                                // BFS queue: queue index -> rank
+    int* const bpar = din2;
+    int* const bdep = dip;
+    int* const bparu = dr2;
+    int* const fseq = ds1b;
+    int* const hsc = reinterpret_cast<int*>(emask);   // the loop scalars below
+    // volatile: lane0 writes these inside divergent `if (lane == 0)` regions and the other lanes read
+    // them after __syncwarp — register promotion would let them read a stale zero
+    volatile int& s_nm = hsc[0], & s_nu = hsc[1];
+    volatile int& s_fmax = hsc[24], & s_fsum = hsc[25], & s_lb = hsc[26], & s_lbx = hsc[27];
+    // even split: base tokens of one unit of slot s's expert (a flagged unit carries one more)
+    const auto ueven = [&](const int& sl) { const int ne = counts[phy[sl]]; return ne / ((ne + kBM - 1) / kBM); };
+    int* const epk = oadd;                             // per-expert packs (oadd is free pre-epilog)
+    uint64_t* const erm = ogids;                       // per-expert rank masks of the copies (0: duplicate ranks)
+    int* const clane = reinterpret_cast<int*>(ckey);           // flattened per-(expert, lane) copy slots
+#endif
 
     const uint32_t tid = threadIdx.x, lane = tid % 32, warp = tid / 32;
     // Debug (stats != nullptr): cycles since kernel entry at milestones, stats[kP / kR + 16 ...]
     const long long t_entry = clock64();
     const auto milestone = [&](const uint32_t& slot) {
         if (stats != nullptr)
-            atomicAdd(stats + kP / kR + slot, static_cast<int>((clock64() - t_entry) / 16));
+            *reinterpret_cast<volatile int*>(stats + kP / kR + slot) =
+                static_cast<int>((clock64() - t_entry) / 16);
     };
     auto* signals = reinterpret_cast<uint32_t*>(buffer);
     const uint32_t epoch = *reinterpret_cast<volatile uint32_t*>(signals + OFF_EPOCH / 4);
     const uint32_t gen = epoch & 1u;
+
+    // Replica slots pull through u64 receive-count rows materialized from the assembled count matrix:
+    // each index-warp lane owns one source rank and copies this rank's replica experts' counts as soon
+    // as their words arrive tagged. ECO_RECV_MODE < 3 targets the native expert_recv_count region;
+    // mode 3 uses the dedicated ECO-region rows instead (the native area measured ~3 us slower for
+    // these reads on L20B: it shares the routing-flooded L2 space with the per-token counters).
+    // The rows land before the plan acquire; the two generation banks keep stale reads impossible.
+    const auto fill_replica_counts = [&] {
+        const layout::EcoMeta online_meta(meta, ECO_E, ECO_P, ECO_R);
+        const uint32_t nf = online_meta.get_num_fixed(rank);
+        if (nf >= kS)
+            return;
+        const uint32_t taghi = ((epoch / 2u) % 3u + 1u) << 30;
+        const uint32_t iw = tid - kFirstIndexWarp * 32u;
+        if (iw >= kR)
+            return;
+        const auto* row = reinterpret_cast<const volatile uint32_t*>(
+            buffer + OFF_ECO_COUNTS + gen * kR * kP * 2u + iw * kP * 2u);
+        constexpr uint32_t kOutOff = ECO_RECV_MODE == 3 ? OFF_ECO_RECV_COUNTS : OFF_RECV_COUNT;
+        auto* out = reinterpret_cast<uint64_t*>(buffer + kOutOff) +
+                    (static_cast<uint64_t>(gen) * kR + iw) * kS;
+        for (uint32_t l = nf; l < kS; ++ l) {
+            const uint32_t e = static_cast<uint32_t>(online_meta.get_phy2log(rank * kS + l));
+            const auto* w = row + e / 3u;
+            uint32_t word = *w, backoff = 32u;
+            while ((word & 0xc0000000u) != taghi) {
+                __nanosleep(backoff);
+                backoff = min(backoff * 2u, 512u);
+                word = *w;
+            }
+            out[l] = static_cast<uint64_t>((word >> ((e % 3u) * 10u)) & 0x3ffu);
+        }
+    };
+    // Replica slots carry no source-index rows: the dispatch role writes each logical
+    // expert's indices into its lowest (canonical) copy's rows only, and every replica's
+    // pull reads that canonical row directly on its owner rank — complete once all
+    // dispatches exit the rank barrier. No post-barrier fan-out is needed at all.
+#if ECO_SPLIT_COUNTS
+    if (blockIdx.x == 0) {
+#if ECO_ROUTE_PREP
+        for (uint32_t i = tid; i < kDispatchSms * kE; i += kThreads)
+            cta_count[i] = 0;
+#endif
+        for (uint32_t e = tid; e < kE; e += kThreads)
+            route_count[e] = 0;
+        __syncthreads();
+        for (uint32_t i = tid; i < num_tokens * ECO_TOPK; i += kThreads) {
+            const auto e = static_cast<uint64_t>(__ldg(reinterpret_cast<const int64_t*>(buffer + OFF_TOPK) + i));
+            if (e < kE) {
+                atomicAdd(route_count + e, 1u);
+#if ECO_ROUTE_PREP
+                // Dispatch assigns consecutive route chunks round-robin over (CTA, warp).
+                const uint32_t chunk = i / (ECO_TOPK * kTokensPerDispatchWarp);
+                const uint32_t cta = (chunk % (kDispatchSms * kDispatchWarps)) / kDispatchWarps;
+                atomicAdd(cta_count + e * kDispatchSms + cta, 1u);
+#endif
+            }
+        }
+        __syncthreads();
+        if (tid == 0)
+            milestone(16);
+#if ECO_ROUTE_PREP
+        // Rows issue first at the full producer width; dispatch's own staging covers the offset
+        // table build below, so its route_ready wait never blocks.
+        send_count_rows(buffer, peers, route_count, rank, epoch, tid, kThreads);
+        if (tid == 0)
+            milestone(17);
+        // Every producer thread prefixes one expert's per-CTA counts (consecutive words), writes
+        // each dispatch CTA's source-index start and the final send_count status (all CTAs arrived).
+        auto* route_offsets = reinterpret_cast<uint32_t*>(buffer + OFF_ECO_ROUTE_OFFSETS);
+        auto* send_count = reinterpret_cast<uint64_t*>(buffer + OFF_SEND_COUNT);
+        for (uint32_t e = tid; e < kE; e += kThreads) {
+            uint32_t start = 0;
+            for (uint32_t cta = 0; cta < kDispatchSms; ++ cta) {
+                const uint32_t n = cta_count[e * kDispatchSms + cta];
+                route_offsets[cta * kE + e] = start;
+                start += n;
+            }
+            send_count[e] = (static_cast<uint64_t>(kDispatchSms) << 32) | start;
+        }
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+            st_release_gpu(signals + OFF_ECO_ROUTE_READY / 4, epoch + 1);
+            trace_point(buffer, 42);
+        }
+        return;
+#else
+        send_count_rows(buffer, peers, route_count, rank, epoch, tid, kThreads);
+        if (tid == 0)
+            milestone(17);
+        return;
+#endif
+    }
+    // The producer occupies the other SM of this cluster. These two warps have no sending work here;
+    // they publish this rank's replica slots' native-format count rows instead.
+    if (warp >= kFirstIndexWarp) {
+        fill_replica_counts();
+        return;
+    }
+#endif
     const layout::EcoMeta online_meta(meta, ECO_E, ECO_P, ECO_R);
     if (tid == 0)
         trace_point(buffer, 3);
     const auto* routes = reinterpret_cast<const int64_t*>(buffer + OFF_TOPK);
     const uint32_t num_routes = num_tokens * ECO_TOPK;
 
-    if (warp >= kFirstIndexWarp) {
+    const auto send_rows = [&] {
         // The count rows go out FIRST on the two index warps: route_count[] is ready a few us in, and rows sent
         // this early drain ahead of the dispatch role's routing flood instead of queueing behind a ~10us staging
         // phase; their posted remote stores' fabric drain then stalls only these warps' LSU path.
         rows_sync();   // route_count[] complete (helpers arrive once counting is done)
+#if ECO_SPLIT_COUNTS
+        send_count_rows(buffer, peers, route_count, rank, epoch, tid - kFirstIndexWarp * 32, 64);
+        if (tid == kFirstIndexWarp * 32) {
+            milestone(17);
+        }
+#else
+#ifdef OFF_ECO_PUB_ISSUED
+        // The rows follow this rank's dispatch count publication (its critical pre-barrier remote writes): the two
+        // traffic streams go out back to back instead of interleaving in the fabric
+        if (lane == 0) {
+            uint32_t seen;
+            do {
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(seen) : "l"(signals + OFF_ECO_PUB_ISSUED / 4) : "memory");
+            } while (seen != epoch + 1);
+        }
+        __syncwarp();
+#endif
+        if (tid == kFirstIndexWarp * 32)
+            trace_point(buffer, 37);
         if (stats != nullptr and lane == 0)
             stats[kP / kR + 44 + warp] = 21;
-        constexpr uint32_t kVectors = kE / 8;
-        const uint32_t tag = (epoch / 2) % 3 + 1, tag2 = (tag << 14) | (tag << 30);
-        const auto pack = [&](const uint32_t& e) { return tag2 | route_count[e] | (route_count[e + 1] << 16); };
+        constexpr uint32_t kVectors = kE / 12;
+        const uint32_t tag = (epoch / 2) % 3 + 1, taghi = tag << 30;
+        const auto pack3 = [&](const uint32_t& e) {
+            return taghi | min(route_count[e], 1023u) | (min(route_count[e + 1], 1023u) << 10) |
+                   (min(route_count[e + 2], 1023u) << 20);
+        };
         const uint32_t iw = tid - kFirstIndexWarp * 32;
         for (uint32_t v = iw; v < kR * kVectors; v += 64) {
-            const uint32_t peer = v / kVectors, first = (v % kVectors) * 8;
-            *reinterpret_cast<uint4*>(peers[peer] + OFF_ECO_COUNTS + ((gen * kR + rank) * kP + first) * 2) =
-                make_uint4(pack(first), pack(first + 2), pack(first + 4), pack(first + 6));
+            const uint32_t peer = v / kVectors, first = (v % kVectors) * 12;
+            *reinterpret_cast<uint4*>(peers[peer] + OFF_ECO_COUNTS + (gen * kR + rank) * kP * 2 +
+                                    (v % kVectors) * 16) =
+                make_uint4(pack3(first), pack3(first + 3), pack3(first + 6), pack3(first + 9));
         }
-        if (tid == kFirstIndexWarp * 32)
+        if (tid == kFirstIndexWarp * 32) {
             milestone(17);
-    }
+            trace_point(buffer, 38);
+        }
+#endif
+    };
+#ifndef OFF_ECO_PUB_ISSUED
+    if (warp >= kFirstIndexWarp)
+        send_rows();
+#endif
 
-    // ---- static tables and the warm start (warp 0 + index warps, while the counts warps gather) ----------------
-    if (warp == 0 or warp >= kFirstIndexWarp) {
-        const uint32_t sid = warp == 0 ? tid : 32 + tid - kPlanThreads;
+    // ---- roff, the warm start and scalar headers (warp 0 alone: the index warps return after their row send
+    // instead of waiting at stage_sync, and the slot/expert tables are staged by the helpers) -------------------
+    if (warp == 0) {
+        const uint32_t sid = tid;
         // Host-precomputed static tables: the meta's unit section (offset in header[15], `unit_ref.unit_section`)
         const int* us = meta + online_meta.get_header(15);
         constexpr uint32_t kOffSmall = 4, kOffBig = kOffSmall + kMaxG, kOffSlot = kOffBig + kMaxG;
         constexpr uint32_t kOffExp = kOffSlot + kP, kOffCslot = kOffExp + kE, kOffRoff = kOffCslot + kP;
-        constexpr uint32_t kOffPairs = kOffRoff + (kR + 1 + 3) / 4 * 4;
         static_assert(kP % 8 == 0 and kE % 8 == 0 and kMaxG % 4 == 0, "Vector staging");
         const auto* us4 = reinterpret_cast<const int4*>(us);
-        const auto* p2l4 = reinterpret_cast<const int4*>(meta + online_meta.get_phy2log_offset());
-        constexpr uint32_t kSlotV = kP / 4, kExpV = kE / 4, kGV = 2 * kMaxG / 4, kRoffV = (kR + 1 + 3) / 4;
-        constexpr uint32_t kSI = (kSlotV + 95) / 96, kEI = (kExpV + 95) / 96, kGI = (kGV + 95) / 96, kRI = (kRoffV + 95) / 96;
-        constexpr uint32_t kQV = kP / 8, kNV = kE / 8, kQI = (kQV + 95) / 96, kNI = (kNV + 95) / 96;
-        // All loads first (independent 16-byte loads in flight together), then the shared stores
-        int4 wv[kSI], cv[kSI], pv[kSI], ev[kEI], gv[kGI], rv[kRI];
+        constexpr uint32_t kRoffV = (kR + 1 + 3) / 4;
+        constexpr uint32_t kQV = kP / 8, kNV = kE / 8, kQI = (kQV + 31) / 32, kNI = (kNV + 31) / 32;
         uint4 qv[kQI], nv[kNI];
-        #pragma unroll
-        for (uint32_t i = 0; i < kSI; ++ i) {
-            const uint32_t v = sid + 96 * i;
-            if (v < kSlotV) {
-                wv[i] = __ldg(us4 + kOffSlot / 4 + v); cv[i] = __ldg(us4 + kOffCslot / 4 + v); pv[i] = __ldg(p2l4 + v);
-            }
-        }
-        #pragma unroll
-        for (uint32_t i = 0; i < kEI; ++ i)
-            if (sid + 96 * i < kExpV)
-                ev[i] = __ldg(us4 + kOffExp / 4 + sid + 96 * i);
-        #pragma unroll
-        for (uint32_t i = 0; i < kGI; ++ i)
-            if (sid + 96 * i < kGV)
-                gv[i] = __ldg(us4 + kOffSmall / 4 + sid + 96 * i);
-        #pragma unroll
-        for (uint32_t i = 0; i < kRI; ++ i)
-            if (sid + 96 * i < kRoffV)
-                rv[i] = __ldg(us4 + kOffRoff / 4 + sid + 96 * i);
+        if (sid < kRoffV)
+            reinterpret_cast<int4*>(roff)[sid] = __ldg(us4 + kOffRoff / 4 + sid);
         if (state != nullptr) {
             const auto* st4 = reinterpret_cast<const uint4*>(state);
             #pragma unroll
             for (uint32_t i = 0; i < kQI; ++ i)
-                if (sid + 96 * i < kQV)
-                    qv[i] = st4[sid + 96 * i];
+                if (sid + 32 * i < kQV)
+                    qv[i] = st4[sid + 32 * i];
             #pragma unroll
             for (uint32_t i = 0; i < kNI; ++ i)
-                if (sid + 96 * i < kNV)
-                    nv[i] = st4[kQV + sid + 96 * i];
+                if (sid + 32 * i < kNV)
+                    nv[i] = st4[kQV + sid + 32 * i];
         }
         const int4 hdr = __ldg(us4);
-        const int npairs = hdr.z;
-        #pragma unroll
-        for (uint32_t i = 0; i < kSI; ++ i) {
-            const uint32_t v = sid + 96 * i;
-            if (v < kSlotV) {
-                const int w[4] = {wv[i].x, wv[i].y, wv[i].z, wv[i].w};
-                #pragma unroll
-                for (uint32_t k = 0; k < 4; ++ k) {
-                    clen[4 * v + k] = w[k] & 0xff; cst[4 * v + k] = w[k] >> 8;
-                }
-                reinterpret_cast<int4*>(cslot)[v] = cv[i]; reinterpret_cast<int4*>(phy)[v] = pv[i];
-            }
-        }
-        #pragma unroll
-        for (uint32_t i = 0; i < kEI; ++ i) {
-            const uint32_t v = sid + 96 * i;
-            if (v < kExpV) {
-                const int w[4] = {ev[i].x, ev[i].y, ev[i].z, ev[i].w};
-                #pragma unroll
-                for (uint32_t k = 0; k < 4; ++ k) {
-                    ecnt[4 * v + k] = w[k] & 0xff; eoff[4 * v + k] = w[k] >> 8;
-                }
-            }
-        }
-        #pragma unroll
-        for (uint32_t i = 0; i < kGI; ++ i)
-            if (sid + 96 * i < kGV)
-                reinterpret_cast<int4*>(gids)[sid + 96 * i] = gv[i];
-        #pragma unroll
-        for (uint32_t i = 0; i < kRI; ++ i)
-            if (sid + 96 * i < kRoffV)
-                reinterpret_cast<int4*>(roff)[sid + 96 * i] = rv[i];
-        for (int v0 = static_cast<int>(sid); v0 < (npairs + 3) / 4; v0 += 96 * 4) {   // four pair vectors in flight
-            int4 pp[4];
-            #pragma unroll
-            for (int b = 0; b < 4; ++ b)
-                if (v0 + 96 * b < (npairs + 3) / 4)
-                    pp[b] = __ldg(us4 + kOffPairs / 4 + v0 + 96 * b);
-            #pragma unroll
-            for (int b = 0; b < 4; ++ b)
-                if (v0 + 96 * b < (npairs + 3) / 4)
-                    reinterpret_cast<int4*>(plist)[v0 + 96 * b] = pp[b];
-        }
-        if (sid < kR) {
-            T0[sid] = 0; T[sid] = 0; Bk[sid] = ~0u;
+        for (uint32_t r = sid; r < kR; r += 32) {
+            T0[r] = 0; T[r] = 0; Bk[r] = ~0u;
         }
         if (sid == 0) {
-            s_ns = hdr.x; s_nb = hdr.y; s_prev = 0;
+            s_ns = hdr.x; s_nb = hdr.y; s_prev = 0; s_state_ready = 0;
         }
         if (state != nullptr) {   // warm start: the previous call's quotas into q, its counts into pcnt
             int part = 0;
             #pragma unroll
             for (uint32_t i = 0; i < kQI; ++ i) {
-                const uint32_t v = sid + 96 * i;
+                const uint32_t v = sid + 32 * i;
                 if (v < kQV) {
                     const uint32_t w[4] = {qv[i].x, qv[i].y, qv[i].z, qv[i].w};
                     #pragma unroll
@@ -265,7 +478,7 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             }
             #pragma unroll
             for (uint32_t i = 0; i < kNI; ++ i) {
-                const uint32_t v = sid + 96 * i;
+                const uint32_t v = sid + 32 * i;
                 if (v < kNV) {
                     const uint32_t w[4] = {nv[i].x, nv[i].y, nv[i].z, nv[i].w};
                     #pragma unroll
@@ -281,27 +494,48 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         }
         if (sid == 0)
             milestone(24);
-        stage_sync();
+        __syncwarp();
         if (sid == 0)
             milestone(25);
         const bool warm = state != nullptr and s_prev > 0;   // warm start iff the previous call left counts
         if (sid == 0)
             s_warm = warm;
-        stage_sync();
-        if (sid == 0)
+        __syncwarp();
+        if (sid == 0) {
+            // Publish q/pcnt/s_warm to the helpers, which assign the replicated slots' warm
+            // units while the count rows are still in flight.
+            __threadfence_block();
+            s_state_ready = 1;
+        }
+        if (sid == 0) {
             milestone(22);
+            trace_point(buffer, 39, &s_warm);
+        }
     }
 
+#ifdef OFF_ECO_PUB_ISSUED
+    // Local preparation needs neither the dispatch publication nor global counts. Finish it during the gate
+    // window, so warp 0 cannot hold up planning on a post-send static-table / warm-state load.
     if (warp >= kFirstIndexWarp)
-        return;   // replicated experts' indices: written by the dispatch role's routing phase
+        send_rows();
+#endif
+    if (warp >= kFirstIndexWarp) {
+        fill_replica_counts();
+        return;   // replicated experts' indices are read from the canonical rows directly
+    }
 
     if (warp >= 1) {
-        // ---- counts (warps 1..15): this rank's row into every peer, then every source's row summed ------------
-        constexpr uint32_t kVectors = kE / 8;
+        // ---- counts (warps 1..15): every lane packs (tag << 30) | three 10-bit counts; a thread owns one
+        // 12-expert column over a strided subset of the sources and re-polls stale ones in parallel --------------
         const uint32_t helper = tid - 32;
         for (uint32_t e = helper; e < kE; e += kHelpers)
+#if ECO_SPLIT_COUNTS
+            route_count[e] = counts[e] = 0;
+#else
             route_count[e] = sums[e] = 0;
+#endif
         helper_sync();
+#if !ECO_SPLIT_COUNTS
         for (uint32_t i = helper; i < num_routes; i += kHelpers) {
             const auto e = static_cast<uint64_t>(__ldg(routes + i));
             if (e < kE)
@@ -315,91 +549,188 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             stats[kP / kR + 44 + warp] = 11;
         if (helper == 0)
             milestone(16);
-        // Entries `(tag << 14) | count`, eight per 16-byte store
-        const uint32_t tag = (epoch / 2) % 3 + 1, tag2 = (tag << 14) | (tag << 30);
-        // A thread owns one 8-expert column (16-byte loads, polled until all eight entries carry this call's tag)
-        // over a strided subset of the sources; no barrier after the row writes so early threads poll immediately
+#endif
+        // The slot/expert tables while the count rows are in flight (the remote row send is owned by the index
+        // warps, so the helpers' loads overlap only the peer-arrival window): cslot/ecnt/eoff enumerate each
+        // expert's active copies, clen/cst give the per-slot view, gids/plist drive the auction, and phy
+        // maps each physical slot back to its logical expert.
+        {
+            const int* us = meta + online_meta.get_header(15);
+            const auto* us4 = reinterpret_cast<const int4*>(us);
+            constexpr uint32_t kOffSmall = 4, kOffBig = kOffSmall + kMaxG, kOffSlot = kOffBig + kMaxG;
+            constexpr uint32_t kOffExp = kOffSlot + kP, kOffCslot = kOffExp + kE;
+            constexpr uint32_t kOffPairs = kOffCslot + kP + (kR + 1 + 3) / 4 * 4;
+            constexpr uint32_t kSlotV = kP / 4, kExpV = kE / 4, kGV = 2 * kMaxG / 4;
+            const uint32_t npairs = static_cast<uint32_t>(__ldg(us + 2));
+            for (uint32_t v = helper; v < kSlotV; v += kHelpers) {
+                const int4 w = __ldg(us4 + kOffSlot / 4 + v);
+                const int ws[4] = {w.x, w.y, w.z, w.w};
+                #pragma unroll
+                for (uint32_t k = 0; k < 4; ++ k) {
+                    clen[4 * v + k] = ws[k] & 0xff; cst[4 * v + k] = ws[k] >> 8;
+                }
+                reinterpret_cast<int4*>(cslot)[v] = __ldg(us4 + kOffCslot / 4 + v);
+            }
+            for (uint32_t v = helper; v < kExpV; v += kHelpers) {
+                const int4 w = __ldg(us4 + kOffExp / 4 + v);
+                const int ws[4] = {w.x, w.y, w.z, w.w};
+                #pragma unroll
+                for (uint32_t k = 0; k < 4; ++ k) {
+                    ecnt[4 * v + k] = ws[k] & 0xff; eoff[4 * v + k] = ws[k] >> 8;
+                }
+            }
+            for (uint32_t v = helper; v < kGV; v += kHelpers)
+                reinterpret_cast<int4*>(gids)[v] = __ldg(us4 + kOffSmall / 4 + v);
+            for (uint32_t v = helper; v < (npairs + 3) / 4; v += kHelpers)
+                reinterpret_cast<int4*>(plist)[v] = __ldg(us4 + kOffPairs / 4 + v);
+            const auto* p2l4 = reinterpret_cast<const int4*>(meta + online_meta.get_phy2log_offset());
+            for (uint32_t v = helper; v < kP / 4; v += kHelpers)
+                reinterpret_cast<int4*>(phy)[v] = __ldg(p2l4 + v);
+        }
+        // ---- warm assignment while the count rows are in flight --------------------------------------------------
+        // The replicated slots' unit split depends only on the previous call's state (q: quotas, pcnt:
+        // counts) and the staged tables — not on this call's totals — so it moves ahead of the row
+        // polling. Slots whose expert has no tokens this call are cleared after the counts join.
+        helper_sync();   // staged tables are read across helpers below
+        while (s_state_ready == 0)
+            __nanosleep(32);
+        __threadfence_block();
+        if (s_warm != 0 and not UNIT_HYDRO) {
+            const int nsm = s_ns, nbg = s_nb;
+            for (int g = static_cast<int>(helper); g < nsm; g += kHelpers) {
+                const int se = small_ids[g], sk = ecnt[se], so = eoff[se];
+                int s4[4];
+                #pragma unroll
+                for (int j = 0; j < 4; ++ j)
+                    s4[j] = (j < sk) ? cslot[so + j] : -1;
+                const int npv = pcnt[se], kp = (npv + kBM - 1) / kBM;
+                const int remp = npv - (kp - 1) * kBM;
+                int sown = -1;
+                #pragma unroll
+                for (int j = 0; j < 4; ++ j) {   // the previous partial's owner: congruent quota
+                    const int qs = s4[j] >= 0 ? q[s4[j]] : 0;
+                    if (sown < 0 and s4[j] >= 0 and kp > 0 and qs >= remp and (qs - remp) % kBM == 0)
+                        sown = j;
+                }
+                #pragma unroll
+                for (int j = 0; j < 4; ++ j)
+                    if (s4[j] >= 0) {
+                        const int qs = q[s4[j]];
+                        const int suj = sown >= 0 ? (qs - (j == sown ? remp : 0)) / kBM + (j == sown) : 0;
+                        y[s4[j]] = suj - (j == sown); pf[s4[j]] = j == sown;
+                    }
+            }
+            constexpr uint32_t kHW = kHelpers / 32;
+            constexpr uint32_t kBPH = (kMaxBig + kHW - 1) / kHW;
+            #pragma unroll
+            for (uint32_t i = 0; i < kBPH; ++ i) {
+                const int g = static_cast<int>(warp - 1) + static_cast<int>(kHW) * static_cast<int>(i);
+                if (g >= nbg)
+                    continue;
+                const int e = big_ids[g], bk_ = ecnt[e], bo = eoff[e];
+                const bool on = static_cast<int>(lane) < bk_;
+                const int bp_ = on ? cslot[bo + lane] : 0;
+                const int be = __shfl_sync(~0u, on ? phy[bp_] : 0, 0);
+                const int npv = pcnt[be], kp = (npv + kBM - 1) / kBM;
+                int bown_ = -1, bu_ = 0;
+                if (kp > 0) {
+                    const int remp = npv - (kp - 1) * kBM, qs = on ? q[bp_] : 0;
+                    const uint32_t bal = __ballot_sync(~0u, on and qs >= remp and (qs - remp) % kBM == 0);
+                    bown_ = bal ? static_cast<int>(__ffs(bal)) - 1 : -1;
+                    if (bown_ >= 0 and on)
+                        bu_ = (qs - (static_cast<int>(lane) == bown_ ? remp : 0)) / kBM + (static_cast<int>(lane) == bown_);
+                }
+                if (on) {
+                    y[bp_] = bu_ - (static_cast<int>(lane) == bown_);
+                    pf[bp_] = static_cast<int>(lane) == bown_;
+                }
+            }
+        }
+        const uint32_t tag = (epoch / 2) % 3 + 1, taghi = tag << 30;
         const auto* table = reinterpret_cast<const uint4*>(buffer + OFF_ECO_COUNTS + gen * kR * kP * 2);
+        constexpr uint32_t kVectors = kE / 12;
         constexpr uint32_t kSplit = kHelpers / kVectors > 0 ? kHelpers / kVectors : 1;
+        constexpr uint32_t kMaxSrc = (kR + kSplit - 1) / kSplit;
         for (uint32_t item = helper; item < kVectors * kSplit; item += kHelpers) {
             const uint32_t v = item % kVectors, part = item / kVectors;
-            uint32_t sum[8] = {};
-            constexpr uint32_t kTagMask = (3u << 14) | (3u << 30);
-            const auto stale = [&](const uint4& w) {
-                return ((w.x & kTagMask) != tag2) | ((w.y & kTagMask) != tag2) | ((w.z & kTagMask) != tag2) |
-                       ((w.w & kTagMask) != tag2);
+            uint32_t srcs[kMaxSrc], nsrc = 0;
+            for (uint32_t src = part; src < kR; src += kSplit)
+                srcs[nsrc ++] = src;
+            uint4 w[kMaxSrc];
+            #pragma unroll
+            for (uint32_t b = 0; b < kMaxSrc; ++ b)
+                w[b] = b < nsrc ? __ldcg(table + srcs[b] * (kP / 8) + v) : make_uint4(taghi, taghi, taghi, taghi);
+            // Check each word before combining: OR-ing raw tags can accept mixed old/new words when tag == 3.
+            const auto stale = [&](const uint4& x) {
+                return (((x.x ^ taghi) | (x.y ^ taghi) | (x.z ^ taghi) | (x.w ^ taghi)) &
+                        (3u << 30)) != 0;
             };
-            constexpr uint32_t kBatchSrc = 8;
-            for (uint32_t src0 = part; src0 < kR; src0 += kSplit * kBatchSrc) {
-                if (stats != nullptr and lane == 0)
-                    stats[kP / kR + 80 + warp] = item * 64 + src0;
-                uint4 w[kBatchSrc];
+            uint32_t pending = 0;
+            #pragma unroll
+            for (uint32_t b = 0; b < kMaxSrc; ++ b)
+                pending |= stale(w[b]) ? (1u << b) : 0u;
+            while (pending != 0) {
+                // Back off between re-polls: hundreds of helper lanes spinning on ld.volatile
+                // hammer the L2 slices the dispatch role's remote count/index writes land on.
+                __nanosleep(192);
                 #pragma unroll
-                for (uint32_t b = 0; b < kBatchSrc; ++ b) {
-                    const uint32_t src = src0 + b * kSplit;
-                    w[b] = src < kR ? __ldcg(table + src * (kP / 8) + v) : make_uint4(tag2, tag2, tag2, tag2);
-                }
-                // Re-poll every stale source in parallel each round: late rows then cost one extra
-                // round trip per generation of arrivals, not one per source position.
-                uint32_t pending = 0;
+                for (uint32_t b = 0; b < kMaxSrc; ++ b)
+                    if (pending & (1u << b))
+                        w[b] = ld_volatile_v4(table + srcs[b] * (kP / 8) + v);
+                pending = 0;
                 #pragma unroll
-                for (uint32_t b = 0; b < kBatchSrc; ++ b)
+                for (uint32_t b = 0; b < kMaxSrc; ++ b)
                     pending |= stale(w[b]) ? (1u << b) : 0u;
-                while (pending != 0) {
-                    // Back off between re-polls: hundreds of helper lanes spinning on ld.volatile
-                    // hammer the L2 slices the dispatch role's remote count/index writes land on.
-                    __nanosleep(192);
-                    #pragma unroll
-                    for (uint32_t b = 0; b < kBatchSrc; ++ b)
-                        if (pending & (1u << b))
-                            w[b] = ld_volatile_v4(table + (src0 + b * kSplit) * (kP / 8) + v);
-                    pending = 0;
-                    #pragma unroll
-                    for (uint32_t b = 0; b < kBatchSrc; ++ b)
-                        pending |= stale(w[b]) ? (1u << b) : 0u;
-                }
+            }
+            if (stats != nullptr and lane == 0)
+                stats[kP / kR + 80 + warp] = item * 64;
+            uint32_t sum[12] = {};
+            #pragma unroll
+            for (uint32_t b = 0; b < kMaxSrc; ++ b) {
+                const uint32_t ws[4] = {w[b].x, w[b].y, w[b].z, w[b].w};
                 #pragma unroll
-                for (uint32_t b = 0; b < kBatchSrc; ++ b) {
-                    const uint32_t ws[4] = {w[b].x, w[b].y, w[b].z, w[b].w};
-                    #pragma unroll
-                    for (uint32_t k = 0; k < 4; ++ k)
-                        sum[2 * k] += ws[k] & 0x3fffu, sum[2 * k + 1] += (ws[k] >> 16) & 0x3fffu;
+                for (uint32_t k = 0; k < 4; ++ k) {
+                    sum[3 * k] += ws[k] & 0x3ffu;
+                    sum[3 * k + 1] += (ws[k] >> 10) & 0x3ffu;
+                    sum[3 * k + 2] += (ws[k] >> 20) & 0x3ffu;
                 }
             }
             #pragma unroll
-            for (uint32_t k = 0; k < 8; ++ k)
-                atomicAdd(sums + v * 8 + k, sum[k]);
+            for (uint32_t k = 0; k < 12; ++ k)
+#if ECO_SPLIT_COUNTS
+                atomicAdd(counts + v * 12 + k, sum[k]);
+#else
+                atomicAdd(sums + v * 12 + k, sum[k]);
+#endif
         }
         if (stats != nullptr and lane == 0)
             stats[kP / kR + 80 + warp] = 0xffff;
         if (helper == 0)
             milestone(18);
+#if !ECO_SPLIT_COUNTS
         helper_sync();
         for (uint32_t e = helper; e < kE; e += kHelpers)
             counts[e] = static_cast<uint16_t>(sums[e]);
-        // This rank's single-copy slot totals for the compute role (its scheduler starts on them before the rank
-        // barrier, like plain GC's receive counts)
-        helper_sync();
-        constexpr uint32_t kLocal = kP / kR;
-        const uint32_t num_fixed = static_cast<uint32_t>(online_meta.get_num_fixed(rank));
-        for (uint32_t j = helper; j < num_fixed; j += kHelpers)
-            signals[OFF_ECO_SLOT_COUNT / 4 + j] = counts[online_meta.get_phy2log(rank * kLocal + j)];
-        if (helper == 0)
-            signals[OFF_ECO_NUM_FIXED / 4] = num_fixed;
-        helper_sync();
+        // plan_sync below publishes counts[] within the CTA. Fixed-slot counts and num_fixed are no longer
+        // handed to other roles here: they use native receive counters and immutable launch metadata.
         if (helper == 0)
             milestone(19);
+#endif
     }
 
     // ---- plan (warps 0..15) ------------------------------------------------------------------------------------
     plan_sync();
     if (tid == 0) {
-        // COUNTS_READY published by tid0 (no remote stores of its own): bar.sync makes the helpers' local signal
-        // writes CTA-visible and this fence then orders them device-wide; helper0's remote row stores stay out of
-        // the ordering so the release no longer waits for them to drain through the routing flood.
-        __threadfence();
-        st_release_gpu(signals + OFF_ECO_COUNTS_READY / 4, epoch + 1);
-        trace_point(buffer, 4);
+#if ECO_SPLIT_COUNTS
+        milestone(19);   // all totals, static tables and previous state have joined
+#endif
+        const auto input_time = trace_point(buffer, 4, &s_warm);
+#if defined(ECO_TRACE) and ECO_TRACE
+        const auto* slots = reinterpret_cast<const volatile unsigned long long*>(buffer + OFF_ECO_TRACE);
+        const auto entry = static_cast<uint32_t>(slots[33]) % 64;
+        reinterpret_cast<uint32_t*>(buffer + OFF_ECO_TRACE_RING)[entry * ECO_TRACE_RING_FIELDS + 7] =
+            static_cast<uint32_t>(input_time - slots[24]);
+#endif
     }
     const bool warm = s_warm != 0;
     const int NS = s_ns, NB = s_nb;
@@ -413,12 +744,570 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             q[s] = v;
             y[s] = single and n > 0 ? (n + kBM - 1) / kBM - 1 : 0;
             pf[s] = single and n > 0;
+#if !UNIT_HYDRO
             if (warm and single and n > 0)   // warm start: the rank-time estimate T0, single-copy part
                 atomicAdd(&T0[s / kS], pcost(y[s], pf[s], rm[s]));
+#endif
         }
+#if UNIT_HYDRO
+        else {   // replicated slots start empty; the waterfill below fills them
+            y[s] = 0; pf[s] = 0; q[s] = 0;
+        }
+#endif
     }
     if (tid == 0)
         milestone(31);
+#if UNIT_HYDRO
+    // ---- hydro plan: block-peak waterfill + relocate + bounded augmenting repair ---------------------------------
+    // Bit-exact mirror of HydroPlanner.plan(n, refine=8, aug=64, dmax=8) (work/mpo/ep64/hydro.py):
+    // fixed slots already hold their tokens; each replicated expert's units (full bm + one remainder)
+    // go one-by-one to its least-loaded copy; cheap single moves off the peak; then multi-source BFS
+    // alternating relocation chains push the residual peak to the per-call optimum.
+    for (uint32_t r = tid; r < kR; r += kPlanThreads) {
+        hload[r] = 0; ucnt[r] = 0;
+    }
+    if (tid == 0) {
+        s_nm = 0; s_nu = 0;
+        for (int d = 4; d < 19; ++ d)
+            hsc[d] = 0;
+    }
+    plan_sync();
+    for (uint32_t s = tid; s < kP; s += kPlanThreads)   // the immovable floor joins the rank loads
+        if (clen[s] <= 1 and pf[s])
+            atomicAdd(&hload[s / kS], y[s] + 1);
+    // Replicated experts, hottest first (ties: first copy slot = phy appearance order). Warp0
+    // compacts the movable list into hplaced (free until greedy) with a ballot prefix — expert
+    // index order; then a single-key rank pass (count << 10 | 1023 - first copy slot) ranks each
+    // only against the movable set — O(nm^2) cheap comparisons instead of O(E^2) loads
+    if (warp == 0) {
+        int nmv0 = 0;
+        for (int e0 = 0; e0 < static_cast<int>(kE); e0 += 32) {
+            const int e = e0 + static_cast<int>(lane);
+            const bool mv = e < static_cast<int>(kE) and ecnt[e] >= 2 and counts[e] > 0;
+            const uint32_t bal = __ballot_sync(~0u, mv);
+            if (mv)
+                hplaced[nmv0 + __popc(bal & ((1u << lane) - 1))] = static_cast<uint16_t>(e);
+            nmv0 += __popc(bal);
+        }
+        if (lane == 0)
+            s_nm = nmv0;
+    }
+    plan_sync();
+    const int nmv = s_nm;
+    if (warp == 1) {   // floor-only rank loads here: max and total feed the block-peak lower bound
+        int fm = 0, fs = 0;
+        for (int r = static_cast<int>(lane); r < static_cast<int>(kR); r += 32) {
+            fm = max(fm, hload[r]); fs += hload[r];
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            fm = max(fm, __shfl_xor_sync(~0u, fm, off)); fs += __shfl_xor_sync(~0u, fs, off);
+        }
+        if (lane == 0) { s_fmax = fm; s_fsum = fs; }
+    }
+    for (int f = static_cast<int>(tid); f < nmv; f += static_cast<int>(kPlanThreads)) {
+        const int g = hplaced[f];
+        oadd[f] = (UNIT_HORD ? (63 - ecnt[g]) << 23 : 0) | (counts[g] << 10) | (1023 - cslot[eoff[g]]);
+    }
+    plan_sync();
+    for (int i = static_cast<int>(tid); i < nmv; i += static_cast<int>(kPlanThreads)) {
+        const int e = hplaced[i], me = oadd[i];
+        int rk = 0;
+        for (int f = 0; f < nmv; ++ f)
+            rk += oadd[f] > me;
+        mord[rk] = e;
+    }
+    plan_sync();
+    if (tid == 0)
+        milestone(35);
+    // ---- greedy waterfill, closed-form serial ---------------------------------------------------
+    // Experts deal their units hottest-first to the least-loaded copy. The per-unit argmin
+    // (load, slot) picks are exactly the nb smallest (level, slot) fill events — a copy's u-th win
+    // lands at level L + u, and event (copy v, level lv) sits at output position
+    // C(lv - 1) + #{copies with L < lv and smaller slot}, C(x) = sum(max(0, x - L_v)). So lane j
+    // enumerates its own copy's wins with no warp reduce at all: positions strictly increase with
+    // u and events past the water level land at position >= nb, which also bounds the loop.
+    {
+        const uint64_t a_t = (stats != nullptr and tid == 0) ? clock64() : 0;
+        for (int i = static_cast<int>(tid); i < nmv; i += static_cast<int>(kPlanThreads)) {
+            const int e = mord[i], oo = eoff[e], kk = ecnt[e];
+            const int nbe = (counts[e] + kBM - 1) / kBM;
+            uint64_t rmk = 0;
+            for (int j = 0; j < kk; ++ j)
+                rmk |= 1ull << (cslot[oo + j] / kS);
+            erm[e] = __popcll(rmk) == kk ? rmk : 0ull;
+            epk[i] = static_cast<int>(static_cast<uint32_t>(oo | (kk << 14) | (nbe << 20)) |
+                                      (UNIT_HSPLIT ? static_cast<uint32_t>(counts[e] % nbe) << 26 : 0u));
+        }
+        plan_sync();
+        // flatten the per-expert copy gathers once — the serial loop then reaches for the
+        // next expert's copies with a single non-dependent load instead of an epk->slot
+        // chain. The buffer holds one lane row per expert; experts past its capacity fall
+        // back to the direct cslot gather (R=32 can see nmv > capacity)
+        for (int x = static_cast<int>(tid); x < min(nmv, 2 * kP / 32) * 32;
+             x += static_cast<int>(kPlanThreads)) {
+            const int i = x >> 5, l = x & 31, p = epk[i];
+            clane[x] = l < ((p >> 14) & 0x3f) ? cslot[(p & 0x3fff) + l] : -1;
+        }
+        if (stats != nullptr and tid == 0)
+            hsc[15] = static_cast<int>(clock64() - a_t);
+    }
+    {
+        const uint64_t b_t = (stats != nullptr and tid == 0) ? clock64() : 0;
+        plan_sync();
+        if (stats != nullptr and tid == 0)
+            hsc[16] = static_cast<int>(clock64() - b_t);
+    }
+    if (warp == 0) {
+        const uint64_t g_t = (stats != nullptr and lane == 0) ? clock64() : 0;
+        volatile int* const hl = hload;
+        int dst = 0;
+        int p = epk[0];
+        int cs = clane[lane];                        // prefetch distance 1
+        const bool flat_all = nmv <= 2 * kP / 32;
+#if UNIT_HPROF
+        long long pa = 0, pb = 0, pc = 0, pd = 0, t0 = clock64();
+#endif
+        for (int i = 0; i < nmv; ++ i) {
+            const int kk0 = (p >> 14) & 0x3f, nb0 = (p >> 20) & 0x3f;
+            const int ex0 = UNIT_HSPLIT ? static_cast<int>(static_cast<uint32_t>(p) >> 26) : 0;
+            int cs_n = -1, pn = p;
+            if (flat_all) {                             // next expert's metadata + copies early, no branch
+                const int i1 = min(i + 1, nmv - 1);
+                pn = epk[i1];
+                cs_n = clane[i1 * 32 + lane];
+            } else if (i + 1 < nmv) {
+                pn = epk[i + 1];
+                cs_n = i + 1 < 2 * kP / 32 ? clane[(i + 1) * 32 + lane]
+                       : (lane < ((pn >> 14) & 0x3f) ? cslot[(pn & 0x3fff) + lane] : -1);
+            }
+#if UNIT_HPROF
+            const long long t1 = clock64(); pa += t1 - t0;
+#endif
+            const int L = cs >= 0 ? hl[cs / kS] : (1 << 20);
+#if UNIT_HPROF
+            const int Lw = __shfl_sync(~0u, L, 0);
+            const long long t2 = clock64(); pb += t2 - t1 + (Lw & 0);
+#endif
+            const auto uflag = [&](const int& u) { return (UNIT_HSPLIT ? u < ex0 : u == nb0 - 1) ? 0x8000 : 0; };
+            // closed form of the same picks: they are the nb smallest (level, slot) events; level t above
+            // the lowest copy holds one event per copy at or below it, in slot = lane order. Eight
+            // independent ballots give every level's events at once (registers only); the event (copy, t)
+            // lands at output position cum(t) + #{lower lanes with an event at t} — the exact pick order
+            bool dealt = false;
+            if (nb0 >= UNIT_HCF) {   // warp-uniform: the ballots below run unconditionally (no per-vote divergence)
+                const int d = L - __reduce_min_sync(~0u, L);
+                uint32_t lm[kCfLv];
+                int lc[kCfLv + 1], lam = kCfLv;
+                lc[0] = 0;
+#pragma unroll
+                for (int t = 0; t < kCfLv; ++ t) {
+                    lm[t] = __ballot_sync(~0u, d <= t);
+                    lc[t + 1] = lc[t] + __popc(lm[t]);
+                }
+#pragma unroll
+                for (int t = kCfLv - 1; t >= 0; -- t)
+                    lam = lc[t + 1] >= nb0 ? t : lam;
+                if (lam < kCfLv) {
+                    const uint32_t lt = (1u << lane) - 1;
+                    int w = 0;
+                    uint16_t* const sink = reinterpret_cast<uint16_t*>(plist) + lane;   // free until build
+#pragma unroll
+                    for (int t = 0; t < kCfLv; ++ t) {   // branch-free: inactive events store to a private sink
+                        const int pos = lc[t] + __popc(lm[t] & lt);
+                        const bool ok = d <= t and t <= lam and pos < nb0;
+                        *(ok ? hplaced + dst + pos : sink) = static_cast<uint16_t>(cs | uflag(pos));
+                        w += ok;
+                    }
+                    if (cs >= 0)
+                        hl[cs / kS] = L + w;
+                    dealt = true;
+                }
+            }
+            if (not dealt) {
+                int ce = cs >= 0 ? (cs | (L << 10)) : 0x7fffffff;
+                const uint32_t am = kk0 >= 32 ? ~0u : (1u << kk0) - 1;
+                for (int u = 0; u < nb0; ++ u) {
+                    const int w = __reduce_min_sync(am, ce);
+                    if (ce == w) {
+                        ce += 1 << 10;
+                        // the winner emits its unit straight away — a fire-and-forget store that
+                        // hides under the next reduction's latency, so no separate fill pass
+                        hplaced[dst + u] = (w & 1023) | uflag(u);
+                    }
+                }
+                if (cs >= 0)
+                    hl[cs / kS] = ce >> 10;
+            }
+#if UNIT_HPROF
+            __syncwarp();
+            const long long t3 = clock64(); pc += t3 - t2;
+            if (nb0 >= UNIT_HCF) pd += t3 - t2;
+#endif
+            cs = cs_n;
+            p = pn;
+            dst += nb0;
+#if UNIT_HPROF
+            t0 = clock64();
+#endif
+        }
+#if UNIT_HPROF
+        if (stats != nullptr and lane == 0) {
+            hsc[14] = static_cast<int>(pa); hsc[15] = static_cast<int>(pb); hsc[16] = static_cast<int>(pc);
+            hsc[18] = static_cast<int>(pd); hsc[19] = dst;
+        }
+#endif
+        if (lane == 0)
+            s_nu = dst;
+        if (stats != nullptr and lane == 0)
+            atomicAdd(&hsc[5], static_cast<int>(clock64() - g_t));
+    }
+    {
+        const uint64_t b_t = (stats != nullptr and tid == 0) ? clock64() : 0;
+        plan_sync();
+        if (stats != nullptr and tid == 0) {
+            hsc[17] = static_cast<int>(clock64() - b_t);
+            milestone(36);
+        }
+    }
+    plan_sync();
+    // deferred quota/state flush: count each slot's wins from the unit table, then apply —
+    // all plan threads instead of the serial loop's per-expert read-modify-writes
+    {
+        const int nu0 = min(static_cast<int>(s_nu), kMaxU);
+        auto* const gct = oadd;                                  // count | partial flag << 30 (even: +1 units << 16)
+        for (uint32_t s = tid; s < kP; s += kPlanThreads)
+            gct[s] = 0;
+        plan_sync();
+        for (int i = static_cast<int>(tid); i < nu0; i += static_cast<int>(kPlanThreads)) {
+            const int hp = hplaced[i];
+            atomicAdd(&gct[hp & 0x7fff], 1 + ((hp & 0x8000) != 0 ? (UNIT_HSPLIT ? (1 << 16) : (1 << 30)) : 0));
+        }
+        plan_sync();
+        for (uint32_t s = tid; s < kP; s += kPlanThreads) {
+            const int gc = gct[s], got = UNIT_HSPLIT ? gc & 0xffff : gc & 0x3fffffff;
+            if (UNIT_HSPLIT and got > 0) {
+                const int ne = counts[phy[s]], nbs = (ne + kBM - 1) / kBM;
+                q[s] += got * (ne / nbs) + (gc >> 16);
+            } else if (got > 0) {
+                const int ne = counts[phy[s]], nbs = (ne + kBM - 1) / kBM;
+                if (gc & (1 << 30)) {   // this slot holds its expert's partial unit
+                    y[s] += got - 1; pf[s] = 1;
+                    q[s] += (got - 1) * kBM + ne - (nbs - 1) * kBM;
+                } else {
+                    y[s] += got; q[s] += got * kBM;
+                }
+            }
+        }
+    }
+    plan_sync();
+    if (warp == 0) {
+        if (lane == 0)
+            milestone(32);
+        const int nu = min(static_cast<int>(s_nu), kMaxU);
+        // nothing lowers the peak below LB = max(ceil(total / R), max floor): stop there
+        const int lb = UNIT_HLB ? max((s_fsum + static_cast<int>(s_nu) + static_cast<int>(kR) - 1) / static_cast<int>(kR),
+                                      static_cast<int>(s_fmax)) : -1;
+        bool atlb = false;
+        // ---- relocate: serial scan in placement order; every unit that can leave a peak rank does ---
+        for (int pass = 0; pass < kHydRefine; ++ pass) {
+            int top = 0;   // warp-max over the two ranks each lane covers
+            for (int r = static_cast<int>(lane); r < static_cast<int>(kR); r += 32)
+                top = max(top, hload[r]);
+            for (int off = 16; off > 0; off >>= 1)
+                top = max(top, __shfl_xor_sync(~0u, top, off));
+            if (top <= lb) {
+                atlb = true;
+                break;
+            }
+            // ranks a unit may move to (load + 1 < top) as a bit mask: a unit's first such copy (ascending
+            // slots = ascending ranks) is its copy-rank mask & free -> lowest bit, no per-copy loop
+            const auto free_ranks = [&]() {
+                const uint32_t f0 = __ballot_sync(~0u, static_cast<int>(lane) < static_cast<int>(kR) and hload[lane] + 1 < top);
+                const uint32_t f1 = kR > 32 ? __ballot_sync(~0u, static_cast<int>(lane) + 32 < static_cast<int>(kR) and
+                                                           hload[min(static_cast<int>(lane) + 32, static_cast<int>(kR) - 1)] + 1 < top) : 0u;
+                return static_cast<uint64_t>(f0) | (static_cast<uint64_t>(f1) << 32);
+            };
+            uint64_t fr = free_ranks();
+            int pos = 0, moved = 0;
+            while (pos < nu) {
+                const int i = pos + static_cast<int>(lane);
+                int s = -1, s2 = -1;
+                if (i < nu) {
+                    s = hplaced[i] & 0x7fff;
+                    if (hload[s / kS] == top) {
+                        const int e = phy[s], oo = eoff[e];
+                        const uint64_t em = erm[e];
+                        if (em != 0) {
+                            const uint64_t m = em & fr;
+                            if (m != 0)
+                                s2 = cslot[oo + __popcll(em & ((m & (~m + 1)) - 1))];
+                        } else {
+                            const int kk = ecnt[e];
+                            for (int j = 0; j < kk; ++ j) {
+                                const int c = cslot[oo + j];
+                                if (hload[c / kS] + 1 < top) { s2 = c; break; }
+                            }
+                        }
+                    }
+                }
+                const uint32_t bal = __ballot_sync(~0u, s2 >= 0);
+                if (bal == 0) {
+                    pos += 32;
+                    continue;
+                }
+                const int fi = __ffs(bal) - 1, ai = pos + fi;
+                const int as = __shfl_sync(~0u, s, fi), as2 = __shfl_sync(~0u, s2, fi);
+                if (lane == 0) {
+                    const bool part = (hplaced[ai] & 0x8000) != 0;
+                    if (not UNIT_HSPLIT) {
+                        if (part) { pf[as] = 0; pf[as2] = 1; }
+                        else { y[as] -= 1; y[as2] += 1; }
+                    }
+                    const int amt = UNIT_HSPLIT ? ueven(as) + part : part ? rm[as] : kBM;
+                    q[as] -= amt; q[as2] += amt;
+                    hload[as / kS] -= 1; hload[as2 / kS] += 1;
+                    hplaced[ai] = (hplaced[ai] & 0x8000) | as2;
+                }
+                __syncwarp();
+                fr = free_ranks();
+                moved = 1;
+                pos = ai + 1;
+            }
+            if (__ballot_sync(~0u, moved) == 0)
+                break;
+        }
+        if (lane == 0) {
+            milestone(33);
+            s_lb = lb;
+        }
+        // ---- per-rank unit positions as monotone append stamps (placement order at build; each
+        //      relocate takes the next stamp so the order always matches the reference's
+        //      remove + append). Parallel rank-grouped count, one pass. At LB the BFS never runs ---
+        for (int r = static_cast<int>(lane); r < static_cast<int>(kR); r += 32)
+            ucnt[r] = 0;
+        __syncwarp();
+        for (int i0 = 0; i0 < (atlb ? 0 : nu); i0 += 32) {
+            const int i = i0 + static_cast<int>(lane);
+            const bool act = i < nu;
+            const int r = act ? (hplaced[i] & 0x7fff) / kS : -1;
+            const uint32_t am = __ballot_sync(~0u, act);
+            const uint32_t match = act ? __match_any_sync(am, r) : 0;
+            const uint32_t lt = match & ((1u << lane) - 1);
+            int cr = 0;
+            if (act)
+                cr = ucnt[r];                                    // pre-window count for my rank
+            __syncwarp();
+            if (act) {
+                upos[i] = cr + __popc(lt);
+                if (__ffs(match) - 1 == static_cast<int>(lane))
+                    ucnt[r] = cr + __popc(match);                // leader commits the window's count
+            }
+            __syncwarp();
+        }
+        for (int r = static_cast<int>(lane); r < static_cast<int>(kR); r += 32)
+            useq[r] = ucnt[r];
+        __syncwarp();
+        if (lane == 0)
+            milestone(34);
+    }
+    plan_sync();
+#if UNIT_HYDRO
+    // ---- multi-source BFS, level-batched on ALL plan warps: edge keys (queue position, append
+    //      stamp, copy, unit) order the atomicMins exactly like the reference's sequential pops;
+    //      the least keyed terminal edge wins and the unit index inside the key is the payload.
+    //      Warp 0 alone does the serial reduce/enqueue/apply -----------------------------------
+    {
+        const int nua = min(static_cast<int>(s_nu), kMaxU);
+        volatile int& s_fr = hsc[2], & s_stop = hsc[3];    // terminal rank / empty-level flag
+        volatile int& s_top = hsc[10], & s_fb = hsc[11], & s_qn = hsc[12];
+        for (int it = 0; it < kHydAug; ++ it) {
+            if (warp == 0) {
+                int top = 0;
+                for (int r = static_cast<int>(lane); r < static_cast<int>(kR); r += 32)
+                    top = max(top, hload[r]);
+                for (int off = 16; off > 0; off >>= 1)
+                    top = max(top, __shfl_xor_sync(~0u, top, off));
+                const int r0 = static_cast<int>(lane), r1 = r0 + 32;
+                const bool src0 = r0 < kR and hload[r0] == top, src1 = r1 < kR and hload[r1] == top;
+                const uint32_t sm0 = __ballot_sync(~0u, src0), sm1 = __ballot_sync(~0u, src1);
+                if (r0 < kR) {   // sources = peak ranks, fseq = rank order among them
+                    const int f0 = src0 ? __popc(sm0 & ((1u << lane) - 1)) : -1;
+                    bpar[r0] = src0 ? -1 : -2; bdep[r0] = src0 ? 0 : -1;
+                    fseq[r0] = f0; if (f0 >= 0) frk[f0] = r0;
+                }
+                if (r1 < kR) {
+                    const int f1 = src1 ? __popc(sm0) + __popc(sm1 & ((1u << lane) - 1)) : -1;
+                    bpar[r1] = src1 ? -1 : -2; bdep[r1] = src1 ? 0 : -1;
+                    fseq[r1] = f1; if (f1 >= 0) frk[f1] = r1;
+                }
+                if (lane == 0) {
+                    s_top = top; s_fr = -1; s_stop = 0;
+                    s_fb = 0; s_qn = __popc(sm0) + __popc(sm1);
+                    s_lbx = top <= s_lb;
+                }
+                __syncwarp();
+                    {   // next level's prep (bedge reset + unvisited-rank mask), done here to save a block sync
+                        const int q0 = static_cast<int>(lane), q1 = q0 + 32;
+                        if (q0 < kR) bedge[q0] = ~0u;
+                        if (q1 < kR) bedge[q1] = ~0u;
+                        const uint32_t u0 = __ballot_sync(~0u, q0 < static_cast<int>(kR) and bpar[min(q0, static_cast<int>(kR) - 1)] == -2);
+                        const uint32_t u1 = __ballot_sync(~0u, q1 < static_cast<int>(kR) and bpar[min(q1, static_cast<int>(kR) - 1)] == -2);
+                        if (lane == 0) { hsc[28] = static_cast<int>(u0); hsc[29] = static_cast<int>(u1); }
+                    }
+            }
+            plan_sync();
+            if (s_lbx != 0)
+                break;
+            if (stats != nullptr and tid == 0)
+                atomicAdd(&hsc[8], 1);
+            for (int lvl = 0; lvl < kHydDepth and s_fr < 0; ++ lvl) {
+                if (stats != nullptr and tid == 0)
+                    atomicAdd(&hsc[9], 1);
+                const int fb = s_fb, qn = s_qn;        // frontier = queue positions [fb, qn)
+                // bedge reset + unvisited mask were prepared by warp 0 before the last block sync
+                const uint64_t unv = static_cast<uint64_t>(static_cast<uint32_t>(hsc[28])) |
+                                     (static_cast<uint64_t>(static_cast<uint32_t>(hsc[29])) << 32);
+                uint64_t db_t = (stats != nullptr and tid == 0) ? clock64() : 0;
+                // scatter: every warp strides all units and emits the frontier's edges. The key
+                // packs the (queue position, append stamp, copy) order on top and the unit index
+                // below — one u32 atomicMin orders the race AND carries the payload.
+                for (int i = static_cast<int>(warp) * 32 + static_cast<int>(lane); i < nua; i += 512) {
+                    const int s = hplaced[i] & 0x7fff, ra = s / kS;
+                    const int fs = fseq[ra];
+                    if (fs < fb or fs >= qn)
+                        continue;
+                    const int e = phy[s], oo = eoff[e], kk = ecnt[e];
+                    const uint32_t pre = (static_cast<uint32_t>(fs) << 26) |
+                                         (static_cast<uint32_t>(upos[i]) << 16) |
+                                         static_cast<uint32_t>(i);
+                    const uint64_t em = erm[e];
+                    if (em != 0) {   // distinct copy ranks: copy index = # copy ranks below b
+                        for (uint64_t m = em & unv & ~(1ull << ra); m; m &= m - 1) {
+                            const int b = __ffsll(static_cast<long long>(m)) - 1;
+                            atomicMin(&bedge[b], pre | (static_cast<uint32_t>(__popcll(em & ((1ull << b) - 1))) << 11));
+                        }
+                    } else {
+                        for (int cj = 0; cj < kk; ++ cj) {
+                            const int s2 = cslot[oo + cj], b = s2 / kS;
+                            if (b != ra and bpar[b] == -2)
+                                atomicMin(&bedge[b], pre | (static_cast<uint32_t>(cj) << 11));
+                        }
+                    }
+                }
+                plan_sync();
+                if (stats != nullptr and tid == 0)
+                    atomicAdd(&hsc[4], static_cast<int>(clock64() - db_t));
+                if (warp == 0) {
+                    const int top = s_top;
+                    const int r0 = static_cast<int>(lane), r1 = r0 + 32;
+                    const uint32_t e0 = r0 < kR ? bedge[r0] : ~0u, e1 = r1 < kR ? bedge[r1] : ~0u;
+                    // parallel payload decode + BFS state commit: each lane resolves its own two
+                    // ranks' winning keys, so the serial section below only orders the queue
+                    const auto dec = [&](const uint32_t& k) {   // key -> (unit << 11) | slot
+                        const int i = k & 0x7ff, cj = (k >> 11) & 0x1f;
+                        return (i << 11) | cslot[eoff[phy[hplaced[i] & 0x7fff]] + cj];
+                    };
+                    if (e0 != ~0u) { bpar[r0] = frk[e0 >> 26]; bdep[r0] = lvl + 1; bparu[r0] = dec(e0); }
+                    if (e1 != ~0u) { bpar[r1] = frk[e1 >> 26]; bdep[r1] = lvl + 1; bparu[r1] = dec(e1); }
+                    uint32_t fmin = ~0u;
+                    if (e0 != ~0u and hload[r0] <= top - 2) fmin = e0;
+                    if (e1 != ~0u and hload[r1] <= top - 2) fmin = min(fmin, e1);
+                    for (int off = 16; off > 0; off >>= 1)
+                        fmin = min(fmin, __shfl_xor_sync(~0u, fmin, off));
+                    if (fmin != ~0u) {   // terminal: the least keyed terminal edge wins
+                        const bool ow0 = e0 == fmin, ow1 = e1 == fmin;
+                        const uint32_t ow = __ballot_sync(~0u, ow0 or ow1);
+                        s_fr = __shfl_sync(~0u, ow0 ? r0 : r1, __ffs(ow) - 1);
+                    } else {
+                        // enqueue the discovered ranks in flat edge order: position = # smaller keys
+                        const bool d0 = e0 != ~0u, d1 = e1 != ~0u;
+                        const uint32_t act = __ballot_sync(~0u, d0 or d1);
+                        const uint32_t bth = __ballot_sync(~0u, d0 and d1);
+                        if (act == 0) {
+                            s_stop = 1;
+                        } else {
+                            const int qn0 = qn;
+                            // position = # smaller keys over all 64 candidates (keys are unique; ~0u = none):
+                            // a fixed 32-step shuffle sweep instead of a dependent shfl+ballot chain per rank
+                            int p0 = 0, p1 = 0;
+#pragma unroll 8
+                            for (int j = 0; j < 32; ++ j) {
+                                const uint32_t ka = __shfl_sync(~0u, e0, j), kb = __shfl_sync(~0u, e1, j);
+                                p0 += static_cast<int>(ka < e0) + static_cast<int>(kb < e0);
+                                p1 += static_cast<int>(ka < e1) + static_cast<int>(kb < e1);
+                            }
+                            if (d0) { fseq[r0] = qn0 + p0; frk[qn0 + p0] = r0; }
+                            if (d1) { fseq[r1] = qn0 + p1; frk[qn0 + p1] = r1; }
+                            if (lane == 0) {
+                                s_fb = qn0;
+                                s_qn = qn0 + __popc(act) + __popc(bth);
+                            }
+                        }
+                    }
+                    __syncwarp();
+                    {   // next level's prep (bedge reset + unvisited-rank mask), done here to save a block sync
+                        const int q0 = static_cast<int>(lane), q1 = q0 + 32;
+                        if (q0 < kR) bedge[q0] = ~0u;
+                        if (q1 < kR) bedge[q1] = ~0u;
+                        const uint32_t u0 = __ballot_sync(~0u, q0 < static_cast<int>(kR) and bpar[min(q0, static_cast<int>(kR) - 1)] == -2);
+                        const uint32_t u1 = __ballot_sync(~0u, q1 < static_cast<int>(kR) and bpar[min(q1, static_cast<int>(kR) - 1)] == -2);
+                        if (lane == 0) { hsc[28] = static_cast<int>(u0); hsc[29] = static_cast<int>(u1); }
+                    }
+                }
+                plan_sync();
+                if (stats != nullptr and tid == 0)
+                    atomicAdd(&hsc[6], static_cast<int>(clock64() - db_t));
+                if (s_fr >= 0 or s_stop != 0)
+                    break;
+            }
+            if (s_fr < 0)
+                break;
+            const uint64_t db3 = (stats != nullptr and tid == 0) ? clock64() : 0;
+            if (warp == 0 and lane == 0) {   // apply the chain back from the terminal
+                int b = s_fr;
+                while (bpar[b] != -1) {
+                    const int pk = bparu[b];
+                    const int i = pk >> 11, s2 = pk & 0x7ff;
+                    const int s = hplaced[i] & 0x7fff, a2 = s / kS;
+                    const bool part = (hplaced[i] & 0x8000) != 0;
+                    if (not UNIT_HSPLIT) {
+                        if (part) { pf[s] = 0; pf[s2] = 1; }
+                        else { y[s] -= 1; y[s2] += 1; }
+                    }
+                    const int amt = UNIT_HSPLIT ? ueven(s) + part : part ? rm[s] : kBM;
+                    q[s] -= amt; q[s2] += amt;
+                    hload[a2] -= 1; hload[b] += 1;
+                    hplaced[i] = (hplaced[i] & 0x8000) | s2;
+                    // the append stamp keeps the within-rank edge order identical to the
+                    // reference's remove + append without maintaining any list structure
+                    upos[i] = useq[b]; ++ useq[b];
+                    b = bpar[b];
+                }
+            }
+            plan_sync();
+            if (stats != nullptr and tid == 0)
+                atomicAdd(&hsc[7], static_cast<int>(clock64() - db3));
+        }
+        if (tid == 0) {
+            milestone(30);
+            trace_point(buffer, 17);
+            if (stats != nullptr) {
+                for (int d = 0; d < 6; ++ d)
+                    stats[4030 + d] = hsc[4 + d];
+                stats[4036] = s_nu;
+                stats[4037] = s_nm;
+                for (int d = 0; d < 6; ++ d)
+                    stats[4038 + d] = hsc[14 + d];
+            }
+        }
+    }
+#endif
+    plan_sync();
+    if (tid == 0) {
+        milestone(21);
+        trace_point(buffer, 18);
+    }
+#else
     // Small replicated experts: one lane each, striding when there are more than kPlanThreads; big ones: a warp
     // each (lane = copy). A lane replays its whole expert locally — the planning phase uses no collectives.
     int bp[kBigPerWarp], bq[kBigPerWarp], bk[kBigPerWarp], btot[kBigPerWarp];
@@ -439,60 +1328,20 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         btot[i] = bvalid[i] ? counts[e] : 0;
     }
     if (warm) {
-        // Unit-space warm start (`UnitPlanner._warm`): (1) the previous plan's units per copy (q: previous quotas, pcnt:
-        // previous counts; the partial unit's owner is the first copy whose quota is congruent to the previous partial
-        // size), the estimate T0 with the new partial sizes; (2) the experts whose unit count changed add units to the
-        // copies with the lowest estimate (+ own additions) or remove them from the highest (+ own removals); the
-        // partial stays with its owner while it holds a unit, else goes to the holding copy with the highest estimate
+        // Unit-space warm start (`UnitPlanner._warm`): (1) the replicated slots' warm unit split was
+        // assigned by the helpers during the count-row window (previous call's quotas and counts only);
+        // here the experts with no tokens this call are cleared and the per-copy rank-time estimates
+        // fold into T0; (2) the experts whose unit count changed add units to the copies with the lowest
+        // estimate (+ own additions) or remove them from the highest (+ own removals); the partial stays
+        // with its owner while it holds a unit, else goes to the holding copy with the highest estimate
         constexpr int kUnit = kWB + kBM;
-        for (int g = tid; g < NS; g += kPlanThreads) {   // one lane per small expert
-            const int se = small_ids[g], sk = ecnt[se], so = eoff[se], stot = counts[se];
-            int s4[4];
-            #pragma unroll
-            for (int j = 0; j < 4; ++ j)
-                s4[j] = (j < sk) ? cslot[so + j] : -1;
-            const int npv = stot > 0 ? pcnt[se] : 0, kp = (npv + kBM - 1) / kBM;
-            const int remp = npv - (kp - 1) * kBM;
-            int sown = -1;
-            #pragma unroll
-            for (int j = 0; j < 4; ++ j) {   // the previous partial's owner: first copy with a congruent quota
-                const int qs = s4[j] >= 0 ? q[s4[j]] : 0;
-                if (sown < 0 and s4[j] >= 0 and kp > 0 and qs >= remp and (qs - remp) % kBM == 0)
-                    sown = j;
-            }
-            const int rm = stot > 0 ? stot - ((stot + kBM - 1) / kBM - 1) * kBM : 0;
-            #pragma unroll
-            for (int j = 0; j < 4; ++ j)
-                if (s4[j] >= 0) {
-                    const int qs = q[s4[j]];
-                    const int suj = sown >= 0 ? (qs - (j == sown ? remp : 0)) / kBM + (j == sown) : 0;
-                    const int yy = suj - (j == sown), pp = j == sown;
-                    y[s4[j]] = yy; pf[s4[j]] = pp;
-                    atomicAdd(&T0[s4[j] / kS], pcost(yy, pp, rm));
+        for (uint32_t s = tid; s < kP; s += kPlanThreads) {
+            if (clen[s] > 1) {
+                if (counts[phy[s]] == 0) {
+                    y[s] = 0; pf[s] = 0;
+                } else {
+                    atomicAdd(&T0[s / kS], pcost(y[s], pf[s], rm[s]));
                 }
-        }
-        int bu[kBigPerWarp], bown[kBigPerWarp];
-        #pragma unroll
-        for (uint32_t i = 0; i < kBigPerWarp; ++ i) {
-            bu[i] = 0; bown[i] = -1;
-            if (not bvalid[i])
-                continue;
-            if (btot[i] > 0) {
-                const int be = __shfl_sync(~0u, bon[i] ? phy[bp[i]] : 0, 0);
-                const int npv = pcnt[be], kp = (npv + kBM - 1) / kBM;
-                if (kp > 0) {
-                    const int remp = npv - (kp - 1) * kBM, qs = bon[i] ? q[bp[i]] : 0;
-                    const uint32_t bal = __ballot_sync(~0u, bon[i] and qs >= remp and (qs - remp) % kBM == 0);
-                    bown[i] = bal ? __ffs(bal) - 1 : -1;
-                    if (bown[i] >= 0 and bon[i])
-                        bu[i] = (qs - (static_cast<int>(lane) == bown[i] ? remp : 0)) / kBM + (static_cast<int>(lane) == bown[i]);
-                }
-            }
-            if (bon[i]) {
-                const int yy = bown[i] >= 0 ? bu[i] - (static_cast<int>(lane) == bown[i]) : 0;
-                const int pp = static_cast<int>(lane) == bown[i];
-                y[bp[i]] = yy; pf[bp[i]] = pp;
-                atomicAdd(&T0[bp[i] / kS], pcost(yy, pp, btot[i] > 0 ? btot[i] - ((btot[i] + kBM - 1) / kBM - 1) * kBM : 0));
             }
         }
         plan_sync();
@@ -671,7 +1520,11 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             if (not bvalid[i] or btot[i] == 0)
                 continue;
             const int tr = bon[i] ? T0[bp[i] / kS] : 0;
-            int add = 0, u = bu[i];
+            // Units per copy incl. the partial, and the partial's owner, re-read from the
+            // helpers' warm assignment (y/pf).
+            int add = 0, u = bon[i] ? y[bp[i]] + pf[bp[i]] : 0;
+            const uint32_t obal = __ballot_sync(~0u, bon[i] and pf[bp[i]] != 0);
+            int own = obal ? static_cast<int>(__ffs(obal)) - 1 : -1;
             int delta = (btot[i] + kBM - 1) / kBM - __reduce_add_sync(~0u, bon[i] ? u : 0);
             // Same closed form as the small experts: the picks are the delta smallest (largest, when removing)
             // elements of the lanes' merged arithmetic sequences, the threshold found by binary search
@@ -712,7 +1565,6 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
                     ++ add;
                 u -= add;
             }
-            int own = bown[i];
             if (not __any_sync(~0u, static_cast<int>(lane) == own and u > 0)) {
                 const uint32_t mk = __reduce_max_sync(~0u, (bon[i] and u > 0) ? ((static_cast<uint32_t>(tr) << 5) | (31 - lane)) : 0u);
                 own = 31 - static_cast<int>(mk & 31);
@@ -844,36 +1696,49 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         milestone(21);
         trace_point(buffer, 18);
     }
+#endif
 
     // ---- publish: quotas, canonical starts within each expert's copies (ascending slots) -------------------------
     // Quotas (full units * bm + the partial unit) computed where they are read: no rewrite pass and barrier
+#if UNIT_HYDRO
+    const auto quota = [&](const int& c) { return q[c]; };   // hydro keeps exact per-slot token quotas
+#else
     const auto quota = [&](const int& c) { return y[c] * kBM + pf[c] * rm[c]; };
+#endif
     auto* out_quota = signals + OFF_ECO_QUOTA / 4;
     auto* out_start = signals + OFF_ECO_QUOTA_START / 4;
+    // Banked by call parity: bank[epoch&1] holds this call's plan while
+    // bank[epoch&1^1] keeps the previous one readable for speculation.
+    const uint32_t kQBank = ECO_QBANK ? uint32_t(kP) : 0u;
+    out_quota += (epoch & 1u) * kQBank;
+    out_start += (epoch & 1u) * kQBank;
     for (uint32_t p = tid; p < kP; p += kPlanThreads) {
         const int o = cst[p], k = ecnt[phy[p]];
         int start = 0;
-        for (int j = 0; j < k; ++ j) {   // active copies ascend: the copies below p (passive copies hold nothing)
+        // active copies ascend: sum the copies below p (passive copies hold nothing). No early exit, so
+        // the independent loads pipeline instead of one dependent slot+quota round trip per copy
+#pragma unroll 4
+        for (int j = 0; j < k; ++ j) {
             const int c = cslot[o + j];
-            if (c >= static_cast<int>(p))
-                break;
-            start += quota(c);
+            start += c < static_cast<int>(p) ? quota(c) : 0;
         }
         out_quota[p] = static_cast<uint32_t>(quota(static_cast<int>(p)));
         out_start[p] = static_cast<uint32_t>(start);
     }
     plan_sync();
     if (tid == 0) {
+        milestone(40);
         __threadfence();
+        milestone(41);
         st_release_gpu(signals + OFF_ECO_PLAN_READY / 4, epoch + 1);
-        trace_point(buffer, 5);
+        const auto publish_time = trace_point(buffer, 5);
         milestone(20);
 #if defined(ECO_TRACE) and ECO_TRACE
         auto* slots = reinterpret_cast<unsigned long long*>(buffer + OFF_ECO_TRACE);
-        const auto since = slots[5] - *reinterpret_cast<volatile unsigned long long*>(slots + 24);
+        const auto since = publish_time - *reinterpret_cast<volatile unsigned long long*>(slots + 24);
         atomicAdd(slots + 25, since);
-        const auto entry = static_cast<uint32_t>(*reinterpret_cast<volatile unsigned long long*>(slots + 30)) % 64;
-        reinterpret_cast<uint32_t*>(buffer + OFF_ECO_TRACE_RING)[entry * 8 + 3] = static_cast<uint32_t>(since);
+        const auto entry = static_cast<uint32_t>(*reinterpret_cast<volatile unsigned long long*>(slots + 33)) % 64;
+        reinterpret_cast<uint32_t*>(buffer + OFF_ECO_TRACE_RING)[entry * ECO_TRACE_RING_FIELDS + 3] = static_cast<uint32_t>(since);
 #endif
     }
     // ---- next call's warm state (after the release, off the critical path): this plan's quotas of the replicated
@@ -884,4 +1749,14 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         for (uint32_t e = tid; e < kE; e += kPlanThreads)
             state[kP + e] = counts[e];
     }
+#if defined(ECO_TRACE) and ECO_TRACE
+    plan_sync();
+    if (tid == 0) {   // ring field 10: plan kernel exit (ns since this call's role1 start)
+        const auto exit_time = trace_point(buffer, 43);
+        const auto* slots = reinterpret_cast<const volatile unsigned long long*>(buffer + OFF_ECO_TRACE);
+        const auto entry = static_cast<uint32_t>(slots[33]) % 64;
+        atomicMax(reinterpret_cast<uint32_t*>(buffer + OFF_ECO_TRACE_RING) + entry * ECO_TRACE_RING_FIELDS + 10,
+                  static_cast<uint32_t>(exit_time - slots[24]));
+    }
+#endif
 }

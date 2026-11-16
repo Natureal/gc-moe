@@ -25,7 +25,7 @@ from ...layout.gc_moe import (
     align,
     ceil_div,
 )
-from ...eco.plan import ECO_PLAN_ROLE, ECO_UNIT_THREADS, compile_eco_plan, eco_unit_config
+from ...eco.plan import ECO_PLAN_ROLE, ECO_UNIT_THREADS, compile_eco_plan, eco_split_counts_enabled, eco_unit_config
 from ...runtime.gc_moe import RoleBinary, get_context
 from ...runtime.jit import (
     COMPILE_LOCK,
@@ -353,8 +353,8 @@ def _convert_role2_map_uses(ptx: str) -> str:
 
 def _device_compile_target(device: torch.device) -> str:
     major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) != (10, 3):
-        raise NotImplementedError('current three-role device path requires compute capability 10.3')
+    if (major, minor) not in ((10, 0), (10, 3)):
+        raise NotImplementedError('current three-role device path requires compute capability 10.0 or 10.3')
     return device_compile_target((major, minor))
 
 
@@ -377,16 +377,16 @@ def _entry_formals(ptx: str) -> list[str]:
     return lines
 
 
-def _order_role2_value_formals(ptx: str) -> str:
+def _order_role2_value_formals(ptx: str, eco: bool = False) -> str:
     """Keep ordinary scalars ahead of the eighteen contiguous value maps."""
     formals = _entry_formals(ptx)
-    if len(formals) != 24:
+    if len(formals) != 24 + int(eco):
         raise RuntimeError('role2 value-formal count changed')
     for index, line in enumerate(formals):
         if re.search(r"\b[A-Za-z0-9_.$]+_param_" + str(index) +
                      r"(?:\[[0-9]+\])?,?[ \t]*$", line) is None:
             raise RuntimeError('role2 value-formal order changed')
-    order = (0, 1, 2, 3, 5, 6, 4, *range(7, 24))
+    order = (0, 1, 2, 3, 5, 6, *((24,) if eco else ()), 4, *range(7, 24))
     ordered = [formals[i].rstrip().rstrip(',') for i in order]
     original = '\n'.join(formals)
     if ptx.count(original) != 1:
@@ -400,7 +400,8 @@ def _assemble_role_value_params(ptx: str, role: int,
                                 eco: bool = False) -> tuple[str, bytes, str]:
     """Build each role with relative peer value, plus role2's value maps.
 
-    ECO: role1 also takes the layer's EcoMeta pointer after the token count."""
+    ECO: role1 has a static metadata pointer; roles 2/3 have a trailing single-copy slot count.
+    The role2 scalar is reordered ahead of the value maps without changing their PTX parameter ordinals."""
     ptx = _clean_cute_ptx(ptx)
     if ptx_target(ptx) != target:
         raise RuntimeError('CuTe generated a different device target')
@@ -410,6 +411,8 @@ def _assemble_role_value_params(ptx: str, role: int,
                     ('ptr',) * 17),
                 3: ('ptr', 'ptr', 'u32', 'u32', 'ptr', 'ptr', 'ptr',
                     'f32', 'f32')}[role]
+    if eco and role in (2, 3):
+        expected += ('u32',)
     formals = _entry_formals(ptx)
     if len(formals) != len(expected):
         raise RuntimeError(f"role{role} CuTe parameter count changed")
@@ -427,7 +430,7 @@ def _assemble_role_value_params(ptx: str, role: int,
             ptx = _rewrite_value_formal(
                 ptx, map_ordinal, 128, 128, raw_param_address=True)
         ptx = _convert_role2_map_uses(ptx)
-        ptx = _order_role2_value_formals(ptx)
+        ptx = _order_role2_value_formals(ptx, eco)
     return assemble_ptx(ptx, dump_dir, f"role{role}_value_params",
                                 target=target, ptxas_options=ptxas_options)
 
@@ -554,16 +557,32 @@ def prepare_role_binaries(config, y: torch.Tensor,
         if eco_state is not None and (eco_state.dtype != torch.int16 or
                                       eco_state.numel() != sym_buffer.num_experts + eco_logical):
             raise ValueError('ECO state must be int16 [physical + logical experts]')
+        eco_dispatch_meta, eco_fixed_by_rank = _eco_dispatch_meta(
+            eco_meta, eco_logical, sym_buffer.num_experts, sym_buffer.group.size())
     if context is None:
         context = get_context()
-    # ECO: the plan CTA takes one cluster (two SMs) of the compute partition by default and dispatch keeps
-    # its whole partition (dispatch-bound pulls lose more to one dispatch SM than compute loses to one
-    # cluster). GC_MOE_ECO_PLAN_DISPATCH=1 instead takes one dispatch SM and leaves compute whole - better
-    # when dispatch finishes well before the compute role ends.
-    _eco_plan_dispatch = eco and os.environ.get('GC_MOE_ECO_PLAN_DISPATCH', '0') == '1'
+    # ECO: the plan CTA takes one cluster (two SMs) of the compute partition and dispatch keeps its whole partition
+    # (one dispatch SM costs far more than one compute cluster, measured on B300 and L20)
     _eco_helper = eco and os.environ.get('GC_MOE_ECO_HELPER') == '1'
-    dispatch_sms = context.dispatch_sms - (1 if _eco_plan_dispatch else 0)
-    compute_sms = context.compute_sms - (0 if _eco_plan_dispatch else (2 if eco else 0))
+    eco_rows_after_pub = eco and os.environ.get('GC_MOE_ECO_ROWS_AFTER_PUB') == '1'
+    eco_split_counts = eco and eco_split_counts_enabled(sym_buffer.group.size())
+    eco_route_prep = eco and os.environ.get('GC_MOE_ECO_ROUTE_PREP') == '1'
+    if eco_route_prep and not eco_split_counts:
+        raise ValueError('GC_MOE_ECO_ROUTE_PREP requires the two-CTA plan')
+    # Timing probe: replica pulls/tasks run on the previous call's published
+    # quotas without waiting for this call's plan. Wrong output — never check.
+    eco_spec = eco and os.environ.get('GC_MOE_ECO_SPEC') == '1'
+    # Measurement only: GC_MOE_DBG_COMPUTE_MINUS=<even n> leaves n compute SMs idle in plain calls, pricing the ECO
+    # plan cluster's SM reservation on plain loads
+    dbg_compute_minus = 0 if eco else int(os.environ.get('GC_MOE_DBG_COMPUTE_MINUS', '0'))
+    if dbg_compute_minus < 0 or dbg_compute_minus % 2:
+        raise ValueError('GC_MOE_DBG_COMPUTE_MINUS must be a non-negative even SM count')
+    dispatch_sms = context.dispatch_sms
+    # GC_MOE_ECO_NO_RESERVE=1: compute launches on the whole partition; the cluster that overlaps the plan CTA's SM
+    # starts when the plan exits (tasks are claimed dynamically, nothing waits on that cluster starting)
+    eco_no_reserve = eco and os.environ.get('GC_MOE_ECO_NO_RESERVE') == '1'
+    compute_sms = (context.compute_sms if eco_no_reserve else context.compute_sms - 2) if eco \
+        else context.compute_sms - dbg_compute_minus
     device = sym_buffer.buffer.device
     weight_pairs = (l1_weights, l2_weights)
     if shared_l1_weights is not None:
@@ -597,7 +616,9 @@ def prepare_role_binaries(config, y: torch.Tensor,
     key = _capture_key(config, sym_buffer, context, y, l1_weights, l2_weights,
                        shared_l1_weights, shared_l2_weights, stats,
                        nvlink_timeout_secs, role_resources, combine_resources,
-                       compiler_identity) + ((eco_logical,) if eco else ())
+                       compiler_identity) + ((eco_logical, eco_rows_after_pub, eco_split_counts, eco_route_prep,
+                                              eco_spec) if eco else ()) + (
+                                                 (dbg_compute_minus,) if dbg_compute_minus else ())
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -639,7 +660,10 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         nvlink_timeout_secs=nvlink_timeout_secs,
                         role_config=role_configs[index],
                         combine_geometry=combine_geometry if role == 3 else None,
-                        eco_logical_experts=eco_logical, eco_trace=eco and _eco_trace_enabled())
+                        eco_logical_experts=eco_logical, eco_trace=_eco_trace_enabled(),
+                        eco_rows_after_pub=eco_rows_after_pub,
+                        eco_route_prep=eco_route_prep and role == 1,
+                        eco_spec=eco_spec)
                     role_kernels.append(role_kernel)
                 helper_kernel = None
                 if _eco_helper:
@@ -663,13 +687,14 @@ def prepare_role_binaries(config, y: torch.Tensor,
                         nvlink_timeout_secs=nvlink_timeout_secs,
                         role_config=role_configs[1],
                         eco_logical_experts=eco_logical,
-                        eco_trace=eco and _eco_trace_enabled(),
+                        eco_trace=_eco_trace_enabled(),
                         cta_base=compute_sms)
                 binary_key = _binary_key(
                     compiler_identity,
                     tuple(role_kernels) + ((helper_kernel,) if helper_kernel is not None else ()),
                     role_resources,
-                    combine_resources, sym_buffer, y, weights, stats)
+                    combine_resources, sym_buffer, y, weights, stats) + (
+                    eco_split_counts, eco_route_prep)
                 def compile_roles():
                     signal_view = from_dlpack(sym_buffer.buffer.view(torch.int32))
                     peer_view = from_dlpack(sym_buffer.buffer.view(torch.int64).flatten()[:74])
@@ -679,11 +704,12 @@ def prepare_role_binaries(config, y: torch.Tensor,
                     map_views = tuple(from_dlpack(map_storage[i * 128:(i + 1) * 128])
                                       for i in range(18))
                     role3_map_view = from_dlpack(map_storage[:2304])
-                    eco_meta_view = from_dlpack(eco_meta) if eco else None
+                    eco_meta_view = from_dlpack(eco_dispatch_meta) if eco else None
                     y_view = from_dlpack(y)
                     stats_view = from_dlpack(stats) if stats is not None else signal_view
                     rank_view, token_view = Uint32(0), Uint32(0)
                     clamp_view, alpha_view = Float32(0.0), Float32(1.0)
+                    fixed_view = Uint32(0) if eco else None
                     compiled_binaries = []
                     for index, (role, role_kernel) in enumerate(zip((1, 2, 3), role_kernels)):
                         compile_args = ((signal_view, peer_view, rank_view, token_view,
@@ -697,12 +723,16 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                         (signal_view, peer_view, rank_view, token_view,
                                          eco_meta_view, None, None,
                                          clamp_view, alpha_view))
+                        if eco and role == 2:
+                            compile_args += (fixed_view,)
+                        elif eco and role == 3:
+                            compile_args += (None,) * 17 + (fixed_view,)
                         cubin = compile_kernel(
                             role_kernel, compile_args, compiler_identity,
                             lambda ptx, dump_dir: _assemble_role_value_params(
                                 ptx, role, dump_dir, target=compiler_target,
                                 ptxas_options=compiler_identity.ptxas_options,
-                                eco=eco and role == 1))
+                                eco=eco))
                         role_config = role_configs[index]
                         compiled_binaries.append(RoleBinary(
                             role, cubin, role_config.dynamic_smem,
@@ -711,7 +741,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                             compute_sms if role == 2 else
                             role_kernel.finalize_sms))
                     if eco:
-                        # ECO plan role: nvcc cubin, static shared memory, one CTA on the dispatch SM left free
+                        # ECO stays within the reserved cluster: either one CTA or a producer/planner pair.
                         compiled_binaries.append(RoleBinary(
                             ECO_PLAN_ROLE,
                             compile_eco_plan(sym_buffer.num_experts, sym_buffer.group.size(), eco_logical,
@@ -719,21 +749,28 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                              layout.views['topk_idx'].offset, sym_buffer.num_topk,
                                              sym_buffer.num_max_tokens_per_rank,
                                              eco_unit_config(sym_buffer.group.size(), config.block_m,
-                                                             sym_buffer.num_experts - eco_logical),
-                                             trace=_eco_trace_enabled()),
+                                                             sym_buffer.num_experts - eco_logical, config.tokens),
+                                             arch=compiler_target[:-1] + 'a',
+                                             trace=_eco_trace_enabled(), rows_after_pub=eco_rows_after_pub,
+                                             split_counts=eco_split_counts, route_prep=eco_route_prep,
+                                             spec=eco_spec,
+                                             dispatch_sms=dispatch_sms,
+                                             dispatch_warps=role_configs[0].routing_warps,
+                                             recv_mode=int(os.environ.get(
+                                                 'GC_MOE_ECO_RECV_COUNTS', '3'))),
                             0,
-                            ECO_UNIT_THREADS, 1))
+                            ECO_UNIT_THREADS, 2 if eco_split_counts else 1))
                     if helper_kernel is not None:
                         helper_cubin = compile_kernel(
                             helper_kernel,
                             (signal_view, peer_view, rank_view, token_view,
                              map_views[0], None, None,
-                             clamp_view, alpha_view, *map_views[1:]),
+                             clamp_view, alpha_view, *map_views[1:], fixed_view),
                             compiler_identity,
                             lambda ptx, dump_dir: _assemble_role_value_params(
                                 ptx, 2, dump_dir, target=compiler_target,
                                 ptxas_options=compiler_identity.ptxas_options,
-                                eco=False))
+                                eco=True))
                         role2_config = role_configs[1]
                         compiled_binaries.append(RoleBinary(
                             5, helper_cubin, role2_config.dynamic_smem,
@@ -760,14 +797,15 @@ def prepare_role_binaries(config, y: torch.Tensor,
     y_arg = ctypes.c_void_p(y.data_ptr())
     stats_arg = ctypes.c_void_p(stats.data_ptr() if stats is not None else
                                sym_buffer.buffer.data_ptr())
-    role1_args = ((signal_arg, peer_arg, rank_arg, token_arg, ctypes.c_void_p(eco_meta.data_ptr()),
+    fixed_args = (ctypes.c_uint32(eco_fixed_by_rank[sym_buffer.rank_idx]),) if eco else ()
+    role1_args = ((signal_arg, peer_arg, rank_arg, token_arg, ctypes.c_void_p(eco_dispatch_meta.data_ptr()),
                    clamp_arg, alpha_arg) if eco else
                   (signal_arg, peer_arg, rank_arg, token_arg, clamp_arg, alpha_arg))
     arguments = (role1_args,
                  (signal_arg, peer_arg, rank_arg, token_arg,
-                  clamp_arg, alpha_arg, *map_args),
+                  clamp_arg, alpha_arg, *fixed_args, *map_args),
                  (signal_arg, peer_arg, rank_arg, token_arg, role3_map_arg,
-                  y_arg, stats_arg, clamp_arg, alpha_arg))
+                  y_arg, stats_arg, clamp_arg, alpha_arg, *fixed_args))
     if eco:
         # Peer base addresses for the plan CTA's remote stores (device table, stable for graph capture)
         key = (sym_buffer.buffer.device.index, tuple(sym_buffer.peer_addresses))
@@ -782,8 +820,47 @@ def prepare_role_binaries(config, y: torch.Tensor,
                        ctypes.c_uint32(sym_buffer.rank_idx), ctypes.c_uint32(config.tokens)),)
         if _eco_helper:
             arguments += ((signal_arg, peer_arg, rank_arg, token_arg,
-                           clamp_arg, alpha_arg, *map_args),)
+                           clamp_arg, alpha_arg, *fixed_args, *map_args),)
     return list(prepared.binaries), arguments
+
+_ECO_DISPATCH_METAS = {}
+
+
+def _eco_dispatch_meta(eco_meta: torch.Tensor, num_logical: int, num_physical: int,
+                       num_ranks: int) -> tuple[torch.Tensor, tuple[int, ...]]:
+    """Fixed-size dispatch metadata and each rank's static single-copy prefix.
+
+    Keep only the EcoMeta header/copies/phy2log/num_fixed prefix, followed by one word per physical slot.
+    The planner receives the original metadata, whose variable-length unit section must not specialize role1.
+    Retain the source tensor to prevent allocator pointer reuse from hitting an unrelated cached placement.
+    A placement must stay immutable while a graph using it can replay: changing it requires preparing the
+    derived table again and recapturing the graph's by-value single-copy slot counts.
+    """
+    version = None if eco_meta.is_inference() else eco_meta._version
+    key = (eco_meta.device, eco_meta.data_ptr(), eco_meta.numel(), version,
+           num_logical, num_physical, num_ranks)
+    cached = _ECO_DISPATCH_METAS.get(key)
+    if cached is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError('run ECO GC MoE once outside graph capture first')
+        meta = eco_meta.cpu()
+        phy2log = meta[16 + num_logical * 16:16 + num_logical * 16 + num_physical].to(torch.int64)
+        fixed_offset = 16 + num_logical * 16 + num_physical
+        prefix_words = fixed_offset + num_ranks
+        fixed = tuple(int(x) for x in meta[fixed_offset:prefix_words].tolist())
+        if len(fixed) != num_ranks or any(not 0 <= x <= num_physical // num_ranks for x in fixed):
+            raise ValueError('invalid ECO single-copy slot prefixes')
+        local = num_physical // num_ranks
+        # Only single-copy slots receive routing-time count pushes. The plan kernel materializes
+        # replica slots' per-source counts into their native receive-count rows, so the pull path
+        # reads every slot identically; passive copies have zero quota and need no count publication.
+        info = [int(expert) | ((1 << 31) if slot % local < fixed[slot // local] else 0)
+                for slot, expert in enumerate(phy2log.tolist())]
+        tail = torch.tensor([v - (1 << 32) if v >= (1 << 31) else v for v in info], dtype=torch.int32)
+        dispatch_meta = torch.cat([eco_meta[:prefix_words], tail.to(eco_meta.device)])
+        cached = _ECO_DISPATCH_METAS[key] = (eco_meta, dispatch_meta, fixed)
+    return cached[1], cached[2]
+
 
 def launch_gc_moe(config, y, l1_weights, l2_weights, sym_buffer,
                   shared_l1_weights, shared_l2_weights, stats,

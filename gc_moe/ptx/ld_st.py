@@ -33,6 +33,26 @@ def ld_volatile_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
 
 
 @dsl_user_op
+def warp_wait_count_u64(ptr: cute.Pointer, active: Uint32, arrivals: int, *, loc=None, ip=None) -> Uint32:
+    """Warp-collective wait for packed native counters (high word: arrivals, low word: tokens).
+
+    Every lane of a converged warp must call it; lanes with `active == 0` load nothing and return 0. The loop
+    branch is warp-uniform (vote.any): a per-lane divergent poll loop makes ptxas drop uniform-datapath code
+    for the whole kernel (role2: +750 SASS instructions and epilogue spills).
+    """
+    value = llvm.inline_asm(
+        T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value(), active.ir_value(loc=loc, ip=ip)],
+        '{ .reg .b64 packed; .reg .b32 lo, hi; .reg .pred act, pending, again; '
+        f'setp.ne.u32 act, $2, 0; mov.b32 lo, 0; mov.b32 hi, {arrivals}; '
+        'wait_count: @act ld.volatile.global.b64 packed, [$1]; @act mov.b64 {lo, hi}, packed; '
+        f'setp.ne.u32 pending, hi, {arrivals}; vote.sync.any.pred again, pending, 0xffffffff; '
+        '@again bra.uni wait_count; mov.b32 $0, lo; }',
+        '=r,l,r,~{memory}', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return Uint32(value)
+
+
+@dsl_user_op
 def ld_global_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
     """Ordinary 64-bit load for source counts after the rank rendezvous."""
     address = ptr.toint(loc=loc, ip=ip).ir_value()
@@ -40,6 +60,16 @@ def ld_global_u64(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint64:
                             'ld.global.u64 $0, [$1];', '=l,l',
                             has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
     return Uint64(value)
+
+
+@dsl_user_op
+def ld_global_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint32:
+    """Ordinary (L1-cacheable) 32-bit load for a table completed before an acquire in this kernel."""
+    address = ptr.toint(loc=loc, ip=ip).ir_value()
+    value = llvm.inline_asm(T.i32(), [address],
+                            'ld.global.u32 $0, [$1];', '=r,l',
+                            has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Uint32(value)
 
 
 @dsl_user_op

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from math import ceil, sqrt
@@ -45,6 +46,14 @@ def get_block_m_for_gc_moe(num_ranks: int, num_experts: int,
             block_m = candidate
             if _f32(num_blocks * candidate) >= covered:
                 break
+    # Measured per-GPU override, '<max expected tokens per slot>:<block M>,...' ascending; e.g. EP64 L20B
+    # (EPLB512 sweep, 128-1024 tokens per rank): GC_MOE_BLOCK_M_TABLE=400:96,100000:192
+    table = os.environ.get('GC_MOE_BLOCK_M_TABLE')
+    if table:
+        for item in table.split(','):
+            limit, candidate = item.split(':')
+            if expected <= float(limit):
+                return int(candidate)
     return block_m
 
 
@@ -106,6 +115,7 @@ class RoleConfig:
     swizzle_output: int
     routing_warps: int
     pull_bytes: int
+    pull_stages: int
     shared_layout: SharedStorageLayout
 
 
@@ -121,7 +131,7 @@ def get_role_config(role: int, block_m: int, num_experts: int,
         pull_bytes //= 2
     store1 = 8 if block_m <= 16 else 16 if block_m <= 96 else 32 if block_m <= 192 else 24
     store2 = 8 if block_m == 240 else store1
-    routing_warps = 12 if block_m >= 96 else 8
+    routing_warps = int(os.environ.get('GC_MOE_ROUTING_WARPS', 12 if block_m >= 96 else 8))
     dispatch_threads = routing_warps * 32 if role == 1 else 128
     dispatch_warps = dispatch_threads // 32
     smem_cd = align(max(2 * store1 * 64 * 2, 2 * store2 * 128 * 2), 1024)
@@ -138,25 +148,41 @@ def get_role_config(role: int, block_m: int, num_experts: int,
         raise ValueError('insufficient shared memory for two TMA stages')
     dynamic_smem = budget_fixed + budget_stages * stage
     stages = 2 if role == 1 else budget_stages
-    # Actual SharedStorage uses the widened role1 pull region. Keep its byte
-    # count distinct from the launch allocation retained by the reference.
-    actual_dispatch = (1024 if role == 2 else align(num_experts * 4, 1024) +
-                       align(dispatch_warps * pull_bytes, 1024))
-    actual_barriers = (dispatch_warps + 4 + 16 + 4) * 8
-    fixed = actual_dispatch + smem_cd + smem_amax + actual_barriers + 2 * 32 + 4
+    # Role1 double-buffers its pull staging (only pays off with whole-token
+    # chunks); fall back to a single stage when the widened region overflows
+    # the launch allocation.
+    pull_stages = 2 if role == 1 and pull_bytes == hidden else 1
+    # GC_MOE_PULL_STAGES=1 forces the single-buffered serial pull loop.
+    if __import__('os').environ.get('GC_MOE_PULL_STAGES', '2') != '2':
+        pull_stages = 1
+
+    def role_fixed(ps: int) -> int:
+        # Actual SharedStorage uses the widened role1 pull region. Keep its byte
+        # count distinct from the launch allocation retained by the reference.
+        actual_dispatch = (1024 if role == 2 else align(num_experts * 4, 1024) +
+                           align(dispatch_warps * ps * pull_bytes, 1024))
+        actual_barriers = (dispatch_warps * ps + 4 + 16 + 4) * 8
+        return actual_dispatch + smem_cd + smem_amax + actual_barriers + 2 * 32 + 4
+
+    fixed = role_fixed(pull_stages)
     if fixed + stages * stage > dynamic_smem:
-        raise ValueError('role shared-storage footprint exceeds launch allocation')
+        pull_stages = 1
+        fixed = role_fixed(1)
+        if fixed + stages * stage > dynamic_smem:
+            raise ValueError('role shared-storage footprint exceeds launch allocation')
     threads = dispatch_threads if role == 1 else 384
     shared_layout = get_role_shared_layout(
         role, block_m, num_experts, pull_bytes, stages,
         store_m_l1=store1, store_m_l2=store2, dispatch_warps=dispatch_warps,
-        block_n=BLOCK_N, block_k=BLOCK_K, sf_block_m=align(block_m, 128))
+        block_n=BLOCK_N, block_k=BLOCK_K, sf_block_m=align(block_m, 128),
+        pull_stages=pull_stages)
     if shared_layout.field_end > dynamic_smem:
         raise ValueError('role shared storage exceeds its launch allocation')
     return RoleConfig(role, block_m, BLOCK_N, BLOCK_K, store1, store2,
                       dispatch_threads, threads, stages, dynamic_smem,
                       stage, fixed, block_m // 2, align(block_m, 128),
-                      128, 128, 64, routing_warps, pull_bytes, shared_layout)
+                      128, 128, 64, routing_warps, pull_bytes, pull_stages,
+                      shared_layout)
 
 
 def get_combine_geometry(hidden: int, reusable_bytes: int,

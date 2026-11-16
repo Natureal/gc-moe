@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from ctypes import c_float
 from dataclasses import dataclass
 from math import inf
@@ -123,10 +124,17 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
         if stats.dtype != torch.int32 or stats.numel() != local_e or \
                 not stats.is_cuda or not stats.is_contiguous():
             raise ValueError('stats must be contiguous CUDA int32 [local_experts]')
-    # ECO calls size blocks by the logical experts (about one active copy each); native calls by the slots
-    bm = get_block_m_for_gc_moe(ranks, block_m_experts or sym_buffer.num_experts,
+    # ECO and native calls both size blocks by the physical slots (measured on EP64 L20B: sizing ECO by the logical
+    # experts picks bm192 at 128 tokens, 1.4-1.9 us slower than the slots' bm128)
+    bm = get_block_m_for_gc_moe(ranks, sym_buffer.num_experts,
                                 sym_buffer.num_max_tokens_per_rank, tokens,
                                 sym_buffer.num_topk)
+    # ECO calls: GC_MOE_ECO_BLOCK_M pins block M (a block costs about the same from 32 to 96 rows on L20, so the
+    # best choice is the smallest block that holds a typical expert's tokens; pick it offline per EP size / GPU)
+    if block_m_experts and os.environ.get('GC_MOE_ECO_BLOCK_M'):
+        bm = int(os.environ['GC_MOE_ECO_BLOCK_M'])
+        if bm not in (16, 32, 64, 96, 128):
+            raise ValueError('GC_MOE_ECO_BLOCK_M must be one of 16, 32, 64, 96, 128')
     call_layout = GCBufferLayout(
         ranks, sym_buffer.num_experts, sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_topk, h, i,
@@ -136,6 +144,23 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
         raise ValueError("symmetric buffer is too small for call's shared experts")
     return ValidatedCall(tokens, bm, h, i, local_e, shared_experts,
                          shared_recipe[2], clamp, alpha, bool(fast_math))
+
+
+_ECO_STATIC_MAPS = {}
+
+
+def _eco_static_map(eco_meta: torch.Tensor, num_logical: int, rank: int, device) -> torch.Tensor:
+    """Logical expert -> this rank's static copy: active copy `rank mod copies` from EcoMeta's copies[E][32] table
+    (int16 pairs after the 16-word header, ascending slots, -1 padded, bit 15 marks a passive copy)"""
+    key = (eco_meta.data_ptr(), rank)
+    if key not in _ECO_STATIC_MAPS:
+        copies = eco_meta[16:16 + num_logical * 16].cpu().contiguous().view(torch.int16).view(num_logical, 32)
+        rows = []
+        for e in range(num_logical):
+            active = [int(v) for v in copies[e].tolist() if v >= 0]
+            rows.append(active[rank % len(active)])
+        _ECO_STATIC_MAPS[key] = torch.tensor(rows, dtype=torch.int64, device=device)
+    return _ECO_STATIC_MAPS[key]
 
 
 def fp8_fp4_gc_moe(y: torch.Tensor,
@@ -158,7 +183,14 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
     header[15]); `eco_logical_experts`: its logical expert count): `topk_idx` holds logical experts, the
     `sym_buffer.num_experts` physical slots serve them, and a plan role splits each replicated expert's tokens over
     its copies every call. `eco_state` (int16 [physical + logical], zero-initialized, one per layer, reset when the
-    placement changes) warm-starts each plan from the layer's previous one; without it every call plans cold."""
+    placement changes) warm-starts each plan from the layer's previous one; without it every call plans cold.
+    Below GC_MOE_ECO_MIN_TOKENS tokens per rank (default 0: never) the call skips the plan: each rank sends a replicated
+    expert's tokens to its copy `rank mod copies` and the plain path runs on the same buffer and weights (the first
+    such call per layer must run eagerly: it builds the rank's static map from `eco_meta`)."""
+    if eco_meta is not None and y.shape[0] < int(os.environ.get('GC_MOE_ECO_MIN_TOKENS', '0')):
+        topk = sym_buffer.topk_idx[:y.shape[0]]
+        topk.copy_(_eco_static_map(eco_meta, eco_logical_experts, sym_buffer.rank_idx, topk.device)[topk])
+        eco_meta, eco_state, eco_logical_experts = None, None, 0
     config = validate_call(y, l1_weights, l2_weights, sym_buffer,
                            shared_l1_weights, shared_l2_weights,
                            cumulative_local_expert_recv_stats, recipe, activation,

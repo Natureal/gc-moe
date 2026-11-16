@@ -53,8 +53,8 @@ class SharedStorageLayout:
 def get_role_shared_layout(role: int, block_m: int, num_experts: int,
                            pull_bytes: int, stages: int, *,
                            store_m_l1: int, store_m_l2: int, dispatch_warps: int,
-                           block_n: int, block_k: int,
-                           sf_block_m: int) -> SharedStorageLayout:
+                           block_n: int, block_k: int, sf_block_m: int,
+                           pull_stages: int = 1) -> SharedStorageLayout:
     """Lay out one role's shared data and control fields in byte order."""
     if role not in (1, 2, 3) or block_m % 16 or block_m < 16 or stages < 2:
         raise ValueError('invalid shared-storage role geometry')
@@ -73,7 +73,7 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
         cursor = 1
     else:
         reserve('expert_counts', num_experts * 4, 1024)
-        reserve('pull', dispatch_warps * pull_bytes, 1024)
+        reserve('pull', dispatch_warps * pull_stages * pull_bytes, 1024)
     reserve('cd', max(2 * 2 * store_m_l1 * (block_n // 2),
                       2 * store_m_l2 * block_n * 2), 1024)
     reserve('data_a', stages * (block_m // 2) * block_k, 1024)
@@ -82,7 +82,7 @@ def get_role_shared_layout(role: int, block_m: int, num_experts: int,
     reserve('data_sfb', stages * block_n * 4, 4)
     reserve('amax', 8 * store_m_l1 * 4, 8)
     reserve('tasks', 2 * 32, 16)
-    reserve('dispatch_bars', dispatch_warps * 8, 8)
+    reserve('dispatch_bars', dispatch_warps * pull_stages * 8, 8)
     reserve('data_full', stages * 8, 8)
     reserve('data_empty', stages * 8, 8)
     reserve('accum_full', 2 * 8, 8)
@@ -137,26 +137,39 @@ def _signal_offsets() -> dict[str, int]:
 SIGNAL_OFFSETS = _signal_offsets()
 
 
+ECO_TRACE_RING_FIELDS = 16
+ECO_MAX_DISPATCH_CTAS = 128
+
+
 def _eco_signal_offsets() -> dict[str, int]:
     """ECO region layout, relative to `GCBufferLayout.eco_base`. Epoch-tagged signals (value epoch + 1, epoch =
-    recv_parity): role1 publishes the fixed slots' totals and this rank's single-copy slot count after the rank
-    barrier; the plan publishes every slot's quota and its canonical start within the expert's copies. `eco_counts`
-    (last): per-source logical token counts, [2 generations][ranks][experts] u16 `(tag << 14) | count`, tag =
-    (epoch / 2) % 3 + 1: every entry of a generation is rewritten every other call, so the tag tells this call's
-    value from the previous one (self-validating, no fence/flag); logical experts <= physical slots."""
+    recv_parity): the plan publishes every slot's quota and its canonical start within the expert's copies.
+    Single-copy dispatch/compute use native receive counters and static launch metadata. `eco_counts`
+    (last): per-source logical token counts, two generations with row stride physical_experts * 2 bytes.
+    Each u32 packs three 10-bit counts and a two-bit tag `(epoch / 2) % 3 + 1`; every word of a generation is
+    rewritten every other call (self-validating, no separate fence/flag). The producer can append dispatch_sms
+    per-expert source-index starts after the count table."""
     fields = (
-        ('eco_counts_ready', 1, 4),
+        ('eco_counts_ready', 1, 4),  # producer: per-dispatch-CTA route offsets are ready
         ('eco_plan_ready', 1, 4),
-        ('eco_num_fixed', 1, 4),
-        # per source rank: epoch + 1 once its replicated experts' source indices are in place (its plan CTA)
+        ('eco_num_fixed', 1, 4),  # reserved: num_fixed is a static kernel argument
+        # role1: epoch + 1 once its count publication is issued (gates the plan's count rows)
+        ('eco_pub_issued', 1, 4),
+        # per rank: epoch + 1 once this rank's canonical source-index rows are complete (its
+        # dispatch role, after the rank barrier); the plan role's index warps gate the replica
+        # fan-out copies on it
+        ('eco_idx_ready', 1, 4),
+        # per rank: epoch + 1 once its replica slots' source indices are in place (its plan CTA)
         ('eco_reps_ready', MAX_RANKS, 4),
+        # per local slot: epoch + 1 once its copied source-index rows are in place (the slot's
+        # canonical owner pushes them after `eco_idx_ready`)
         ('eco_slot_count', MAX_EXPERTS_PER_RANK, 4),
         ('eco_quota', MAX_EXPERTS, 4),
         ('eco_quota_start', MAX_EXPERTS, 4),
         # Optional timeline trace (globaltimer ns, GC_MOE_ECO_TRACE=1 builds)
         ('eco_trace', 64, 8),
-        # Per-call trace ring (64 calls x 8 u32 ns since the call's role1 start)
-        ('eco_trace_ring', 512, 4),
+        # Fields 8..15 audit plan deadlines; times use ns relative to this call's role1 start.
+        ('eco_trace_ring', 64 * ECO_TRACE_RING_FIELDS, 4),
     )
     offset = 0
     result = {}
@@ -171,8 +184,17 @@ def _eco_signal_offsets() -> dict[str, int]:
 ECO_SIGNAL_OFFSETS = _eco_signal_offsets()
 
 
+def eco_recv_counts_offset(num_ranks: int, num_experts: int) -> int:
+    """Per-source replica receive-count rows in native u64 format ([gen][source][slot]), appended
+    after the count table and route offsets in the quiet ECO region rather than the native signal
+    area: the `expert_recv_count` region sits in the routing-flooded L2 space and measured ~3 us
+    slower per call for the same per-source row reads."""
+    return align(ECO_SIGNAL_OFFSETS['eco_counts'] + 2 * num_ranks * num_experts * 2 +
+                 ECO_MAX_DISPATCH_CTAS * num_experts * 4, 128)
+
+
 def eco_region_bytes(num_ranks: int, num_experts: int) -> int:
-    return align(ECO_SIGNAL_OFFSETS['eco_counts'] + 2 * num_ranks * num_experts * 2, 128)
+    return align(eco_recv_counts_offset(num_ranks, num_experts) + 2 * num_experts * 8, 128)
 
 
 @dataclass(frozen=True)

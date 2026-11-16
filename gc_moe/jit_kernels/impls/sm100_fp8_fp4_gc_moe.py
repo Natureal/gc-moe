@@ -765,10 +765,11 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                         (signal_view, peer_view, rank_view, token_view,
                                          eco_meta_view, None, None,
                                          clamp_view, alpha_view))
+                        # eco_fixed_slots follows tensor_map_1..21 in the kernel signature
                         if eco and role == 2:
-                            compile_args += (fixed_view,)
+                            compile_args += (None,) * (22 - map_count) + (fixed_view,)
                         elif eco and role == 3:
-                            compile_args += (None,) * 17 + (fixed_view,)
+                            compile_args += (None,) * 21 + (fixed_view,)
                         cubin = compile_kernel(
                             role_kernel, compile_args, compiler_identity,
                             lambda ptx, dump_dir: _assemble_role_value_params(
@@ -808,7 +809,8 @@ def prepare_role_binaries(config, y: torch.Tensor,
                             helper_kernel,
                             (signal_view, peer_view, rank_view, token_view,
                              map_views[0], None, None,
-                             clamp_view, alpha_view, *map_views[1:], fixed_view),
+                             clamp_view, alpha_view, *map_views[1:],
+                             *((None,) * (22 - map_count)), fixed_view),
                             compiler_identity,
                             lambda ptx, dump_dir: _assemble_role_value_params(
                                 ptx, 2, dump_dir, target=compiler_target,

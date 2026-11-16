@@ -1240,14 +1240,14 @@ class GCMoERoleKernel:
         pool_blocks = Uint32(signals[SIGNAL_OFFSETS['routed_pool_blocks'] // 4])
         if cutlass.const_expr(self.eco):
             # ECO: replica slots hold plan quotas, not native counts; total the padded slot blocks here
-            lane_blocks = Uint32(0)
-            for wave in cutlass.range_constexpr((self.local_experts + 31) // 32):
-                expert_idx = Uint32(wave * 32) + lane
-                if expert_idx < Uint32(self.local_experts):
-                    lane_blocks += (self._eco_slot_total(
-                        signals, rank_idx, expert_idx, eco_fixed_slots, recv_ptr,
+            eco_lane_blocks = Uint32(0)
+            for eco_wave in cutlass.range_constexpr((self.local_experts + 31) // 32):
+                eco_slot = Uint32(eco_wave * 32) + lane
+                if eco_slot < Uint32(self.local_experts):
+                    eco_lane_blocks += (self._eco_slot_total(
+                        signals, rank_idx, eco_slot, eco_fixed_slots, recv_ptr,
                         Uint32(ready_epoch - Uint64(1))) + Uint32(self.block_m - 1)) // Uint32(self.block_m)
-            pool_blocks = cute.arch.warp_redux_sync(lane_blocks, 'add')
+            pool_blocks = cute.arch.warp_redux_sync(eco_lane_blocks, 'add')
         # All CTAs use the immutable role1 epoch, so block0 may flip parity
         # without a grid-wide cache-completion barrier. The next dispatch
         # clears this bank only after the entire local finalize grid ends.
@@ -1322,8 +1322,9 @@ class GCMoERoleKernel:
         warpgroup_reg_alloc(self.epi_registers)
         epi_warp = Uint32(physical_warp - 4)
         ready = signals.iterator + SIGNAL_OFFSETS['combine_ready_grid_idx'] // 4
-        if cutlass.const_expr(not self.finalize_output):
-            # No token reduction exists to carry selected-peer acquires.
+        if cutlass.const_expr(not self.finalize_output or self.eco):
+            # No token reduction exists to carry selected-peer acquires. ECO: a token's replica results come from
+            # the copy's rank, not routed_expert // local_experts, so wait for every peer as before.
             peer = epi_warp
             while peer < Uint32(self.num_ranks):
                 wait_sys_u64_eq(ready + peer * 2, ready_epoch, rank_idx, peer)
@@ -1368,6 +1369,8 @@ class GCMoERoleKernel:
                 # All lanes vote; invalid routes never form a peer pointer.
                 # Duplicate owners may acquire the same publication twice.
                 peer_ready = not lane_valid
+                if cutlass.const_expr(self.eco):
+                    peer_ready = True   # every peer was acquired above
                 wait_start = read_clock64()
                 while cute.arch.vote_ballot_sync(peer_ready) != Uint32(0xffffffff):
                     if lane_valid and not peer_ready:

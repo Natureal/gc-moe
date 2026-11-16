@@ -199,11 +199,14 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     if role == 1:
         # The dispatch layout has no MMA planes; use its actual footprint (single-buffer the pull if
         # the double-buffered region does not fit).
-        if shared_layout.field_end > SMEM_CAPACITY and pull_stages == 2:
+        # ECO's role1 also allocates its per-logical-expert canonical-copy table after the layout
+        # (at most num_experts u32 entries, 16-byte aligned): reserve it in the launch allocation.
+        eco_table = align(num_experts * 4, 16) + 16
+        if shared_layout.field_end + eco_table > SMEM_CAPACITY and pull_stages == 2:
             pull_stages = 1
             fixed = role_fixed(1)
             shared_layout = role_layout(1)
-        dynamic_smem = shared_layout.field_end
+        dynamic_smem = shared_layout.field_end + eco_table
         if dynamic_smem > SMEM_CAPACITY:
             raise ValueError('role1 pull region exceeds shared memory')
     if shared_layout.field_end > dynamic_smem:

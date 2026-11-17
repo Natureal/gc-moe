@@ -1840,44 +1840,55 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         __threadfence();
         const auto* rtab = reinterpret_cast<const uint32_t*>(buffer + OFF_ECO_COUNTS + gen * kR * kP * 2u);
         auto* table = signals + OFF_ECO_REP_TABLE / 4;
-        int toff = 0;
-        for (uint32_t ls = 0; ls < kS; ++ ls) {
-            const int s = static_cast<int>(rank * kS + ls), e = phy[s];
-            if (ecnt[e] < 2)
-                continue;
-            const int qs = static_cast<int>(out_quota[s]), st = static_cast<int>(out_start[s]);
+        // flat over every replica pull position of this rank (all replica slots at once, not slot by slot)
+        __shared__ int rt_slot[kS], rt_off[kS + 1];
+        __shared__ int rt_n;
+        if (tid == 0) {
+            int n = 0, t = 0;
+            for (uint32_t ls = 0; ls < kS; ++ ls) {
+                const int s = static_cast<int>(rank * kS + ls);
+                if (ecnt[phy[s]] < 2)
+                    continue;
+                rt_slot[n] = s; rt_off[n] = t; t += static_cast<int>(out_quota[s]); ++ n;
+            }
+            rt_off[n] = t; rt_n = n;
+        }
+        plan_sync();
+        const int nrs = rt_n, total = rt_off[nrs];
+        for (int g = static_cast<int>(tid); g < total; g += static_cast<int>(kPlanThreads)) {
+            int k_ = 0;
+            while (rt_off[k_ + 1] <= g)
+                ++ k_;
+            const int s = rt_slot[k_], e = phy[s], i = g - rt_off[k_];
             const int canon = cslot[eoff[e]], crank = canon / static_cast<int>(kS), cloc = canon % static_cast<int>(kS);
             const uint32_t word = static_cast<uint32_t>(e) / 3u, shift = (static_cast<uint32_t>(e) % 3u) * 10u;
-            for (int i = static_cast<int>(tid); i < qs; i += static_cast<int>(kPlanThreads)) {
-                uint32_t c[kR];
+            uint32_t c[kR];
+#pragma unroll
+            for (uint32_t src = 0; src < kR; ++ src)
+                c[src] = (__ldcg(rtab + src * (kP / 2) + word) >> shift) & 0x3ffu;
+            const uint32_t p = out_start[s] + static_cast<uint32_t>(i);
+            uint32_t lo = 0, hi = 1024;
+            while (hi - lo > 1) {
+                const uint32_t mid = (lo + hi) / 2;
+                uint32_t sum = 0;
 #pragma unroll
                 for (uint32_t src = 0; src < kR; ++ src)
-                    c[src] = (__ldcg(rtab + src * (kP / 2) + word) >> shift) & 0x3ffu;
-                const uint32_t p = static_cast<uint32_t>(st + i);
-                uint32_t lo = 0, hi = 1024;
-                while (hi - lo > 1) {
-                    const uint32_t mid = (lo + hi) / 2;
-                    uint32_t sum = 0;
-#pragma unroll
-                    for (uint32_t src = 0; src < kR; ++ src)
-                        sum += min(c[src], mid);
-                    if (sum <= p) lo = mid; else hi = mid;
-                }
-                uint32_t base = 0;
-#pragma unroll
-                for (uint32_t src = 0; src < kR; ++ src)
-                    base += min(c[src], lo);
-                uint32_t k = p - base, src_rank = 0;
-                for (uint32_t src = 0; src < kR; ++ src)
-                    if (c[src] > lo) {
-                        if (k == 0) { src_rank = src; break; }
-                        -- k;
-                    }
-                const auto* row = reinterpret_cast<const uint32_t*>(peers[crank] + OFF_SOURCE_IDX +
-                    ((static_cast<uint64_t>(cloc) * kR + src_rank) * ECO_CAPACITY + lo) * 4u);
-                table[toff + i] = (src_rank << 16) | __ldcv(row);
+                    sum += min(c[src], mid);
+                if (sum <= p) lo = mid; else hi = mid;
             }
-            toff += qs;
+            uint32_t base = 0;
+#pragma unroll
+            for (uint32_t src = 0; src < kR; ++ src)
+                base += min(c[src], lo);
+            uint32_t k = p - base, src_rank = 0;
+            for (uint32_t src = 0; src < kR; ++ src)
+                if (c[src] > lo) {
+                    if (k == 0) { src_rank = src; break; }
+                    -- k;
+                }
+            const auto* row = reinterpret_cast<const uint32_t*>(peers[crank] + OFF_SOURCE_IDX +
+                ((static_cast<uint64_t>(cloc) * kR + src_rank) * ECO_CAPACITY + lo) * 4u);
+            table[g] = (src_rank << 16) | __ldcv(row);
         }
         __threadfence();
         plan_sync();

@@ -163,7 +163,7 @@ def compile_eco_plan(num_physical: int, num_ranks: int, num_logical: int, eco_ba
         'OFF_ECO_ROUTES_DONE': eco_base + ECO_SIGNAL_OFFSETS['eco_routes_done'],
     }
     defines.update(zip(('UNIT_BM', 'UNIT_WB', 'UNIT_WA', 'UNIT_NR', 'UNIT_NRC', 'UNIT_HOP2', 'UNIT_HYDRO'), unit))
-    for extra in ('UNIT_HREFINE', 'UNIT_HAUG', 'UNIT_HDBG', 'UNIT_HSPLIT', 'UNIT_HLB', 'UNIT_HTOK', 'UNIT_HORD', 'UNIT_HCF', 'UNIT_HPROF', 'UNIT_HCFLV', 'UNIT_HPOST'):
+    for extra in ('UNIT_HREFINE', 'UNIT_HAUG', 'UNIT_HDBG', 'UNIT_HSPLIT', 'UNIT_HLB', 'UNIT_HTOK', 'UNIT_HORD', 'UNIT_HCF', 'UNIT_HPROF', 'UNIT_HCFLV'):
         if os.environ.get(f'GC_MOE_ECO_{extra}'):
             defines[extra] = int(os.environ[f'GC_MOE_ECO_{extra}'])
     flags = [f'-D{k}={v}u' if k.startswith('OFF_') else f'-D{k}={v}' for k, v in sorted(defines.items())]

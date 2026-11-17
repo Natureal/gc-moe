@@ -1568,6 +1568,8 @@ class GCMoERoleKernel:
                     if block == 0:
                         base = signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4
                         prev_start = ld_volatile_u64(base + 24 * 2)
+                        # absolute timeline (ns): slot 61 = previous call's last role3 warp (slot 60, max)
+                        st_global_u64(base + 61 * 2, ld_volatile_u64(base + 60 * 2))
                         self._eco_trace(signals, 24, 0)
                         call = atom_add_u64(base + 21 * 2, Uint64(1))
                         # Slot 30 is the counting-phase timestamp. Keep the ring's call index separate.
@@ -3246,6 +3248,7 @@ class GCMoERoleKernel:
                 if elect_one_sync():
                     self._eco_trace(signals, 15, 2)
                     self._eco_trace_ring(signals, 9, True)  # field 9: last role3 warp done
+                    self._eco_trace(signals, 60, 2)          # slot 60: absolute, latest role3 warp done
             if cutlass.const_expr(self.eco_trace):
                 if block == 0 and tid == 0:
                     self._eco_trace_accum(signals, 23)

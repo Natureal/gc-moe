@@ -262,7 +262,7 @@ def main():
                 torch.cuda.current_stream(device).wait_stream(cs)
                 torch.cuda.synchronize()
                 slots = buf.buffer.view(torch.int64)[(buf.layout.eco_base + ECO_SIGNAL_OFFSETS["eco_trace"]) // 8:][:64]
-                slots[44:60].zero_()
+                slots[44:62].zero_()
                 torch.cuda.synchronize()
                 runs = []
                 for _ in range(args.trace_calls):
@@ -287,6 +287,15 @@ def main():
                 per_call[-1]["trace_us"] = dict(zip(("barrier", "pull_end", "l1_first", "l1_last", "l2_last",
                                                      "gemm_done", "role2_exit", "role3_done"), g_[:, :8].T.tolist()))
                 per_call[-1]["trace_raw_us"] = g_[:, 8:].tolist()   # [rank][ring field 0..15], 13/14 de-inverted
+                ab = slots[[24, 59, 60, 61]].clone()   # abs ns: role1 start, plan kernel start, role3 end, prev role3 end
+                abs_ = [torch.zeros_like(ab) for _ in range(R)]
+                dist.all_gather(abs_, ab)
+                # per rank (us, relative to the previous call's last role3 warp): role1 start, plan kernel start
+                # (0 = none), this call's role3 end
+                A_ = torch.stack(abs_).cpu().numpy().astype(np.float64)
+                per_call[-1]["abs_us"] = np.round(np.stack([(A_[:, 0] - A_[:, 3]) / 1e3,
+                                                            np.where(A_[:, 1] > 0, (A_[:, 1] - A_[:, 3]) / 1e3, 0.0),
+                                                            (A_[:, 2] - A_[:, 3]) / 1e3], 1), 2).tolist()
                 ph = slots[44:60].clone()
                 phs = [torch.zeros_like(ph) for _ in range(R)]
                 dist.all_gather(phs, ph)

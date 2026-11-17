@@ -177,6 +177,13 @@ __cluster_dims__(2, 1, 1)
 #endif
 eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, const uint64_t* peers,
                 uint32_t rank, uint32_t num_tokens) {
+#if defined(ECO_TRACE) and ECO_TRACE
+    if (threadIdx.x == 0 and blockIdx.x == 0) {   // trace slot 59: plan kernel start (absolute globaltimer ns)
+        unsigned long long t0;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0) :: "memory");
+        *reinterpret_cast<volatile unsigned long long*>(buffer + OFF_ECO_TRACE + 59 * 8) = t0;
+    }
+#endif
     // Count gathering
 #if ECO_SPLIT_COUNTS
     // Direct accumulation avoids a second helper barrier and narrowing copy.

@@ -1828,6 +1828,63 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         reinterpret_cast<uint32_t*>(buffer + OFF_ECO_TRACE_RING)[entry * ECO_TRACE_RING_FIELDS + 3] = static_cast<uint32_t>(since);
 #endif
     }
+#if ECO_REP_TABLE
+    // ---- replica pull table: for each of this rank's replica pull positions (replica slots ascending, each its
+    // quota span [start, start + quota) of the expert's canonical order), the source rank and token_topk, so role1
+    // reads one local word instead of locating the position (round-robin over sources) and reading the canonical
+    // row remotely per token. Canonical position p: round j = max{j : sum_s min(c_s, j) <= p}, then the
+    // (p - sum_s min(c_s, j))-th source (ascending) with c_s > j; its slot j of the canonical copy's row.
+    if (tid < kPlanThreads) {
+        const auto* idx_ready = reinterpret_cast<const volatile uint32_t*>(signals + OFF_ECO_IDX_READY / 4);
+        while (*idx_ready != epoch + 1u) {}   // role1 passed the rank barrier: every canonical row is complete
+        __threadfence();
+        const auto* rtab = reinterpret_cast<const uint32_t*>(buffer + OFF_ECO_COUNTS + gen * kR * kP * 2u);
+        auto* table = signals + OFF_ECO_REP_TABLE / 4;
+        int toff = 0;
+        for (uint32_t ls = 0; ls < kS; ++ ls) {
+            const int s = static_cast<int>(rank * kS + ls), e = phy[s];
+            if (ecnt[e] < 2)
+                continue;
+            const int qs = static_cast<int>(out_quota[s]), st = static_cast<int>(out_start[s]);
+            const int canon = cslot[eoff[e]], crank = canon / static_cast<int>(kS), cloc = canon % static_cast<int>(kS);
+            const uint32_t word = static_cast<uint32_t>(e) / 3u, shift = (static_cast<uint32_t>(e) % 3u) * 10u;
+            for (int i = static_cast<int>(tid); i < qs; i += static_cast<int>(kPlanThreads)) {
+                uint32_t c[kR];
+#pragma unroll
+                for (uint32_t src = 0; src < kR; ++ src)
+                    c[src] = (__ldcg(rtab + src * (kP / 2) + word) >> shift) & 0x3ffu;
+                const uint32_t p = static_cast<uint32_t>(st + i);
+                uint32_t lo = 0, hi = 1024;
+                while (hi - lo > 1) {
+                    const uint32_t mid = (lo + hi) / 2;
+                    uint32_t sum = 0;
+#pragma unroll
+                    for (uint32_t src = 0; src < kR; ++ src)
+                        sum += min(c[src], mid);
+                    if (sum <= p) lo = mid; else hi = mid;
+                }
+                uint32_t base = 0;
+#pragma unroll
+                for (uint32_t src = 0; src < kR; ++ src)
+                    base += min(c[src], lo);
+                uint32_t k = p - base, src_rank = 0;
+                for (uint32_t src = 0; src < kR; ++ src)
+                    if (c[src] > lo) {
+                        if (k == 0) { src_rank = src; break; }
+                        -- k;
+                    }
+                const auto* row = reinterpret_cast<const uint32_t*>(peers[crank] + OFF_SOURCE_IDX +
+                    ((static_cast<uint64_t>(cloc) * kR + src_rank) * ECO_CAPACITY + lo) * 4u);
+                table[toff + i] = (src_rank << 16) | __ldcv(row);
+            }
+            toff += qs;
+        }
+        __threadfence();
+        plan_sync();
+        if (tid == 0)
+            st_release_gpu(signals + OFF_ECO_REP_READY / 4, epoch + 1u);
+    }
+#endif
 #if ECO_COMBINE_EXACT
     // ---- exact combine readiness (off the critical path): every rank's plan is identical, so this rank derives
     // which rank computes each of its own routes. Route (token, k) to logical expert e sits at slot j of this

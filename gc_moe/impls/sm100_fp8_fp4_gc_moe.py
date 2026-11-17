@@ -461,6 +461,10 @@ class GCMoERoleKernel:
         # Timing probe only (output may be wrong): ECO combine uses the plain per-token readiness wait
         # (peer = routed id // local slots) instead of acquiring every peer
         self.eco_combine_probe = self.eco and __import__('os').environ.get('GC_MOE_ECO_COMBINE_PROBE') == '1'
+        # Replica pull table (GC_MOE_ECO_REP_TABLE=1): the plan CTA resolves every replica pull position to
+        # (source rank, token_topk) after its publish; role1's serial path reads it instead of peel + remote index
+        self.eco_rep_table = self.eco and __import__('os').environ.get('GC_MOE_ECO_REP_TABLE') == '1' and \
+            capacity * topk <= ECO_MAX_ROUTES
         # Exact combine readiness (default): each route waits only for the rank that computes it. Every rank's plan
         # is identical, so the source derives it locally: canonical position (round-robin over sources) of its
         # slot, then the copy whose [quota_start, quota_start + quota) holds it.
@@ -1877,6 +1881,10 @@ class GCMoERoleKernel:
                 nvlink_barrier(signals, peer_ptrs, Uint32(block), Uint32(tid),
                                self.num_ranks, self.dispatch_sms, False, True,
                                rank_idx, 1, self.nvlink_timeout_secs)
+                if cutlass.const_expr(self.eco_rep_table):
+                    if block == 0 and tid == 0:   # every canonical source-index row is complete (plan CTA reads them)
+                        st_release_u32(signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_idx_ready']) // 4,
+                                       recv_epoch + Uint32(1), False)
             if cutlass.const_expr(self.eco_trace):
                 if block == 0 and tid == 0:
                     self._eco_trace(signals, 1, 0)
@@ -1993,6 +2001,10 @@ class GCMoERoleKernel:
                     self._eco_load_plan(signals, rank_idx, eco_epoch,
                                         eco_num_fixed, expert_counts, lane,
                                         expert_starts)
+                    if cutlass.const_expr(self.eco_rep_table):
+                        rep_ready = signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_rep_ready']) // 4
+                        while ld_acquire_gpu_u32(rep_ready) != eco_epoch + Uint32(1):
+                            pass
                     eco_plan_loaded = Uint32(1)
             current_expert, expert_start, expert_end, pool_block_offset = \
                 advance_expert(
@@ -2119,6 +2131,15 @@ class GCMoERoleKernel:
                 selected = False
                 src_rank = Uint32(0)
                 src_slot = Uint32(0)
+                rt_entry = Uint32(0)
+                rt_use = False
+                if cutlass.const_expr(self.eco_rep_table):
+                    if Uint32(current_expert) >= eco_num_fixed:
+                        rt_entry = Uint32(signals[(self.eco_base + ECO_SIGNAL_OFFSETS['eco_rep_table']) // 4 +
+                                                  (token_idx - eco_fixed_tokens)])
+                        rt_use = True
+                        selected = True
+                        src_rank = rt_entry >> Uint32(16)
                 if cutlass.const_expr(self.eco_spec):
                     # Stale speculative spans can overrun this call's order: fold the
                     # overflow back into it (a rank-0 dummy hotspots every rank on the
@@ -2159,8 +2180,12 @@ class GCMoERoleKernel:
                 if cutlass.const_expr(self.eco):
                     # Fixed slots resolve to their own rows, replica slots to
                     # the canonical copy's rows — both via the per-slot base.
-                    token_topk = Uint32(eco_idx_ptr[
-                        Uint32(src_rank) * Uint32(self.capacity) + src_slot])
+                    token_topk = Uint32(0)
+                    if rt_use:
+                        token_topk = rt_entry & Uint32(0xffff)
+                    else:
+                        token_topk = Uint32(eco_idx_ptr[
+                            Uint32(src_rank) * Uint32(self.capacity) + src_slot])
                 else:
                     token_topk = source_idx[(Uint32(current_expert) * Uint32(self.num_ranks) +
                                              src_rank) * Uint32(self.capacity) + src_slot]
@@ -2344,6 +2369,10 @@ class GCMoERoleKernel:
                         self._eco_load_plan(signals, rank_idx, eco_epoch,
                                             eco_num_fixed, expert_counts, lane,
                                             expert_starts)
+                        if cutlass.const_expr(self.eco_rep_table):
+                            rep_ready = signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_rep_ready']) // 4
+                            while ld_acquire_gpu_u32(rep_ready) != eco_epoch + Uint32(1):
+                                pass
                         eco_plan_loaded = Uint32(1)
                 current_expert, expert_start, expert_end, pool_block_offset = \
                     advance_expert(

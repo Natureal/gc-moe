@@ -118,7 +118,7 @@ def compile_eco_plan(num_physical: int, num_ranks: int, num_logical: int, eco_ba
                      arch: str = 'sm_103a', trace: bool = False, rows_after_pub: bool = False,
                      split_counts: bool = False, route_prep: bool = False, spec: bool = False,
                      dispatch_sms: int = 1, dispatch_warps: int = 1, recv_mode: int = 3,
-                     combine_exact: bool = False) -> bytes:
+                     combine_exact: bool = False, rep_table: bool = False) -> bytes:
     """Cubin of the plan role (`eco_unit_kernel.cu`, ECO_UNIT_THREADS threads) for one (P, R, E) configuration,
     buffer layout (`eco_base`: the buffer's ECO region, `GCBufferLayout.eco_base`) and `unit` build (see
     `eco_unit_config`)."""
@@ -159,6 +159,9 @@ def compile_eco_plan(num_physical: int, num_ranks: int, num_logical: int, eco_ba
         'ECO_TRACE_RING_FIELDS': ECO_TRACE_RING_FIELDS,
         'ECO_TRACE': int(trace),
         'ECO_COMBINE_EXACT': int(combine_exact),
+        'ECO_REP_TABLE': int(rep_table),
+        'OFF_ECO_REP_TABLE': eco_base + ECO_SIGNAL_OFFSETS['eco_rep_table'],
+        'OFF_ECO_REP_READY': eco_base + ECO_SIGNAL_OFFSETS['eco_rep_ready'],
         'OFF_ECO_ROUTE_PEER': eco_base + ECO_SIGNAL_OFFSETS['eco_route_peer'],
         'OFF_ECO_ROUTES_DONE': eco_base + ECO_SIGNAL_OFFSETS['eco_routes_done'],
     }

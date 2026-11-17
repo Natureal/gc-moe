@@ -173,9 +173,6 @@ def locate_routed_pool_block(counts: cute.Tensor,
             local_m = pool_block - lane_offset
             local_valid = min(Uint32(block_m),
                               received - local_m * Uint32(block_m))
-            # bit 31: more M-blocks of this expert follow (weight L2 residency hint; no consumer reads the index)
-            if (local_m + Uint32(1)) * Uint32(block_m) < received:
-                local_m = local_m | Uint32(0x80000000)
             expert = cute.arch.shuffle_sync(expert_idx, owner_lane)
             m_block = cute.arch.shuffle_sync(local_m, owner_lane)
             valid_m = cute.arch.shuffle_sync(local_valid, owner_lane)

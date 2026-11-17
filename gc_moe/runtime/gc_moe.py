@@ -226,11 +226,6 @@ class _ChildGraph:
         # compute grid; it waits for the dispatch counts anyway), so the critical roles start one launch earlier
         if os.environ.get('GC_MOE_ECO_PLAN_LAST') == '1' and 5 not in roles:
             roles_order = (1, 2, 4, 3)
-        # GC_MOE_ECO_LAUNCH_ORDER=<digits>, e.g. 1423: node launch order of dispatch(1) / compute(2) / plan(4) before
-        # finalize(3); nodes launch serially in this order, so the first one starts ~1 us before the next
-        _lo = os.environ.get('GC_MOE_ECO_LAUNCH_ORDER')
-        if _lo and 4 in roles and 5 not in roles:
-            roles_order = tuple(int(c) for c in _lo) + (3,)
         order = [index for role in roles_order for index, x in enumerate(binaries) if x.role == role]
         try:
             self.graph = _ok(cu.cuGraphCreate(0))

@@ -271,15 +271,19 @@ def main():
                     row = e[int(torch.argmax(e[:, 1]))]
                     # fields: 0 barrier, 6 pull end, 13 first L1 start (inverted), 3 last L1, 7 last L2, 1 GEMM done
                     # (role3 start), 8 last role2 CTA exit, 9 last role3 warp (ECO reuses some fields: read 0/1/9)
+                    raw = [float(v) for v in row]
+                    for k in (13, 14):   # inverted max = earliest
+                        raw[k] = 4294967.295 - raw[k] if raw[k] > 0 else float("nan")
                     runs.append([row[0], row[6], 4294967.295 - row[13] if row[13] > 0 else float("nan"),
-                                 row[3], row[7], row[1], row[8], row[9]])
+                                 row[3], row[7], row[1], row[8], row[9]] + raw)
                 del tg
                 loc = torch.tensor(np.nanmedian(np.array([[float(v) for v in r] for r in runs]), 0), device=device)
                 alls = [torch.zeros_like(loc) for _ in range(R)]
                 dist.all_gather(alls, loc)
+                g_ = torch.stack(alls).cpu().numpy().round(2)
                 per_call[-1]["trace_us"] = dict(zip(("barrier", "pull_end", "l1_first", "l1_last", "l2_last",
-                                                     "gemm_done", "role2_exit", "role3_done"),
-                                                    torch.stack(alls).T.cpu().numpy().round(2).tolist()))
+                                                     "gemm_done", "role2_exit", "role3_done"), g_[:, :8].T.tolist()))
+                per_call[-1]["trace_raw_us"] = g_[:, 8:].tolist()   # [rank][ring field 0..15], 13/14 de-inverted
             if rank == 0:
                 print(f"{name:<10} call {i:5d}  slowest {max(per_rank):8.2f} us  fastest {min(per_rank):8.2f}", flush=True)
         s = [c["slowest_rank_median_us"] for c in per_call]

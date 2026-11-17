@@ -1764,6 +1764,9 @@ class GCMoERoleKernel:
                 if tid == Uint32(0):
                     st_release_u32(signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_routes_done']) // 4 +
                                    block, recv_epoch + Uint32(1), False)
+            if cutlass.const_expr(self.eco_trace):
+                if elect_one_sync():
+                    self._eco_trace_ring(signals, 11, True)   # field 11: last dispatch warp finished routing
             if cutlass.const_expr(self.eco):
                 if lane == Uint32(0):
                     self._eco_trace(signals, 31, 2)
@@ -1923,6 +1926,9 @@ class GCMoERoleKernel:
                             recv_ptr + expert_idx * Uint32(2))
                     expert_counts[wave] = Uint32(observed)
             cute.arch.sync_warp()
+            if cutlass.const_expr(self.eco_trace):
+                if elect_one_sync():
+                    self._eco_trace_ring(signals, 12, True)   # field 12: last dispatch warp holds this rank's counts
 
             if block == Uint32(0) and physical_warp == Uint32(0):
                 own_pool_blocks = Uint32(0)

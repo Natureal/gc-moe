@@ -411,6 +411,9 @@ class GCMoERoleKernel:
         self.pull_chunks = hidden // self.pull_bytes
         # GC_MOE_PULL_PIPE=0 keeps the widened staging but runs the serial loop.
         self.pull_pipe = __import__('os').environ.get('GC_MOE_PULL_PIPE', '1') == '1'
+        # single-stage pull: defer each token's S2G drain + l1_full release (GC_MOE_PULL_DEFER=1)
+        self.pull_defer = __import__('os').environ.get('GC_MOE_PULL_DEFER', '0') == '1' and \
+            role_config.pull_bytes == hidden
         if role == 3 and finalize_output:
             if combine_geometry is None:
                 raise ValueError('finalize requires host combine geometry')
@@ -2008,6 +2011,11 @@ class GCMoERoleKernel:
                     stored_rank_count, expert_counts, expert_starts, eco_canons,
                     eco_fixed_tokens, eco_num_fixed, eco_epoch, eco_plan_loaded)
                 current_expert = Int32(self.local_experts)
+            # GC_MOE_PULL_DEFER: the previous token's S2G drain + l1_full release waits until this warp next needs
+            # its staging buffer (or a ring slot / the plan), overlapping the next token's locate + index read
+            pd_pend = Uint32(0)
+            pd_ring = Uint32(0)
+            pd_inc = Uint32(0)
             while current_expert < Int32(self.local_experts):
                 if cached_rank_expert != current_expert:
                     cached_rank_expert = current_expert
@@ -2166,6 +2174,14 @@ class GCMoERoleKernel:
                 topk_slot = token_topk % Uint32(self.topk)
                 if cutlass.const_expr(self.eco and self.eco_trace):
                     pt2 = read_globaltimer()
+                if cutlass.const_expr(self.pull_defer):
+                    if pd_pend != Uint32(0):
+                        if elect_one_sync():
+                            cute.arch.cp_async_bulk_wait_group(0)
+                            red_release_gpu_add_u32(
+                                signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 + pd_ring, pd_inc)
+                        cute.arch.sync_warp()
+                        pd_pend = Uint32(0)
                 if generation > 0:
                     empty_ptr = signals.iterator + \
                         SIGNAL_OFFSETS['l1_empty_count'] // 4 + ring_block
@@ -2280,18 +2296,24 @@ class GCMoERoleKernel:
                     bulk_s2g_1d(dst_x + final_byte_words, warp_pull,
                                  Uint32(self.pull_bytes))
                     cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0)
                     is_last_token = token_idx == expert_end - Uint32(1)
                     full_increment = Uint32(self.block_m) - (pull_token % self.block_m) \
                         if is_last_token else Uint32(1)
-                    red_release_gpu_add_u32(
-                        signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 + ring_block,
-                        Uint32(full_increment))
+                    if cutlass.const_expr(not self.pull_defer):
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        red_release_gpu_add_u32(
+                            signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 + ring_block,
+                            Uint32(full_increment))
                     if cutlass.const_expr(self.eco and self.eco_trace):
                         if token_idx >= eco_fixed_tokens and token_idx < eco_fixed_tokens + \
                                 Uint32(self.dispatch_sms * self.dispatch_warps):
                             self._eco_trace_ring(signals, 14, True)
                 cute.arch.sync_warp()
+                if cutlass.const_expr(self.pull_defer):
+                    pd_pend = Uint32(1)
+                    pd_ring = ring_block
+                    pd_inc = Uint32(self.block_m) - (pull_token % self.block_m) \
+                        if token_idx == expert_end - Uint32(1) else Uint32(1)
                 if cutlass.const_expr(self.eco and self.eco_trace):
                     # serial-path per-token phases (ns sums): trace slots 44.. replica tokens, 52.. single-copy
                     pt6 = read_globaltimer()
@@ -2309,6 +2331,14 @@ class GCMoERoleKernel:
                 token_idx += Uint32(self.dispatch_sms * self.dispatch_warps)
                 if cutlass.const_expr(self.eco):
                     if eco_plan_loaded == Uint32(0) and token_idx >= eco_fixed_tokens:
+                        if cutlass.const_expr(self.pull_defer):
+                            if pd_pend != Uint32(0):
+                                if elect_one_sync():
+                                    cute.arch.cp_async_bulk_wait_group(0)
+                                    red_release_gpu_add_u32(
+                                        signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 + pd_ring, pd_inc)
+                                cute.arch.sync_warp()
+                                pd_pend = Uint32(0)
                         self._eco_load_plan(signals, rank_idx, eco_epoch,
                                             eco_num_fixed, expert_counts, lane,
                                             expert_starts)
@@ -2318,6 +2348,14 @@ class GCMoERoleKernel:
                         expert_counts, token_idx, current_expert, expert_start,
                         expert_end, pool_block_offset, lane, self.local_experts,
                         self.block_m)
+            if cutlass.const_expr(self.pull_defer):
+                if pd_pend != Uint32(0):
+                    if elect_one_sync():
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        red_release_gpu_add_u32(
+                            signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 + pd_ring, pd_inc)
+                    cute.arch.sync_warp()
+                    pd_pend = Uint32(0)
             if cutlass.const_expr(self.eco_trace):
                 if elect_one_sync():
                     self._eco_trace(signals, 8, 2)

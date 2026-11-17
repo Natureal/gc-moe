@@ -595,7 +595,7 @@ class GCMoERoleKernel:
             elapsed = Uint32(read_globaltimer() - ld_volatile_u64(base + 24 * 2))
             entry = Uint32(ld_volatile_u64(base + 33 * 2)) % Uint32(64)
             ptr = signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace_ring']) // 4 + entry * Uint32(ECO_TRACE_RING_FIELDS) + field
-            if cutlass.const_expr(field == 13 or field == 14):
+            if cutlass.const_expr(field == 13 or field == 14 or (field == 10 and not self.eco)):
                 elapsed = Uint32(0xffffffff) - elapsed
             if cutlass.const_expr(is_max):
                 atom_max_u32_global(ptr, elapsed)
@@ -2445,6 +2445,16 @@ class GCMoERoleKernel:
                         if cutlass.const_expr(self.shared_experts > 0):
                             is_shared = Uint32(1) if task_phase >= \
                                 Uint32(GCBlockPhase.SharedLinear1) else Uint32(0)
+                        if cutlass.const_expr(self.eco_trace and not self.eco and self.shared_experts > 0):
+                            # plain shared-expert timeline (ring fields unused outside ECO): 10 first shared L1
+                            # task start (inverted max = earliest), 2 last shared L1 start, 5 last shared L2 start
+                            if is_shared != Uint32(0):
+                                if elect_one_sync():
+                                    if task_phase == Uint32(GCBlockPhase.SharedLinear1):
+                                        self._eco_trace_ring(signals, 10, True)
+                                        self._eco_trace_ring(signals, 2, True)
+                                    else:
+                                        self._eco_trace_ring(signals, 5, True)
                         block_idx = pool_block % Uint32(self.ring_blocks)
                         if cutlass.const_expr(self.shared_experts > 0):
                             if is_shared != Uint32(0):

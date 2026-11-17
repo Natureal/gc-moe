@@ -1072,3 +1072,8 @@ eager trace（P512，barrier 之后，rank 均值，µs）：
 - 最慢 rank 用 E[max_r(f_r + ε)]（ε ~ N(0, σ²)）预测，call 级无偏；确定性 max 低估约 1.6 µs。
 - 修改计划见对话（2026-11-17）：目标换成 f + 平滑 max；先离线（1200 call）比较 hydro / hydro_f(w) / auction(新权重) 的 E[max] 与 plan 延迟，再 oracle 实测（≥ 4 轮交替），最后在线实现且 plan 发布不晚于现在（约 24 µs）。
 - **离线对比（1200 call，`/tmp/offcmp.py`，新系数 wb 2.521 / wa 0.541 / wt 0.0066 µs，σ 1.35）**：E[max] / 确定性 max / block 峰值——c32：hydro 56.06 / 54.36 / 16.07，hydro-w 55.67（−0.40）/ 53.85 / 16.07，auction(wb 384, wa 82) 55.84（−0.22）/ 54.67 / 16.61；c24：hydro 56.00 / 54.34 / 16.07，hydro-w 55.58（−0.41）/ 53.81 / 16.07，auction 55.82（−0.18）/ 54.67 / 16.62。→ hydro-w 最好（block 峰值不变）；auction 换新权重后 block 峰值升 0.55，E[max] 只降约 0.2。下一步：hydro-w 的 oracle 已在 40 call 上实测约 −0.45 µs（se_qvar / se_qtie），按计划需 ≥ 4 轮确认后再考虑在线实现（零额外延迟地并进 hydro 闭式贪心）。
+
+### 8.38 shared expert 时间线（plain trace 新增 ring 字段：10 首个 shared L1 任务开始（倒置）、2 最后一个 shared L1 开始、5 最后一个 shared L2 开始；gc-moe-u23，sse_tr1/0，EP32 bm96，20 call 中位数，µs 自 role1 开始）
+- 带 1 个 shared expert：shared L1 第一个任务 2.0 开始、最后一个 3.0 开始，shared L2 最后一个 9.5 开始（约 12 µs 前做完）；routed L1 首个任务 21.5–21.9；拿到计数 15.4–16.2；最晚 GEMM 完成 eplb448 87.2 / oracle c32 83.7。不带 shared：routed L1 首个 20.9–22.1，最晚 GEMM 86.8 / 84.5 → shared expert 完全藏在 dispatch 里，不推迟 routed GEMM。
+- 计时（cold-l2，40 call）：oracle c32 shared1 92.53 vs shared0 92.74（无差）；eplb448 shared0 95.56，shared1 那次被干扰（mean 247 / median 338），需重测。
+- 含义：shared 算完后到 routed L1 开工之间 GEMM SM 仍空闲约 9 µs（约 12 → 21 µs），等 dispatch（计数 ~16 µs、首个 routed block 凑齐 ~21 µs）。trace 模式下 benchmark 打印的计时（~1300 µs）不可用，只看 trace 时间线。

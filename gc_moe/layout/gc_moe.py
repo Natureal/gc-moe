@@ -194,10 +194,6 @@ def _eco_signal_offsets() -> dict[str, int]:
         ('eco_route_dbg', ECO_MAX_ROUTES, 4),
         # per dispatch CTA: epoch + 1 once its routes' canonical slots are recorded (plan CTA then derives the peers)
         ('eco_routes_done', ECO_MAX_DISPATCH_CTAS, 4),
-        # replica pull table (GC_MOE_ECO_REP_TABLE=1): per local replica pull position (role1's token cursor minus
-        # its single-copy tokens), src_rank << 16 | token_topk, built by the plan CTA after its publish
-        ('eco_rep_table', ECO_MAX_ROUTES, 4),
-        ('eco_rep_ready', 1, 4),
     )
     offset = 0
     result = {}

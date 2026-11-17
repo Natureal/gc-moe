@@ -451,6 +451,10 @@ class GCMoERoleKernel:
         # Split pull (ECO): the last GC_MOE_ECO_SPLIT_PULL dispatch warps of each SM pull only replica tokens (from the
         # plan's arrival, alongside the fixed pulls); the others pull only fixed tokens in the unchanged pool order
         self.eco_split_pull = int(__import__('os').environ.get('GC_MOE_ECO_SPLIT_PULL', '0')) if self.eco else 0
+        if role == 1 and self.eco_split_pull and not (role_config.pull_stages == 2 and role_config.pull_bytes == hidden):
+            raise ValueError(f'GC_MOE_ECO_SPLIT_PULL={self.eco_split_pull} needs the double-buffered pull pipeline, '
+                             f'which does not fit shared memory here (pull_stages={role_config.pull_stages}, '
+                             f'{role_config.routing_warps} dispatch warps): lower GC_MOE_ROUTING_WARPS or unset the split')
         # Timing probe only (output may be wrong): ECO combine uses the plain per-token readiness wait
         # (peer = routed id // local slots) instead of acquiring every peer
         self.eco_combine_probe = self.eco and __import__('os').environ.get('GC_MOE_ECO_COMBINE_PROBE') == '1'
@@ -2098,6 +2102,8 @@ class GCMoERoleKernel:
                 # Reduce across its register waves before the warp reduction.
                 # A source's remaining count after the peeled rounds is max(count - peel_offset, 0); derive it
                 # instead of mutating a copy, so the cached counts stay read-only for the expert's later tokens.
+                if cutlass.const_expr(self.eco and self.eco_trace):
+                    pt0 = read_globaltimer()
                 peel_slot = Uint32(pull_token) + eco_peel_start
                 peel_offset = Uint32(0)
                 selected = False
@@ -2138,6 +2144,8 @@ class GCMoERoleKernel:
                     else:
                         peel_slot -= round_tokens
                         peel_offset += minimum
+                if cutlass.const_expr(self.eco and self.eco_trace):
+                    pt1 = read_globaltimer()
                 if cutlass.const_expr(self.eco):
                     # Fixed slots resolve to their own rows, replica slots to
                     # the canonical copy's rows — both via the per-slot base.
@@ -2156,12 +2164,16 @@ class GCMoERoleKernel:
                             cute.AddressSpace.gmem, assumed_align=4), rank_idx)
                 src_token = token_topk // Uint32(self.topk)
                 topk_slot = token_topk % Uint32(self.topk)
+                if cutlass.const_expr(self.eco and self.eco_trace):
+                    pt2 = read_globaltimer()
                 if generation > 0:
                     empty_ptr = signals.iterator + \
                         SIGNAL_OFFSETS['l1_empty_count'] // 4 + ring_block
                     target = generation * (2 * self.intermediate // 128)
                     while ld_acquire_gpu_u32(empty_ptr) < target:
                         pass
+                if cutlass.const_expr(self.eco and self.eco_trace):
+                    pt3 = read_globaltimer()
                 src_base = mapped_peer_base(peer_ptrs, src_rank, self.num_ranks)
                 src_x = cute.make_ptr(
                     Uint32, src_base + Uint64(self.input_x_words * 4) +
@@ -2193,6 +2205,8 @@ class GCMoERoleKernel:
                             cute.arch.cp_async_bulk_commit_group()
                             cute.arch.cp_async_bulk_wait_group(0)
                 cute.arch.sync_warp()
+                if cutlass.const_expr(self.eco and self.eco_trace):
+                    pt4 = read_globaltimer()
 
                 sf_row = ring_block * ((self.block_m + 127) // 128 * 128) + \
                     ((pull_token % self.block_m) & ~127) + \
@@ -2251,6 +2265,8 @@ class GCMoERoleKernel:
                                         sf_col * self.sf_ring_tokens + sf_row] = \
                                     remote_word[0]
                 cute.arch.sync_warp()
+                if cutlass.const_expr(self.eco and self.eco_trace):
+                    pt5 = read_globaltimer()
                 if elect_one_sync():
                     signals[self.l1_weight_words + pool_token % self.ring_tokens] = weight
                     signals[self.metadata_words + pool_token * 3] = src_rank
@@ -2276,6 +2292,20 @@ class GCMoERoleKernel:
                                 Uint32(self.dispatch_sms * self.dispatch_warps):
                             self._eco_trace_ring(signals, 14, True)
                 cute.arch.sync_warp()
+                if cutlass.const_expr(self.eco and self.eco_trace):
+                    # serial-path per-token phases (ns sums): trace slots 44.. replica tokens, 52.. single-copy
+                    pt6 = read_globaltimer()
+                    if elect_one_sync():
+                        pbase = signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4 + \
+                            (Uint32(44) if Uint32(current_expert) >= eco_num_fixed else Uint32(52)) * Uint32(2)
+                        atom_add_u64(pbase, Uint64(1))
+                        atom_add_u64(pbase + 2, pt1 - pt0)
+                        atom_add_u64(pbase + 4, pt2 - pt1)
+                        atom_add_u64(pbase + 6, pt3 - pt2)
+                        atom_add_u64(pbase + 8, pt4 - pt3)
+                        atom_add_u64(pbase + 10, pt5 - pt4)
+                        atom_add_u64(pbase + 12, pt6 - pt5)
+                    cute.arch.sync_warp()
                 token_idx += Uint32(self.dispatch_sms * self.dispatch_warps)
                 if cutlass.const_expr(self.eco):
                     if eco_plan_loaded == Uint32(0) and token_idx >= eco_fixed_tokens:

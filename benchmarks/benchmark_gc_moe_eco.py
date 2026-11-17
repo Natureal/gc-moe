@@ -261,6 +261,9 @@ def main():
                         call()
                 torch.cuda.current_stream(device).wait_stream(cs)
                 torch.cuda.synchronize()
+                slots = buf.buffer.view(torch.int64)[(buf.layout.eco_base + ECO_SIGNAL_OFFSETS["eco_trace"]) // 8:][:64]
+                slots[44:60].zero_()
+                torch.cuda.synchronize()
                 runs = []
                 for _ in range(args.trace_calls):
                     dist.barrier()
@@ -284,6 +287,12 @@ def main():
                 per_call[-1]["trace_us"] = dict(zip(("barrier", "pull_end", "l1_first", "l1_last", "l2_last",
                                                      "gemm_done", "role2_exit", "role3_done"), g_[:, :8].T.tolist()))
                 per_call[-1]["trace_raw_us"] = g_[:, 8:].tolist()   # [rank][ring field 0..15], 13/14 de-inverted
+                ph = slots[44:60].clone()
+                phs = [torch.zeros_like(ph) for _ in range(R)]
+                dist.all_gather(phs, ph)
+                # serial-pull per-token phase sums (ns): [rank][replica: n, locate, index, ring wait, issue, sf/weight,
+                # publish | single-copy: same 7] (GC_MOE_ECO_TRACE=1 ECO builds)
+                per_call[-1]["pull_phase_ns"] = torch.stack(phs).cpu().numpy()[:, [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]].tolist()
             if rank == 0:
                 print(f"{name:<10} call {i:5d}  slowest {max(per_rank):8.2f} us  fastest {min(per_rank):8.2f}", flush=True)
         s = [c["slowest_rank_median_us"] for c in per_call]

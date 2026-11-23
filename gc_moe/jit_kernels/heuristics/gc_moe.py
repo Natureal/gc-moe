@@ -107,7 +107,15 @@ def get_ring_tokens(num_ranks: int, num_experts: int, capacity: int, topk: int,
     for bm in CANDIDATE_BLOCK_M:
         pool_blocks = ceil_div(max_routed, bm) + local_experts
         largest = max(largest, num_max_live_pool_blocks(pool_blocks, num_sms, hidden, intermediate) * bm)
-    ring_tokens = align(largest, 1920)
+    import os as _os
+    ring_pad = int(_os.environ.get('GC_MOE_RING_PAD', '0'))
+    ring_tokens = align(largest + ring_pad, 1920)
+    if _os.environ.get('GC_MOE_PUSH_DISPATCH', '0') == '1':
+        # deepEP fixed layout: (local_expert, src) pairs each own pair_cap rows
+        pair_cap = int(_os.environ.get('GC_MOE_PAIR_CAP', '128'))
+        pair_cap = align(pair_cap, max(CANDIDATE_BLOCK_M))
+        needed = local_experts * num_ranks * pair_cap + local_experts * capacity
+        ring_tokens = max(ring_tokens, align(needed, 1920))
     sf_tokens = max((ring_tokens // bm) * align(bm, 128) for bm in CANDIDATE_BLOCK_M)
     return ring_tokens, sf_tokens
 
@@ -214,7 +222,8 @@ def get_role_config(role: int, block_m: int, num_experts: int,
     return RoleConfig(role, block_m, BLOCK_N, BLOCK_K, store1, store2,
                       dispatch_threads, threads, stages, dynamic_smem,
                       stage, fixed, block_m // 2, align(block_m, 128),
-                      128, 128, 64, routing_warps, pull_bytes, pull_stages,
+                      int(__import__('os').environ.get('GC_MOE_SWZ_ACTS', '128')),
+                      128, 64, routing_warps, pull_bytes, pull_stages,
                       shared_layout)
 
 

@@ -35,12 +35,19 @@ from ..layout.gc_moe import (
     ECO_MAX_ROUTES,
     ECO_SIGNAL_OFFSETS,
     ECO_TRACE_RING_FIELDS,
+    SHARED_DBG_OFF,
+    SHARED_DONE_WORD,
+    SHARED_DBG_WORDS,
+    SHARED_DBG2_OFF,
+    SHARED_DBG2_WORDS,
     ACCUM_BARRIER_STAGES,
     COMBINE_WARPS,
     FINALIZE_THREADS,
     GCBufferLayout,
     MAX_RANKS,
     SIGNAL_OFFSETS,
+    XO_FLAG_OFF,
+    XO_ROW_OFF,
     eco_recv_counts_offset,
 )
 from ..layout.sym_buffer import mapped_peer_base
@@ -57,8 +64,11 @@ from ..ptx.ld_st import (
     EVICT_FIRST,
     EVICT_NORMAL,
     atom_add_u64,
+    atom_acq_rel_gpu_add_u64,
     atom_release_gpu_add_u32,
+    atom_release_gpu_add_u64,
     atom_shared_add_u32,
+    atom_sys_add_u32,
     atom_sys_add_u64,
     bulk_zero_shared,
     ld_acquire_gpu_u32,
@@ -78,6 +88,8 @@ from ..ptx.ld_st import (
     red_gpu_add_u32,
     red_release_gpu_add_u32,
     red_release_gpu_xor_u64,
+    red_release_sys_add_u32,
+    red_release_sys_min_u32,
     red_release_sys_add_u64,
     st_global_u32,
     st_global_u32x4,
@@ -95,8 +107,10 @@ from ..ptx.tcgen05 import (
 )
 from ..ptx.tma import (
     bulk_g2s_1d,
+    l2_evict_last_policy,
     bulk_s2g_1d,
     generic_tensormap_ptr,
+    global_async_proxy_fence,
     prefetch_tensormap,
     tile_s2g_2d,
     tma_store_arrive,
@@ -125,7 +139,9 @@ from ..scheduler.gc_moe import (
     GCBlockPhase,
     TASK_EMPTY_CONSUMERS,
     advance_expert,
+    advance_expert_xo,
     cached_num_tokens,
+    claim_task,
     eco_wait_plan,
     release_task_info,
     schedule_tasks,
@@ -370,6 +386,10 @@ class GCMoERoleKernel:
             EVICT_FIRST if block_m >= 32 and
             num_tokens * topk <= block_m * local_experts
             else EVICT_NORMAL)
+        # GC_MOE_SHARED_WCACHE=normal keeps the shared weights L2-resident
+        # (the streaming hint above defeats any persisting access policy).
+        if __import__('os').environ.get('GC_MOE_SHARED_WCACHE', 'first') == 'normal':
+            self.shared_weight_cache_hint = EVICT_NORMAL
         self.math_stages = math_stages
         self.nvlink_timeout_secs = nvlink_timeout_secs
         self.routed_weight_linger = routed_weight_linger
@@ -478,9 +498,267 @@ class GCMoERoleKernel:
         self.l2_sf_words = layout.views['l2_acts_sf'].offset // 4
         self.shared_l2_x_words = layout.views['shared_l2_acts'].offset // 4
         self.shared_l2_sf_words = layout.views['shared_l2_acts_sf'].offset // 4
+        self.shared_l2_tasks = ((num_tokens + block_m - 1) // block_m) * self.l2_clusters
         self.shared_sf_tokens = ((capacity + 7) // 8) * 128
         self.combine_words = layout.views['combine_tokens'].offset // 4
         self.metadata_words = layout.workspace_offsets['token_src_metadata'] // 4
+        # deepEP-style push dispatch (GC_MOE_PUSH_DISPATCH=1, non-ECO only):
+        # every (local_expert, src_rank) pair owns a fixed pair_cap-row window
+        # in the destination pool; a source emits straight there right after
+        # its own routing pass — no count matrix, no claims, no grid_sync on
+        # the data path. Call-ordered remote writes are gated on the dst's
+        # per-block empty counters / call epoch so banked regions can be
+        # cleared safely. Signal bank (u32, overlay of the idle source-index
+        # region at SIGNAL_OFFSETS['size']):
+        #   pair_count[pairs]      ONE count word per (expert, src) pair,
+        #                          pushed by the last source CTA after all of
+        #                          that pair's data is out (count = ready flag)
+        #   call_epoch             dst footer sets = call index + 1, the
+        #                          cross-call gate for the next call's writes
+        #   finish[pairs]          source-local (arrivals, tokens) counter
+        _pairs = local_experts * num_ranks
+        # A rank contributes at most num_tokens to one (slot, src) pair.
+        # pair_cap bounds that; tokens beyond it trap loudly (see emission).
+        self.pair_cap = int(__import__('os').environ.get(
+            'GC_MOE_PAIR_CAP', '128'))
+        self.pair_cap = (self.pair_cap + block_m - 1) // block_m * block_m
+        self.pair_blocks = self.pair_cap // block_m
+        # Dense layout: every local expert owns `capacity` rows and sources
+        # write straight into that stream with a cross-rank ordinal.
+        self.expert_cap = capacity
+        self.dense_base = _pairs * self.pair_cap
+        self.pair_rows = self.dense_base + local_experts * self.expert_cap
+        self.total_pair_blocks = _pairs * self.pair_blocks
+        self.push_ns = dispatch_sms
+        self.dep_data_ready = 0                # 2 * _pairs words (u64 each)
+        self.dep_pair_count = 2 * _pairs       # unused (kept for call sites)
+        self.dep_expert_base = self.dep_pair_count + 2 * _pairs
+        self.dep_pair_off = self.dep_expert_base + local_experts
+        self.eblocks = capacity // block_m
+        self.dep_blk_cnt = self.dep_pair_off + _pairs
+        self.dep_fin = self.dep_blk_cnt + local_experts * self.eblocks
+        self.push_finish = self.dep_fin + 2    # 2 * _pairs words (u64 aligned)
+        self.deepep_words = self.push_finish + 2 * _pairs
+        self.dep_done = 0                      # unused (kept for call sites)
+        self.dep_src_done = 0                  # unused (kept for call sites)
+        _push_want = __import__('os').environ.get(
+            'GC_MOE_PUSH_DISPATCH', '0') == '1'
+        _push_fits = (self.deepep_words <= _pairs * capacity
+                      and hidden % 64 == 0
+                      and capacity * topk <= 16384
+                      and self.pair_rows <= layout.ring_tokens)
+        if _push_want and not self.eco and not _push_fits:
+            import sys as _sys
+            print(f'GC_MOE_PUSH_DISPATCH=1 ignored: deepEP layout does not fit '
+                  f'(pairs={_pairs} pair_cap={self.pair_cap} rows={self.pair_rows} '
+                  f'ring={layout.ring_tokens} bank={self.deepep_words})',
+                  file=_sys.stderr)
+        self.push_dispatch = (_push_want and not self.eco and _push_fits)
+        # Fused single-pass dispatch (plain pull only): the route loop assigns
+        # source-index slots with a device-scope atomic on the per-call-cleared
+        # expert_send_count words — the counter's final value IS the per-src
+        # count, so the histogram merge and the second index pass disappear and
+        # every count publishes right after the grid barrier.
+        self.fused_dispatch = bool(
+            not self.eco and not self.push_dispatch and
+            __import__('os').environ.get('GC_MOE_FUSED_DISPATCH', '1') != '0')
+        # x-order count publish (plain pull only): tensor_maps then carries
+        # the per-dst heat table [num_ranks * local_experts] int32 built at
+        # weight reorder; each src walks a phase-rotated interleave of it so
+        # the R sources' remote writes spread over all dsts within a round.
+        self.xorder = bool(
+            not self.eco and not _push_want and
+            __import__('os').environ.get('GC_MOE_XORDER', '0') == '1')
+        self.xorder_rot = __import__('os').environ.get('GC_MOE_XORDER_ROT', '1') != '0'
+        # x-order pool layout (stage B): counts are ingested in per-dst hot
+        # order so early pool blocks belong to hot experts.  The dst's own
+        # table row rides the signals tail (needs local_experts <= 384 so the
+        # row fits the recv_count_sum field's unused tail).
+        self.xorder_pool = bool(self.xorder and local_experts <= 384)
+        # Progressive pull: with the pipelined pull path, counts are waited
+        # lazily inside advance_expert_xo as the cursor reaches each hot
+        # position, instead of the bulk wait below.  Only valid when the
+        # pipeline path will actually run (its cursor does the waiting).
+        self.xo_lazy_pull = bool(
+            self.xorder_pool and self.pull_pipe and
+            self.pull_chunks == 1 and self.pull_stages == 2 and
+            __import__('os').environ.get('GC_MOE_XO_LAZY', '1') != '0')
+        # Native progressive pull: same lazy per-position count wait as
+        # xo_lazy_pull but in local-expert order (identity mapping, no
+        # x-order table, no published row).  Mutually exclusive with
+        # xo_lazy_pull since xorder_pool requires self.xorder.
+        # EP32 A/B (2026-11-20, parts {0,1,10-15}): bit-exact but net
+        # ~-0.8us vs bulk wait (counts arrive clustered; per-position
+        # poll+sync overhead exceeds the skew saving).  Default off.
+        self.prog_native = bool(
+            not self.xorder and not self.eco and not self.push_dispatch and
+            self.pull_pipe and self.pull_chunks == 1 and
+            self.pull_stages == 2 and
+            __import__('os').environ.get('GC_MOE_PROG_PULL', '0') == '1')
+        # Sharded count sums (opt-in A/B): each src publishes its count for
+        # a (dst, local expert) into its own tagged recv_count slot via one
+        # release atomic — no count_sum contention — and block0's dispatch
+        # warps gather-sum the num_ranks shards into count_sum in the
+        # identical (num_ranks*dispatch_sms)<<32|total format, so every
+        # downstream consumer is unchanged.  Plain pull mode only.
+        self.shard_counts = bool(
+            not self.xorder and not self.eco and not self.push_dispatch and
+            __import__('os').environ.get('GC_MOE_SHARD_COUNTS', '0') == '1')
+        # self-route (plain pull only): the dst derives every (expert, src) route
+        # from the peers' topk_idx instead of role1's scattered remote
+        # source-index writes, so role1 emits no remote index stores and needs no
+        # count exchange. Each dispatch CTA owns whole sources, so its topk chunk
+        # rides one bulk copy into the idle pull staging region. Count rows are
+        # published in (source, local expert) order, so the hot-order pool modes
+        # (which re-index that table) are excluded.
+        # shared-first scheduling (plain pull): routed tasks wait until every
+        # shared task on this rank has completed, so the shared expert does not
+        # compete with the routed weight streams for memory bandwidth.
+        self.no_routed = bool(
+            __import__('os').environ.get('GC_MOE_NO_ROUTED', '0') == '1' and
+            not self.eco and not self.push_dispatch)
+        # Attribution probe: role1 routes but never pulls (no ring producer, so it
+        # needs no_routed to keep role2 from waiting on ring data). Isolates the
+        # dispatch phase from the pull phase inside the same kernel structure.
+        self.no_pull = bool(
+            __import__('os').environ.get('GC_MOE_NO_PULL', '0') == '1' and
+            self.no_routed)
+        # Attribution probe: drop role1's rank grid barrier (only meaningful with
+        # no_pull, where nothing consumes the routing results). Removes both the
+        # barrier's poll traffic and its CTA residency.
+        self.no_gridsync = bool(
+            __import__('os').environ.get('GC_MOE_NO_GRIDSYNC', '0') == '1' and
+            self.no_pull)
+        self.l2_evict_last = bool(
+            __import__('os').environ.get('GC_MOE_L2_EVICT_LAST', '0') == '1' and
+            not self.eco and not self.push_dispatch)
+        self.pull_after_shared = bool(
+            __import__('os').environ.get('GC_MOE_PULL_AFTER_SHARED', '0') == '1' and
+            shared_experts > 0 and not self.eco and not self.push_dispatch)
+        self.shared_first = bool(
+            __import__('os').environ.get('GC_MOE_SHARED_FIRST', '0') == '1' and
+            shared_experts > 0 and not self.eco and not self.push_dispatch)
+        # Force the shared phases' atomic global-claim scheduling even when the
+        # static one-task-per-cluster map would fit: early-ready consumer
+        # clusters claim shared tasks first instead of the fixed cluster->task
+        # assignment being gated on late-scheduled CTAs (mod-8 coscheduling
+        # stagger at large num_ranks/dispatch_sms).
+        self.shared_dynamic = bool(
+            __import__('os').environ.get('GC_MOE_SHARED_DYNAMIC', '0') == '1' and
+            shared_experts > 0 and not self.eco and not self.push_dispatch)
+        # C1 gate (GC_MOE_DISPATCH_AFTER_READY=1): role1 runs its entry as
+        # usual (per-call clears, epoch, counters) but spins just before the
+        # routing/count-exchange burst until every role2 CTA has passed its
+        # prologue, so dispatch traffic cannot stretch role2's CTA-ready
+        # window (the mod-8 coscheduling stagger). Handshake words live in
+        # the x-order row tail, unused on this plain path and zeroed once at
+        # buffer creation: each role2 CTA's thread 0 bumps a u64 ready
+        # counter; the CTA completing each batch of compute_sms stamps a
+        # release flag; role1 spins until the flag leaves its entry value.
+        self.dispatch_after_ready = bool(
+            __import__('os').environ.get('GC_MOE_DISPATCH_AFTER_READY', '0') == '1' and
+            not self.eco and not self.push_dispatch and
+            not self.xorder and not self.xorder_pool)
+        # C2 gate (GC_MOE_DISPATCH_AFTER_SHARED=1): hold role1's whole
+        # routing burst (scan + count exchange + source-index writes) until
+        # every shared L2 task has completed (SHARED_DONE_WORD), so the burst
+        # lands after BOTH role2's readiness window and the shared GEMM.
+        # Unlike DISPATCH_AFTER_READY (C1, whose burst then hit the GEMM and
+        # stretched spans 2x), this empties the whole shared window. Enables
+        # the SHARED_DONE_WORD clear+increment machinery (shared_first uses it
+        # too). Shared tasks are self-contained (activations from x), so no
+        # deadlock; routed claims wait on role1's counts as usual, just later.
+        self.dispatch_after_shared = bool(
+            __import__('os').environ.get('GC_MOE_DISPATCH_AFTER_SHARED', '0') == '1' and
+            shared_experts > 0 and not self.eco and not self.push_dispatch and
+            not self.xorder and not self.xorder_pool)
+        # GC_MOE_ROUTE_AFTER_SHARED=1: gate self_route's bulk topk table reads
+        # (the fabric reads that derive routes locally) until every shared L2
+        # task has completed, so those reads cannot stretch role2's shared
+        # readiness/weight-stream window. Extends the SHARED_DONE_WORD
+        # machinery the same way PULL_AFTER_SHARED does.
+        self.route_after_shared = bool(
+            __import__('os').environ.get('GC_MOE_ROUTE_AFTER_SHARED', '0') == '1' and
+            shared_experts > 0 and not self.eco and not self.push_dispatch and
+            not self.xorder and not self.xorder_pool)
+        self.self_route_waves = (num_ranks + self.dispatch_sms - 1) // self.dispatch_sms
+        _self_route_bytes = self.self_route_waves * num_tokens * topk * 8
+        self.self_route = (__import__('os').environ.get('GC_MOE_SELF_ROUTE', '0') == '1' and
+                           not self.eco and not self.push_dispatch and
+                           not self.xorder and not self.prog_native and
+                           not self.shard_counts and
+                           self.self_route_waves <= self.dispatch_warps and
+                           _self_route_bytes <=
+                           self.dispatch_warps * self.pull_stages * self.pull_bytes)
+        if __import__('os').environ.get('GC_MOE_SELF_ROUTE', '0') == '1' and not self.self_route:
+            import sys as _sr_sys
+            print(f'GC_MOE_SELF_ROUTE=1 ignored: {self.self_route_waves} source waves '
+                  f'need {_self_route_bytes} pull-region bytes (warps={self.dispatch_warps}, '
+                  f'region={self.dispatch_warps * self.pull_stages * self.pull_bytes})',
+                  file=_sr_sys.stderr)
+        # Attribution probe: the self-route scan reads this rank's own topk table
+        # instead of each peer's (same bytes, same instructions, local addresses).
+        # Probe: make the shared L2 wave wait for every L1 tile of every M-block
+        # (full phase separation) instead of only its own block's.
+        # K-block data-wait accumulators (SHARED_DBG2 [20]/[22]). Off by default:
+        # 40 timer reads + 80 atomics per tile measurably inflate the shared span.
+        self.shared_dwdbg = bool(
+            __import__('os').environ.get('GC_MOE_SHARED_DWDBG', '0') == '1')
+        self.shared_full_sep = bool(
+            __import__('os').environ.get('GC_MOE_SHARED_FULL_SEP', '0') == '1')
+        self.scan_local = bool(
+            __import__('os').environ.get('GC_MOE_SCAN_LOCAL', '0') == '1' and
+            self.self_route)
+        # Pull metadata staging (level 1: topk weights, level 2: + activation SF).
+        # The self-route scan already reads every peer's topk table, so each CTA
+        # bulk-copies its owned peers' live weight (and SF) tables into this
+        # rank's own buffer in the same wave, and the pull loop then resolves
+        # `weight`/`SF` with local reads. Replaces one scattered remote load per
+        # token (768 x 4B + 768 x 160B per rank) with one bulk copy per peer.
+        self.pull_meta = layout.pull_meta if (
+            self.self_route and self.pull_pipe and self.pull_chunks == 1 and
+            self.pull_stages == 2) else 0
+        self.pull_meta_w_words = layout.views['pull_meta_w'].offset // 4 \
+            if self.pull_meta else 0
+        self.pull_meta_sf_words = layout.views['pull_meta_sf'].offset // 4 \
+            if self.pull_meta >= 2 else 0
+        self.meta_w_bytes = num_tokens * topk * 4
+        self.meta_sf_bytes = num_tokens * (hidden // 128) * 4 if self.pull_meta >= 2 else 0
+        self.meta_w_rank_words = num_tokens * topk
+        self.meta_sf_rank_words = num_tokens * (hidden // 32)
+        self.meta_bytes = self.meta_w_bytes + self.meta_sf_bytes
+        self.meta_stage_words = self.meta_bytes // 4
+        if self.pull_meta:
+            _meta_smem = self.self_route_waves * (num_tokens * topk * 2 +
+                                                  self.meta_stage_words)
+            if _meta_smem > self.dispatch_warps * self.pull_stages * (self.pull_bytes // 4):
+                self.pull_meta = 0
+                import sys as _pm_sys
+                print(f'GC_MOE_PULL_META ignored: staging needs {_meta_smem} words',
+                      file=_pm_sys.stderr)
+        # TMA push staging shares the idle pull region: seq tables at the
+        # tail, pull_stages buffers per emitting warp at the head. Warps that
+        # do not fit idle during emission (scalar fallback keeps all warps).
+        _pull_words = self.pull_bytes // 4
+        _region_words = self.dispatch_warps * self.pull_stages * _pull_words
+        _seq_words = 4 * _pairs + 17 + capacity * topk
+        _stage_words = self.pull_stages * _pull_words
+        self.push_emit_warps = min(
+            self.dispatch_warps,
+            max(0, (_region_words - _seq_words) // _stage_words))
+        # pull_stages == 2 implies pull_bytes == hidden == one chunk, so the
+        # TMA path always moves a whole row per bulk op. Measured on this
+        # fabric: remote cp.async.bulk stores are ~100us/op — GC_MOE_PUSH_TMA=1
+        # keeps the path for A/B only.
+        self.push_tma = bool(self.push_dispatch and role == 1 and
+                             self.pull_stages == 2 and self.push_emit_warps > 0
+                             and __import__('os').environ.get(
+                                 'GC_MOE_PUSH_TMA', '0') == '1')
+        assert not (role == 1 and self.push_dispatch and
+                    _seq_words * 4 >
+                    self.dispatch_warps * self.pull_stages * self.pull_bytes), \
+            'push dispatch seq tables exceed the role1 pull region'
+        self.empty_contrib = 2 * (self.l1_clusters + self.l2_clusters)
         self.ring_tokens = layout.ring_tokens
         self.sf_ring_tokens = layout.sf_ring_tokens
         self.ring_blocks = layout.ring_tokens // block_m
@@ -508,7 +786,8 @@ class GCMoERoleKernel:
 
     @cute.jit
     def _initialize_shared_storage(self, slab: cute.Pointer,
-                                    physical_warp: Uint32, lane: Uint32) -> None:
+                                    physical_warp: Uint32, lane: Uint32,
+                                    signals: cute.Tensor) -> None:
         cute.arch.cluster_arrive_relaxed()
         cute.arch.cluster_wait()
         if physical_warp == 0:
@@ -564,7 +843,19 @@ class GCMoERoleKernel:
                 cute.arch.alloc_tmem(self.tmem_cols, tptr, is_two_cta=True)
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
+        if cutlass.const_expr(self.eco_trace and not self.eco and not self.push_dispatch and
+                              self.role == 2):
+            if physical_warp == 0 and elect_one_sync():
+                self._eco_trace_ring(signals, 33, True)
         cute.arch.griddepcontrol_wait()
+
+    @cute.jit
+    def _shared_cache_hint(self):
+        """L2 policy for the shared-expert weight loads (evict_last pins the
+        35 MB footprint in the persisting carve-out)."""
+        if cutlass.const_expr(self.l2_evict_last):
+            return l2_evict_last_policy()
+        return Uint64(self.shared_weight_cache_hint)
 
     @cute.jit
     def _eco_trace(self, signals: cute.Tensor, slot: cutlass.Constexpr, mode: cutlass.Constexpr) -> None:
@@ -588,6 +879,14 @@ class GCMoERoleKernel:
             atom_add_u64(base + slot * 2, read_globaltimer() - start)
 
     @cute.jit
+    def _eco_trace_rel(self, signals: cute.Tensor, slot: cutlass.Constexpr) -> None:
+        """Scalar trace slot: ns since this call's role1 start (last writer wins)."""
+        if cutlass.const_expr(self.eco_trace):
+            base = signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4
+            st_global_u64(base + slot * 2,
+                          read_globaltimer() - ld_volatile_u64(base + 24 * 2))
+
+    @cute.jit
     def _eco_trace_ring(self, signals: cute.Tensor, field: cutlass.Constexpr, is_max: cutlass.Constexpr) -> None:
         """Per-call trace ring entry field (one issuing thread): ns since this call's role1 start"""
         if cutlass.const_expr(self.eco_trace):
@@ -595,7 +894,10 @@ class GCMoERoleKernel:
             elapsed = Uint32(read_globaltimer() - ld_volatile_u64(base + 24 * 2))
             entry = Uint32(ld_volatile_u64(base + 33 * 2)) % Uint32(64)
             ptr = signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace_ring']) // 4 + entry * Uint32(ECO_TRACE_RING_FIELDS) + field
-            if cutlass.const_expr(field == 13 or field == 14 or (field == 10 and not self.eco)):
+            if cutlass.const_expr(field == 13 or field == 14 or field == 16 or
+                                  field == 20 or field == 21 or field == 22 or
+                                  field == 23 or field == 24 or field == 25 or
+                                  (field == 10 and not self.eco)):
                 elapsed = Uint32(0xffffffff) - elapsed
             if cutlass.const_expr(is_max):
                 atom_max_u32_global(ptr, elapsed)
@@ -731,13 +1033,35 @@ class GCMoERoleKernel:
         progress release. A deferred pull (ring slot still occupied) does its
         empty-wait and issues serially here instead."""
         if pend != Uint32(0):
-            remote_sf_base = pend_src_base + Uint64(self.input_sf_words * 4) + \
-                Uint64(pend_src_token) * Uint64(self.hidden // 128 * 4)
+            if cutlass.const_expr(self.pull_meta == 3):
+                # Timing probe (output wrong): no remote SF/weight read at all and
+                # no staging — every token reads one L1-hot local SF row. Isolates
+                # how much of the shared-expert disturbance these reads cause.
+                sf_ptr = signals.iterator + Uint32(self.pull_meta_sf_words)
+            elif cutlass.const_expr(self.pull_meta == 2):
+                # Staged: every peer's live SF table sits in this rank's own
+                # buffer (the self-route wave bulk-copied it before the rank
+                # barrier), so the row read is local and contiguous.
+                sf_ptr = signals.iterator + Uint32(self.pull_meta_sf_words) + \
+                    pend_src_rank * Uint32(self.meta_sf_rank_words) + \
+                    pend_src_token * Uint32(self.hidden // 32)
+            else:
+                sf_ptr = cute.make_ptr(
+                    Uint32, pend_src_base + Uint64(self.input_sf_words * 4) +
+                    Uint64(pend_src_token) * Uint64(self.hidden // 128 * 4),
+                    cute.AddressSpace.gmem)
             token_topk = pend_src_token * Uint32(self.topk) + pend_topk_slot
-            remote_weight = cute.make_ptr(
-                Uint32, pend_src_base + Uint64(self.input_weight_words * 4) +
-                Uint64(token_topk) * Uint64(4), cute.AddressSpace.gmem)
-            weight = remote_weight[0]
+            if cutlass.const_expr(self.pull_meta == 3):
+                weight = Uint32(0)
+            elif cutlass.const_expr(1 <= self.pull_meta <= 2):
+                weight = (signals.iterator + Uint32(self.pull_meta_w_words) +
+                          pend_src_rank * Uint32(self.meta_w_rank_words) +
+                          token_topk)[0]
+            else:
+                remote_weight = cute.make_ptr(
+                    Uint32, pend_src_base + Uint64(self.input_weight_words * 4) +
+                    Uint64(token_topk) * Uint64(4), cute.AddressSpace.gmem)
+                weight = remote_weight[0]
             sf_row = pend_ring * ((self.block_m + 127) // 128 * 128) + \
                 ((pend_pull % self.block_m) & ~127) + \
                 ((pend_pull % self.block_m) & 31) * 4 + \
@@ -753,10 +1077,7 @@ class GCMoERoleKernel:
                         (sf_vectors + 31) // 32, unroll_full=True):
                     q = q_round * 32 + lane
                     if q < sf_vectors:
-                        remote_vec = cute.make_ptr(
-                            Uint32, remote_sf_base + Uint64(q * Uint32(16)),
-                            cute.AddressSpace.gmem, assumed_align=16)
-                        values = ld_global_u32x4(remote_vec)
+                        values = ld_global_u32x4(sf_ptr + q * Uint32(4))
                         for component in cutlass.range_constexpr(4):
                             sf_col = q * 4 + component
                             if cutlass.const_expr(self.wide_l1_sf):
@@ -777,9 +1098,7 @@ class GCMoERoleKernel:
                         (self.hidden // 128 + 31) // 32, unroll_full=True):
                     sf_col = sf_round * 32 + lane
                     if sf_col < self.hidden // 128:
-                        remote_word = cute.make_ptr(
-                            Uint32, remote_sf_base + Uint64(sf_col * Uint32(4)),
-                            cute.AddressSpace.gmem, assumed_align=4)
+                        remote_word = sf_ptr + sf_col
                         if cutlass.const_expr(self.wide_l1_sf):
                             l1_sf_bytes = cute.recast_ptr(
                                 signals.iterator, dtype=Uint8) + \
@@ -797,6 +1116,9 @@ class GCMoERoleKernel:
             if elect_one_sync():
                 warp_pull_p = warp_pull + pend_par * Uint32(self.pull_bytes // 4)
                 warp_bar_p = warp_bar + pend_par
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    self._eco_trace_ring(signals, 22, True)
                 if pend_issued == Uint32(0):
                     if cutlass.const_expr(self.eco and self.eco_trace):
                         if pend_tidx >= eco_fixed_tokens and pend_tidx < \
@@ -819,14 +1141,21 @@ class GCMoERoleKernel:
                 else:
                     cute.arch.mbarrier_wait(warp_bar_p, pull_phase2)
                     pull_phase2 ^= Uint32(1)
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    self._eco_trace_ring(signals, 23, True)
                 dst_x = cute.recast_ptr(
                     cute.recast_ptr(signals.iterator, dtype=Uint8) +
                     Uint64(self.l1_x_words) * Uint64(4) +
                     Uint64(pend_pool % self.ring_tokens) * Uint64(self.hidden),
                     dtype=Uint32)
-                bulk_s2g_1d(dst_x, warp_pull_p, Uint32(self.pull_bytes))
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0)
+                if cutlass.const_expr(self.pull_meta != 4):
+                    bulk_s2g_1d(dst_x, warp_pull_p, Uint32(self.pull_bytes))
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0)
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    self._eco_trace_ring(signals, 24, True)
                 signals[self.l1_weight_words +
                         pend_pool % self.ring_tokens] = weight
                 signals[self.metadata_words + pend_pool * 3] = pend_src_rank
@@ -835,6 +1164,10 @@ class GCMoERoleKernel:
                 red_release_gpu_add_u32(
                     signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 +
                     pend_ring, Uint32(pend_full_inc))
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    self._eco_trace_ring(signals, 25, True)
+                    self._eco_trace_ring(signals, 26, True)
                 if cutlass.const_expr(self.eco and self.eco_trace):
                     if pend_tidx >= eco_fixed_tokens and pend_tidx < \
                             eco_fixed_tokens + \
@@ -861,6 +1194,9 @@ class GCMoERoleKernel:
         in-flight one, so the remote flight hides resolution + SF work."""
         rank_waves = (self.num_ranks + 31) // 32
         cached_rank_expert = Int32(-1)
+        # x-order pool: cursor positions map to real experts through the
+        # per-dst table row (tensor_maps carries it under xorder).
+        cur_expert = Uint32(0)
         eco_peel_start = Uint32(0)
         eco_canon_rank = rank_idx
         eco_canon_slot = Uint32(0)
@@ -886,6 +1222,9 @@ class GCMoERoleKernel:
         pc_res = Uint32(0)
         pc_abs = Uint32(0)
         pull_words = self.pull_bytes // 4
+        recv_ptr_xo = signals.iterator + \
+            SIGNAL_OFFSETS['expert_recv_count_sum'] // 4 + \
+            gen * Uint32(self.local_experts * 2)
         warp_pull = pull + Uint32(physical_warp * 2) * Uint32(pull_words)
         warp_bar = pull_bar + Uint32(physical_warp * 2)
         rep_entry_ns = Uint64(0)
@@ -924,6 +1263,10 @@ class GCMoERoleKernel:
                     expert_counts, token_idx, current_expert,
                     expert_start, expert_end, pool_block_offset, lane,
                     self.local_experts, self.block_m)
+        if cutlass.const_expr(self.eco_trace and not self.eco and
+                              not self.push_dispatch):
+            if elect_one_sync():
+                self._eco_trace_ring(signals, 20, True)
         for eco_phase in cutlass.range_constexpr((3 if self.eco_interleave else 2) if self.eco else 1):
             phase_bound = Int32(self.local_experts)
             if cutlass.const_expr(self.eco and eco_phase != 1):
@@ -966,6 +1309,11 @@ class GCMoERoleKernel:
             while current_expert < phase_bound:
                 if cached_rank_expert != current_expert:
                     cached_rank_expert = current_expert
+                    cur_expert = Uint32(current_expert)
+                    if cutlass.const_expr(self.xorder_pool):
+                        cur_expert = Uint32(tensor_maps[Uint32(
+                            rank_idx * Uint32(self.local_experts) +
+                            Uint32(current_expert))])
                     if cutlass.const_expr(self.eco and self.eco_trace):
                         entry_t0 = Uint64(0)
                         if Uint32(current_expert) >= eco_num_fixed:
@@ -1018,7 +1366,7 @@ class GCMoERoleKernel:
                                 gen * Uint32(self.num_ranks *
                                              self.local_experts * 2) + \
                                 (source_rank * Uint32(self.local_experts) +
-                                 Uint32(current_expert)) * Uint32(2)
+                                 cur_expert) * Uint32(2)
                             if cutlass.const_expr(self.eco and self.eco_recv_counts == 0):
                                 if cutlass.const_expr(eco_phase == 1):
                                     stored_rank_count[wave] = self._eco_table_count(
@@ -1067,7 +1415,7 @@ class GCMoERoleKernel:
                     # in-flight pull drains; the first 64 entries cover the used
                     # prefix of every source's span. Replica slots read the
                     # canonical copy's rows — warm those only when it is local.
-                    pf_slot = Uint32(current_expert)
+                    pf_slot = cur_expert
                     if cutlass.const_expr(self.eco and eco_phase == 1):
                         pf_slot = Uint32(self.local_experts)
                         if eco_canon_rank == rank_idx:
@@ -1184,7 +1532,7 @@ class GCMoERoleKernel:
                     token_topk = Uint32(eco_idx_ptr[
                         Uint32(src_rank) * Uint32(self.capacity) + src_slot])
                 else:
-                    token_topk = source_idx[(Uint32(current_expert) *
+                    token_topk = source_idx[(cur_expert *
                                              Uint32(self.num_ranks) +
                                              src_rank) * Uint32(self.capacity) +
                                             src_slot]
@@ -1202,7 +1550,13 @@ class GCMoERoleKernel:
                 is_last_token = token_idx == expert_end - Uint32(1)
                 full_increment = Uint32(self.block_m) - (pull_token % self.block_m) \
                     if is_last_token else Uint32(1)
-                src_base = mapped_peer_base(peer_ptrs, src_rank, self.num_ranks)
+                # Timing probe 5 (output wrong): identical pull work, but every
+                # source address resolves to this rank's own buffer — isolates
+                # cross-rank fabric traffic from the same bytes read locally.
+                src_addr_rank = src_rank
+                if cutlass.const_expr(self.pull_meta == 5):
+                    src_addr_rank = rank_idx
+                src_base = mapped_peer_base(peer_ptrs, src_addr_rank, self.num_ranks)
                 src_x = cute.make_ptr(
                     Uint32, src_base + Uint64(self.input_x_words * 4) +
                     Uint64(src_token) * Uint64(self.hidden),
@@ -1225,6 +1579,9 @@ class GCMoERoleKernel:
                                      Uint32(self.pull_bytes), warp_bar + parity)
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             warp_bar + parity, self.pull_bytes)
+                        if cutlass.const_expr(self.eco_trace and not self.eco and
+                                              not self.push_dispatch):
+                            self._eco_trace_ring(signals, 21, True)
                     this_issued = Uint32(1)
                 cute.arch.sync_warp()
                 if cutlass.const_expr(self.eco and self.eco_trace):
@@ -1257,11 +1614,23 @@ class GCMoERoleKernel:
                         rep_entry_ns += read_globaltimer() - entry_t0
                         entry_t0 = Uint64(0)
                 token_idx += token_stride
-                current_expert, expert_start, expert_end, pool_block_offset = \
-                    advance_expert(
-                        expert_counts, token_idx, current_expert, expert_start,
-                        expert_end, pool_block_offset, lane, self.local_experts,
-                        self.block_m)
+                if cutlass.const_expr(self.xo_lazy_pull or self.prog_native):
+                    current_expert, expert_start, expert_end, pool_block_offset = \
+                        advance_expert_xo(
+                            expert_counts, token_idx, current_expert,
+                            expert_start, expert_end, pool_block_offset,
+                            lane, self.local_experts, self.block_m,
+                            recv_ptr_xo,
+                            tensor_maps if tensor_maps is not None else expert_counts,
+                            rank_idx * Uint32(self.local_experts),
+                            self.dispatch_sms, self.num_ranks,
+                            self.nvlink_timeout_secs, self.prog_native)
+                else:
+                    current_expert, expert_start, expert_end, pool_block_offset = \
+                        advance_expert(
+                            expert_counts, token_idx, current_expert,
+                            expert_start, expert_end, pool_block_offset,
+                            lane, self.local_experts, self.block_m)
                 if cutlass.const_expr(self.eco_interleave and eco_phase == 0):
                     if current_expert < phase_bound and eco_num_fixed < Uint32(self.local_experts):
                         if ld_volatile_u32(signals.iterator + (self.eco_base + ECO_SIGNAL_OFFSETS['eco_plan_ready']) // 4) == \
@@ -1278,6 +1647,10 @@ class GCMoERoleKernel:
             pend, pend_issued, pend_par, pend_tidx, pend_pull, pend_pool,
             pend_ring, pend_src_rank, pend_src_base, pend_src_token,
             pend_topk_slot, pend_full_inc, pend_empty, eco_fixed_tokens, lane)
+        if cutlass.const_expr(self.eco_trace and not self.eco and
+                              not self.push_dispatch):
+            if elect_one_sync():
+                self._eco_trace_ring(signals, 27, True)
         if cutlass.const_expr(self.eco and self.eco_trace):
             if entry_t0 != Uint64(0):
                 rep_entry_ns += read_globaltimer() - entry_t0
@@ -1296,6 +1669,9 @@ class GCMoERoleKernel:
                         rank_idx: Uint32, tid: Uint32, lane: Uint32,
                         block: Uint32, recv_ptr: cute.Pointer, stats: cute.Tensor,
                         ready_epoch: Uint64, eco_fixed_slots: Uint32 = None) -> None:
+        if cutlass.const_expr(self.eco_trace):
+            if block == 0 and tid == 0:
+                self._eco_trace(signals, 56, 0)   # footer entry (absolute)
         # Publish completed peer FC2 stores even with no routed tokens.
         # Epochs distinguish late old publications without resetting ready.
         if block == 0 and tid < self.num_ranks:
@@ -1315,6 +1691,11 @@ class GCMoERoleKernel:
         # before publishing this summary. Normal graph completion dependencies
         # also retire every role2 ring access before this footer executes.
         pool_blocks = Uint32(signals[SIGNAL_OFFSETS['routed_pool_blocks'] // 4])
+        if cutlass.const_expr(self.push_dispatch):
+            # push pool spans the pair windows and the repack's dense
+            # per-expert streams; every block slot needs its lifecycle
+            # counters cleared or the next call reads stale state.
+            pool_blocks = Uint32(self.pair_rows // self.block_m)
         if cutlass.const_expr(self.eco):
             # ECO: replica slots hold plan quotas, not native counts; total the padded slot blocks here
             eco_lane_blocks = Uint32(0)
@@ -1380,6 +1761,38 @@ class GCMoERoleKernel:
                 ring_block * Uint32(2), Uint64(0))
             signals[SIGNAL_OFFSETS['l2_empty_count'] // 4 + ring_block] = Uint32(0)
             ring_block += Uint32(self.finalize_sms * 128)
+
+        if cutlass.const_expr(self.push_dispatch):
+            # deepEP retire: single-bank clear of every pair count word and
+            # this rank's finish counters, then publish call_epoch = k+1 —
+            # the gate that orders the next call's data and count pushes
+            # after this clear.
+            dep_base = signals.iterator + SIGNAL_OFFSETS['size'] // 4
+            w = block * Uint32(128) + tid
+            while w < Uint32(2 * self.num_ranks * self.local_experts):
+                signals[SIGNAL_OFFSETS['size'] // 4 + self.dep_data_ready + w] = Uint32(0)
+                w += Uint32(self.finalize_sms * 128)
+            w = block * Uint32(128) + tid
+            while w < Uint32(self.local_experts):
+                signals[SIGNAL_OFFSETS['size'] // 4 + self.dep_expert_base + w] = Uint32(0)
+                w += Uint32(self.finalize_sms * 128)
+            w = block * Uint32(128) + tid
+            while w < Uint32(self.local_experts * self.eblocks):
+                signals[SIGNAL_OFFSETS['size'] // 4 + self.dep_blk_cnt + w] = Uint32(0)
+                w += Uint32(self.finalize_sms * 128)
+            w = block * Uint32(128) + tid
+            while w < Uint32(2 * self.num_ranks * self.local_experts):
+                signals[SIGNAL_OFFSETS['size'] // 4 + self.push_finish + w] = Uint32(0)
+                w += Uint32(self.finalize_sms * 128)
+            cute.arch.sync_threads()
+            if tid == Uint32(0):
+                red_release_gpu_add_u32(dep_base + self.dep_fin, Uint32(1))
+            if block == Uint32(0) and tid == Uint32(0):
+                fin_target = Uint32(ready_epoch) * Uint32(self.finalize_sms)
+                while ld_acquire_gpu_u32(dep_base + self.dep_fin) != fin_target:
+                    pass
+                if cutlass.const_expr(self.eco_trace):
+                    self._eco_trace(signals, 57, 0)   # footer exit (absolute)
 
         # The former tail NVLink barrier (tag 2) is gone: the receive
         # signals are dual-buffered by recv_parity, so peers' next publish
@@ -1577,6 +1990,53 @@ class GCMoERoleKernel:
                             st_global_u32x4(ring + 4 * q, Uint32(0), Uint32(0), Uint32(0), Uint32(0))
                         # field 11: this call's start - the previous call's start (the call period)
                         st_global_u32(ring + 11, Uint32(ld_volatile_u64(base + 24 * 2) - prev_start))
+                        if cutlass.const_expr(self.shared_first or self.pull_after_shared or
+                                              self.dispatch_after_shared or
+                                              self.route_after_shared):
+                            st_global_u32(signals.iterator +
+                                          SIGNAL_OFFSETS['expert_send_count'] // 4 +
+                                          SHARED_DONE_WORD, Uint32(0))
+                        if cutlass.const_expr(not self.eco and not self.push_dispatch and
+                                              not self.xorder):
+                            # per-cluster shared-expert completion (u64 ns, 68 clusters);
+                            # lives in the x-order tail, unused on this path
+                            dbg_zero = signals.iterator + \
+                                (SIGNAL_OFFSETS['expert_recv_count_sum'] +
+                                 SHARED_DBG_OFF) // 4
+                            for q in cutlass.range_constexpr(SHARED_DBG_WORDS // 4):
+                                st_global_u32x4(dbg_zero + 4 * q, Uint32(0), Uint32(0),
+                                                Uint32(0), Uint32(0))
+                            dbg2_zero = signals.iterator + \
+                                (SIGNAL_OFFSETS['expert_send_count'] +
+                                 SHARED_DBG2_OFF) // 4
+                            for q in cutlass.range_constexpr(SHARED_DBG2_WORDS // 4):
+                                st_global_u32x4(dbg2_zero + 4 * q, Uint32(0), Uint32(0),
+                                                Uint32(0), Uint32(0))
+            if cutlass.const_expr(self.dispatch_after_ready):
+                # C1 gate: hold role1's routing burst until every role2 CTA
+                # has passed its prologue (task-consume readiness), so the
+                # burst cannot stretch role2's CTA-ready window.
+                if tid == Uint32(0):
+                    _gate_flag = signals.iterator + \
+                        (SIGNAL_OFFSETS['expert_recv_count_sum'] +
+                         XO_ROW_OFF) // 4 + 2
+                    _gate_entry = ld_acquire_gpu_u32(_gate_flag)
+                    while ld_acquire_gpu_u32(_gate_flag) == _gate_entry:
+                        pass
+                cute.arch.sync_threads()
+            if cutlass.const_expr(self.dispatch_after_shared):
+                # C2 gate: hold role1's whole routing burst until every shared
+                # L2 task completed (SHARED_DONE_WORD, cleared by this CTA's
+                # entry above and bumped by each shared L2 epilogue), so the
+                # burst lands after BOTH the readiness window and the shared
+                # GEMM. Routed claims then wait on the (now later) counts.
+                if tid == Uint32(0):
+                    _done_ptr = signals.iterator + \
+                        SIGNAL_OFFSETS['expert_send_count'] // 4 + SHARED_DONE_WORD
+                    while ld_acquire_gpu_u32(_done_ptr) < \
+                            Uint32(self.shared_l2_tasks):
+                        pass
+                cute.arch.sync_threads()
             # Count local routes and reserve distinct source-index spans. ECO overlaps count publication with
             # source-index writes; the grid and rank barriers join both before activation pulls.
             # Route each global expert to its owner rank and local expert.
@@ -1591,9 +2051,41 @@ class GCMoERoleKernel:
                 # ECO: per logical expert's canonical (lowest) copy slot
                 copies_pk = cute.recast_ptr(
                     dispatch_smem.allocate(self.route_experts * 4, 16), dtype=Uint32)
+            if cutlass.const_expr(self.xorder):
+                # x-order: stage the per-dst heat table in the smem region
+                # reserved for ECO's copy table (the paths are exclusive), so
+                # the publish loops read smem instead of one global load per
+                # expert.  Fits because num_ranks*local_experts <= num_experts.
+                xorder_table = tensor_maps
+                xo_smem = cute.recast_ptr(
+                    dispatch_smem.allocate(
+                        self.num_ranks * self.local_experts * 4, 16), dtype=Uint32)
+                for xo_i in cutlass.range(
+                        Uint32(tid), Uint32(self.num_ranks * self.local_experts),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    xo_smem[Uint32(xo_i)] = Uint32(xorder_table[Uint32(xo_i)])
+                cute.arch.sync_threads()
+            if cutlass.const_expr(self.xorder_pool):
+                # Publish this dst's own table row for role2's scheduler and
+                # the (same-rank) pull cursor: row = table[rank_idx*L + j].
+                # Block 0 writes it once; the flag word releases the row.
+                xo_row_base = SIGNAL_OFFSETS['expert_recv_count_sum'] + XO_ROW_OFF
+                if block == Uint32(0):
+                    for xo_i in cutlass.range(
+                            Uint32(tid), Uint32(self.local_experts),
+                            self.dispatch_warps * 32, unroll_full=True):
+                        st_global_u32(
+                            signals.iterator + (xo_row_base + xo_i * 4) // 4,
+                            xo_smem[Uint32(rank_idx * Uint32(self.local_experts) + Uint32(xo_i))])
+                    cute.arch.sync_threads()
+                    if tid == Uint32(0):
+                        st_release_u32(
+                            signals.iterator +
+                            (SIGNAL_OFFSETS['expert_recv_count_sum'] + XO_FLAG_OFF) // 4,
+                            Uint32(0x584f0001), True)
             pull = cute.recast_ptr(slab + self.shared_layout.pull, dtype=Uint32)
             pull_bar = cute.recast_ptr(slab + self.shared_layout.dispatch_bars, dtype=Uint64)
-            self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane))
+            self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane), signals)
             warpgroup_reg_dealloc(self.dispatch_registers)
             # Dual-buffered receive signals: replay N publishes and reads
             # generation parity & 1; role 3 flips the persistent parity
@@ -1654,10 +2146,182 @@ class GCMoERoleKernel:
                 cute.recast_ptr(signals.iterator + SIGNAL_OFFSETS['size'] // 4,
                                 dtype=Uint32),
                 cute.make_layout((self.num_ranks * self.local_experts * self.capacity,)))
+            if cutlass.const_expr(self.self_route):
+                # self-route: this rank derives every (expert, source) route from
+                # the peers' topk_idx tables, so the dispatch role emits no
+                # scattered 4B source-index stores and needs no count exchange.
+                # Each CTA owns whole sources (block, block + dispatch_sms, ...),
+                # so every (expert, source) slot cursor has a single writer. One
+                # bulk copy per owned source lands in the idle pull staging
+                # region; the rank grid barrier then publishes the rows to the
+                # pull loop exactly like received ones.
+                scan_bar = cute.recast_ptr(dispatch_smem.allocate(32, 8), dtype=Uint64)
+                # Only the first num_tokens * topk entries of a peer's table are
+                # live this call; the rest of the capacity-sized region is stale.
+                scan_buf_words = Uint32(self.num_tokens * self.topk * 2)
+                scan_bytes = Uint32(self.num_tokens * self.topk * 8)
+                scan_valid = num_tokens * Uint32(self.topk)
+                scan_cnt = expert_token_count
+                scan_rows = signals.iterator + \
+                    SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
+                    gen * Uint32(self.num_ranks * self.local_experts * 2)
+                scan_sum = signals.iterator + \
+                    SIGNAL_OFFSETS['expert_recv_count_sum'] // 4 + \
+                    gen * Uint32(self.local_experts * 2)
+                scan_owned = Uint32(0)
+                if Uint32(block) < Uint32(self.num_ranks):
+                    scan_owned = (Uint32(self.num_ranks) - Uint32(1) - Uint32(block)) // \
+                        Uint32(self.dispatch_sms) + Uint32(1)
+                if physical_warp == 0:
+                    if elect_one_sync():
+                        for scan_k in cutlass.range_constexpr(self.self_route_waves):
+                            cute.arch.mbarrier_init(scan_bar + scan_k, 1)
+                        if cutlass.const_expr(0 < self.pull_meta < 3):
+                            for meta_k in cutlass.range_constexpr(self.self_route_waves):
+                                cute.arch.mbarrier_init(scan_bar + Uint32(8) + meta_k, 1)
+                        cute.arch.mbarrier_init_fence()
+                cute.arch.sync_threads()
+                if cutlass.const_expr(self.route_after_shared):
+                    # Gate self_route's bulk topk table reads (and the meta
+                    # staging copies) until every shared L2 task completed, so
+                    # these fabric reads cannot stretch role2's shared window.
+                    if tid == Uint32(0):
+                        _ras_ptr = signals.iterator + \
+                            SIGNAL_OFFSETS['expert_send_count'] // 4 + SHARED_DONE_WORD
+                        while ld_acquire_gpu_u32(_ras_ptr) < \
+                                Uint32(self.shared_l2_tasks):
+                            pass
+                    cute.arch.sync_threads()
+                # Pull metadata staging: the same wave that reads this peer's topk
+                # table bulk-copies its live topk-weight (and activation-SF) table
+                # into this rank's own buffer, so the pull loop resolves both with
+                # local reads instead of one scattered remote load per token.
+                meta_stage = pull + Uint32(self.self_route_waves) * scan_buf_words
+                meta_stage_words = Uint32(self.meta_stage_words)
+                meta_bar = scan_bar + Uint32(8)
+                if cutlass.const_expr(0 < self.pull_meta < 3):
+                    if physical_warp < Uint32(self.self_route_waves):
+                        meta_src = Uint32(block) + \
+                            Uint32(physical_warp) * Uint32(self.dispatch_sms)
+                        if meta_src < Uint32(self.num_ranks):
+                            meta_peer = mapped_peer_base(peer_ptrs, meta_src, self.num_ranks)
+                            if elect_one_sync():
+                                if cutlass.const_expr(self.pull_meta >= 2):
+                                    bulk_g2s_1d(
+                                        meta_stage + Uint32(physical_warp) * meta_stage_words,
+                                        cute.make_ptr(
+                                            Uint8,
+                                            meta_peer + Uint64(self.input_sf_words) * 4,
+                                            cute.AddressSpace.gmem, assumed_align=16),
+                                        Uint32(self.meta_sf_bytes),
+                                        meta_bar + Uint32(physical_warp))
+                                bulk_g2s_1d(
+                                    meta_stage + Uint32(physical_warp) * meta_stage_words +
+                                    Uint32(self.meta_sf_bytes // 4),
+                                    cute.make_ptr(
+                                        Uint8,
+                                        meta_peer + Uint64(self.input_weight_words) * 4,
+                                        cute.AddressSpace.gmem, assumed_align=16),
+                                    Uint32(self.meta_w_bytes),
+                                    meta_bar + Uint32(physical_warp))
+                                cute.arch.mbarrier_arrive_and_expect_tx(
+                                    meta_bar + Uint32(physical_warp),
+                                    Uint32(self.meta_bytes))
+                if physical_warp < Uint32(self.self_route_waves):
+                    scan_src = Uint32(block) + \
+                        Uint32(physical_warp) * Uint32(self.dispatch_sms)
+                    if scan_src < Uint32(self.num_ranks):
+                        scan_addr_rank = scan_src
+                        if cutlass.const_expr(self.scan_local):
+                            scan_addr_rank = rank_idx
+                        scan_peer = mapped_peer_base(peer_ptrs, scan_addr_rank,
+                                                     self.num_ranks)
+                        if elect_one_sync():
+                            bulk_g2s_1d(
+                                pull + Uint32(physical_warp) * scan_buf_words,
+                                cute.make_ptr(
+                                    Uint8,
+                                    scan_peer + Uint64(self.topk_offset_words) * 4,
+                                    cute.AddressSpace.gmem, assumed_align=16),
+                                scan_bytes, scan_bar + Uint32(physical_warp))
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                scan_bar + Uint32(physical_warp), scan_bytes)
+                for scan_k in cutlass.range_constexpr(self.self_route_waves):
+                    scan_src = Uint32(block) + Uint32(scan_k * self.dispatch_sms)
+                    scan_stop = Uint32(0)
+                    if scan_src < Uint32(self.num_ranks):
+                        cute.arch.mbarrier_wait(scan_bar + scan_k, Uint32(0))
+                        scan_stop = scan_valid
+                    scan_tab = cute.recast_ptr(
+                        pull + Uint32(scan_k) * scan_buf_words, dtype=Uint64)
+                    scan_cnt_row = scan_cnt + scan_src * Uint32(self.local_experts)
+                    scan_first = rank_idx * Uint32(self.local_experts)
+                    scan_pos = Uint32(tid)
+                    while scan_pos < scan_stop:
+                        scan_expert = Uint32(scan_tab[scan_pos])
+                        if scan_first <= scan_expert and \
+                                scan_expert < scan_first + Uint32(self.local_experts):
+                            scan_e = scan_expert - scan_first
+                            scan_slot = atom_shared_add_u32(
+                                scan_cnt_row + scan_e, Uint32(1))
+                            source_idx[(scan_e * Uint32(self.num_ranks) + scan_src) *
+                                       Uint32(self.capacity) + scan_slot] = Uint32(scan_pos)
+                        scan_pos += Uint32(self.dispatch_warps * 32)
+                if cutlass.const_expr(0 < self.pull_meta < 3):
+                    # Land the staged tables in this rank's own buffer while the
+                    # scan above runs; the rank grid barrier orders the stores
+                    # before any pull loop reads them.
+                    if physical_warp < Uint32(self.self_route_waves):
+                        meta_src = Uint32(block) + \
+                            Uint32(physical_warp) * Uint32(self.dispatch_sms)
+                        if meta_src < Uint32(self.num_ranks):
+                            cute.arch.mbarrier_wait(meta_bar + Uint32(physical_warp), Uint32(0))
+                            if elect_one_sync():
+                                if cutlass.const_expr(self.pull_meta >= 2):
+                                    bulk_s2g_1d(
+                                        signals.iterator + Uint32(self.pull_meta_sf_words) +
+                                        meta_src * Uint32(self.meta_sf_rank_words),
+                                        meta_stage + Uint32(physical_warp) * meta_stage_words,
+                                        Uint32(self.meta_sf_bytes))
+                                bulk_s2g_1d(
+                                    signals.iterator + Uint32(self.pull_meta_w_words) +
+                                    meta_src * Uint32(self.meta_w_rank_words),
+                                    meta_stage + Uint32(physical_warp) * meta_stage_words +
+                                    Uint32(self.meta_sf_bytes // 4),
+                                    Uint32(self.meta_w_bytes))
+                                cute.arch.cp_async_bulk_commit_group()
+                                cute.arch.cp_async_bulk_wait_group(0)
+                cute.arch.sync_threads()
+                # Publish the derived counts: this CTA's (source, local expert)
+                # rows plus its tagged share of the per-expert sums, so the
+                # dispatch_sms * num_ranks arrival gate still closes. One warp
+                # owns the table, so each CTA contributes exactly once.
+                if physical_warp == 0:
+                    for scan_wave in cutlass.range_constexpr((self.local_experts + 31) // 32):
+                        scan_e = Uint32(scan_wave * 32) + lane
+                        if scan_e < Uint32(self.local_experts):
+                            scan_tot = Uint32(0)
+                            for scan_k in cutlass.range_constexpr(self.self_route_waves):
+                                scan_src = Uint32(block) + Uint32(scan_k * self.dispatch_sms)
+                                if scan_src < Uint32(self.num_ranks):
+                                    scan_c = scan_cnt[scan_src * Uint32(self.local_experts) +
+                                                      scan_e]
+                                    scan_tot += scan_c
+                                    st_global_u64(
+                                        scan_rows + (scan_src * Uint32(self.local_experts) +
+                                                     scan_e) * Uint32(2),
+                                        Uint64(scan_c))
+                            atom_release_gpu_add_u64(
+                                scan_sum + scan_e * Uint32(2),
+                                (Uint64(Uint32(self.dispatch_sms) * scan_owned) << Uint64(32)) |
+                                Uint64(scan_tot))
             # Reference read_topk_idx: adjacent lanes own adjacent topk
             # entries, so one warp processes floor(32 / topk) tokens per
             # iteration. Lanes past that whole-token group stay inactive.
-            tokens_per_warp = 32 // self.topk
+            # Two tokens per warp iteration: at T=128 the old 32//topk=5
+            # chunk left warps 26..63 (CTAs 3..7) idle and piled every
+            # emission on ~3 CTAs; 2-token chunks give one chunk per warp.
+            tokens_per_warp = max(1, min(32 // self.topk, 2))
             active_route_lanes = tokens_per_warp * self.topk
             route_base = Uint32((block * self.dispatch_warps + physical_warp) *
                                 tokens_per_warp)
@@ -1694,36 +2358,426 @@ class GCMoERoleKernel:
                     expert_token_count[expert_idx] = ld_volatile_u32(
                         route_offsets + expert_idx)
             else:
-                for route_iter in cutlass.range(
-                        route_base, num_tokens, route_stride, unroll_full=True):
-                    route_base = Uint32(route_iter)
-                    route_token = route_base + Uint32(lane // self.topk)
-                    token_topk = route_base * Uint32(self.topk) + Uint32(lane)
-                    if lane < active_route_lanes and route_token < num_tokens:
-                        expert = routes[token_topk]
-                        if expert < Uint64(self.route_experts):
-                            atom_shared_add_u32(expert_token_count + Uint32(expert),
-                                                Uint32(1))
-                    cute.arch.sync_warp()
+                if cutlass.const_expr(self.push_dispatch):
+                    # Per-CTA X-order emission sequence in the idle pull region:
+                    #   seq_cnt[e]  : this CTA's instance count per global slot
+                    #   seq_pfx[i]  : prefix over dst-interleaved X positions; the
+                    #                 tail holds 32-wide chunk sums then the total
+                    #   seq_cur[e]  : scatter cursor handing out the ord_loc
+                    #   seq_list[p] : emission entry (rank_ord<<14 | route_idx)
+                    # X position of global slot e is (e % local_experts)*num_ranks +
+                    # e//local_experts so consecutive entries target different dsts
+                    # and every dst's first pair completes early.
+                    push_slots = Uint32(self.num_ranks * self.local_experts)
+                    # Seq tables sit at the pull region's tail; the head is
+                    # repurposed as per-warp TMA staging for push emission.
+                    seq_words = Uint32(4 * self.num_ranks * self.local_experts +
+                                       17 + self.capacity * self.topk)
+                    seq_cnt = pull + (Uint32(self.dispatch_warps *
+                                             self.pull_stages *
+                                             (self.pull_bytes // 4)) - seq_words)
+                    seq_pfx = seq_cnt + push_slots
+                    seq_cur = seq_pfx + push_slots + Uint32(17)
+                    seq_base = seq_cur + push_slots
+                    seq_list = seq_base + push_slots
+                if cutlass.const_expr(self.eco_trace):
+                    if elect_one_sync():
+                        self._eco_trace(signals, 54, 2)   # max: pass-1 start
+                if cutlass.const_expr(self.eco_trace):
+                    if elect_one_sync():
+                        self._eco_trace_rel(signals, 37)
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    if elect_one_sync():
+                        self._eco_trace_ring(signals, 16, True)
+                # self-route derives the routes locally, so the source emits none.
+                route_end = Uint32(0) if self.self_route else num_tokens
+                if cutlass.const_expr(self.fused_dispatch):
+                    # Fused: one pass does slot allocation + remote index write.
+                    # atom_add on the call-cleared send_count word returns the
+                    # slot and leaves the running total = this src's count.
+                    for route_iter in cutlass.range(
+                            route_base, route_end, route_stride, unroll_full=True):
+                        route_base = Uint32(route_iter)
+                        route_token = route_base + Uint32(lane // self.topk)
+                        token_topk = route_base * Uint32(self.topk) + Uint32(lane)
+                        if lane < active_route_lanes and route_token < num_tokens:
+                            expert = routes[token_topk]
+                            if expert < Uint64(self.num_ranks * self.local_experts):
+                                e32 = Uint32(expert)
+                                slot = Uint32(atom_add_u64(
+                                    send_ptr + e32 * Uint32(2), Uint64(1)))
+                                dst_rank = e32 // Uint32(self.local_experts)
+                                dst_local = e32 % Uint32(self.local_experts)
+                                dst_base = mapped_peer_base(
+                                    peer_ptrs, dst_rank, self.num_ranks)
+                                dst_index = cute.make_ptr(
+                                    Uint32,
+                                    dst_base + Uint64(SIGNAL_OFFSETS['size']) +
+                                    Uint64(((dst_local * Uint32(self.num_ranks) +
+                                             rank_idx) * Uint32(self.capacity) +
+                                            slot) * Uint32(4)),
+                                    cute.AddressSpace.gmem)
+                                dst_index[0] = token_topk
+                        cute.arch.sync_warp()
+                else:
+                    for route_iter in cutlass.range(
+                            route_base, route_end, route_stride, unroll_full=True):
+                        route_base = Uint32(route_iter)
+                        route_token = route_base + Uint32(lane // self.topk)
+                        token_topk = route_base * Uint32(self.topk) + Uint32(lane)
+                        if lane < active_route_lanes and route_token < num_tokens:
+                            expert = routes[token_topk]
+                            if expert < Uint64(self.route_experts):
+                                atom_shared_add_u32(expert_token_count + Uint32(expert),
+                                                    Uint32(1))
+                        cute.arch.sync_warp()
             if cutlass.const_expr(self.eco):
                 if lane == Uint32(0):
                     self._eco_trace(signals, 30, 2)
             cute.arch.sync_threads()
-            if cutlass.const_expr(not self.eco_route_prep):
+            if cutlass.const_expr(self.eco_trace):
+                if elect_one_sync():
+                    self._eco_trace_rel(signals, 38)
+            if cutlass.const_expr(self.eco_trace and not self.eco and
+                                  not self.push_dispatch):
+                if elect_one_sync():
+                    self._eco_trace_ring(signals, 17, True)
+            if cutlass.const_expr(not self.eco_route_prep and not self.fused_dispatch and
+                                  not self.self_route):
                 # ECO: counts and source-slot spans are per logical expert
                 for expert_iter in cutlass.range(
                         Uint32(tid), Uint32(self.route_experts),
                         self.dispatch_warps * 32, unroll_full=True):
                     expert_idx = Uint32(expert_iter)
+                    if cutlass.const_expr(self.push_dispatch):
+                        seq_cnt[expert_idx] = expert_token_count[expert_idx]
+                        seq_cur[expert_idx] = Uint32(0)
                     old_send = atom_add_u64(
                         send_ptr + expert_idx * Uint32(2),
-                        (Uint64(1) << 32) | Uint64(expert_token_count[expert_idx]))
+                        (Uint64(1) << 32) |
+                        Uint64(expert_token_count[expert_idx]))
                     expert_token_count[expert_idx] = Uint32(old_send)
+                    if cutlass.const_expr(self.push_dispatch):
+                        seq_base[expert_idx] = Uint32(old_send)
             cute.arch.sync_threads()
+            if cutlass.const_expr(self.push_dispatch):
+                if cutlass.const_expr(self.eco_trace):
+                    if elect_one_sync():
+                        self._eco_trace(signals, 50, 2)   # max: pass-1+publish done
+                # deepEP dispatch: publish this CTA's per-(slot, src) counts
+                # straight into every destination's banked slot table — the dst
+                # sums them into task shapes; no count matrix broadcast, no
+                # grid_sync on the data path. All call-ordered writes are
+                # gated on the dst's call epoch so its footer clears are safe.
+                num_slots = Uint32(self.num_ranks * self.local_experts)
+                dep_base_off = Uint64(SIGNAL_OFFSETS['size'])
+                # No cross-call gate: real forwards run attention/gate work
+                # between MoE calls, so the previous call has long retired
+                # every destination before this one starts writing.
+                if cutlass.const_expr(self.eco_trace):
+                    if elect_one_sync():
+                        self._eco_trace(signals, 52, 2)   # max: epoch gate done
+                if cutlass.const_expr(self.eco_trace):
+                    if elect_one_sync():
+                        self._eco_trace(signals, 53, 2)
+                        self._eco_trace(signals, 44, 2)   # max: epoch gate passed
+                # X-order emission list while count traffic is in flight:
+                # chunk sums over X positions, chunk offsets, per-position
+                # prefixes, then scatter each route entry into its sorted
+                # place. Needs only this CTA's own routing results.
+                seq_chunks = Uint32((num_slots + 31) // 32)
+                for c_iter in cutlass.range(
+                        Uint32(tid), seq_chunks,
+                        self.dispatch_warps * 32, unroll_full=True):
+                    chunk_sum = Uint32(0)
+                    for j_iter in cutlass.range_constexpr(32):
+                        x_idx = c_iter * Uint32(32) + Uint32(j_iter)
+                        if x_idx < num_slots:
+                            x_slot = (x_idx % Uint32(self.num_ranks)) * \
+                                Uint32(self.local_experts) + \
+                                x_idx // Uint32(self.num_ranks)
+                            chunk_sum += Uint32(seq_cnt[x_slot])
+                    seq_pfx[num_slots + c_iter] = chunk_sum
+                cute.arch.sync_threads()
+                if tid == Uint32(0):
+                    chunk_run = Uint32(0)
+                    for c_iter in cutlass.range(
+                            Uint32(0), seq_chunks, 1, unroll_full=False):
+                        chunk_v = Uint32(seq_pfx[num_slots + c_iter])
+                        seq_pfx[num_slots + c_iter] = chunk_run
+                        chunk_run += chunk_v
+                    seq_pfx[num_slots + seq_chunks] = chunk_run
+                cute.arch.sync_threads()
+                for i_iter in cutlass.range(
+                        Uint32(tid), num_slots,
+                        self.dispatch_warps * 32, unroll_full=True):
+                    pfx_run = Uint32(seq_pfx[num_slots +
+                                           (i_iter >> Uint32(5))])
+                    for j_iter in cutlass.range(
+                            i_iter & ~Uint32(31), i_iter, 1, unroll_full=False):
+                        j_slot = (j_iter % Uint32(self.num_ranks)) * \
+                            Uint32(self.local_experts) + \
+                            j_iter // Uint32(self.num_ranks)
+                        pfx_run += Uint32(seq_cnt[j_slot])
+                    seq_pfx[i_iter] = pfx_run
+                cute.arch.sync_threads()
+                route_base = Uint32((block * self.dispatch_warps +
+                                     physical_warp) * tokens_per_warp)
+                for s_iter in cutlass.range(
+                        route_base, num_tokens, route_stride,
+                        unroll_full=True):
+                    s_base = Uint32(s_iter)
+                    s_token = s_base + Uint32(lane // self.topk)
+                    s_tt = s_base * Uint32(self.topk) + Uint32(lane)
+                    if lane < active_route_lanes and s_token < num_tokens:
+                        s_e = Uint32(routes[s_tt])
+                        if s_e < num_slots:
+                            s_ord = atom_shared_add_u32(seq_cur + s_e,
+                                                        Uint32(1))
+                            # rank-level row inside the pair window =
+                            # publish base + this CTA's local ordinal.
+                            s_rord = Uint32(seq_base[s_e]) + s_ord
+                            s_x = (s_e % Uint32(self.local_experts)) * \
+                                Uint32(self.num_ranks) + \
+                                s_e // Uint32(self.local_experts)
+                            seq_list[Uint32(seq_pfx[s_x]) + s_ord] = \
+                                (s_rord << Uint32(14)) | s_tt
+                cute.arch.sync_threads()
+                if cutlass.const_expr(self.eco_trace):
+                    if elect_one_sync():
+                        self._eco_trace(signals, 45, 2)   # max: last warp finished seq build
+                # Emission walks the CTA's pair-major X-order list; each
+                # instance's pool row is fixed — (local, src) pair window base
+                # + rank ordinal — so nothing remote is needed before the
+                # stores: the epoch gate above already guarantees the
+                # destination retired the previous call.
+                own_base = mapped_peer_base(peer_ptrs, rank_idx, self.num_ranks)
+                cta_total = Uint32(seq_pfx[num_slots + seq_chunks])
+                if cutlass.const_expr(self.eco_trace):
+                    if elect_one_sync():
+                        self._eco_trace(signals, 55, 2)   # max: last warp enters emission
+                # Emission partition: TMA staging fits only push_emit_warps
+                # warps; the rest idle (their positions would collide).
+                emit_begin = Int32(physical_warp)
+                emit_stride = self.dispatch_warps
+                push_emit_seq = Uint32(0)
+                # deepEP count = ready flag: every (expert, src) pair gets ONE
+                # count word on its destination, pushed by whichever source
+                # CTA completes the pair last. Empty pairs publish 0 up front.
+                finish_ptr = signals.iterator + \
+                    (SIGNAL_OFFSETS['size'] // 4 + self.push_finish)
+                ready_off = dep_base_off + \
+                    Uint64(self.dep_data_ready) * Uint64(4)
+                for z_iter in cutlass.range(
+                        Uint32(tid), Uint32(self.route_experts),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    z_e = Uint32(z_iter)
+                    if Uint32(seq_cnt[z_e]) == Uint32(0):
+                        z_prev = atom_acq_rel_gpu_add_u64(
+                            finish_ptr + z_e * Uint32(2),
+                            Uint64(1) << 32)
+                        if (z_prev >> 32) == \
+                                Uint64(self.dispatch_sms - 1):
+                            z_pair = (z_e % Uint32(self.local_experts)) * \
+                                Uint32(self.num_ranks) + rank_idx
+                            z_dst = z_e // Uint32(self.local_experts)
+                            st_release_sys_u64(cute.make_ptr(
+                                Uint64, mapped_peer_base(
+                                    peer_ptrs, z_dst, self.num_ranks) +
+                                ready_off + Uint64(z_pair) * Uint64(8),
+                                cute.AddressSpace.gmem),
+                                (z_prev & Uint64(0xffffffff)) + Uint64(1))
+                if cutlass.const_expr(self.push_tma):
+                    emit_stride = self.push_emit_warps
+                    if physical_warp >= self.push_emit_warps:
+                        emit_begin = Int32(cta_total)
+                for pos_iter in cutlass.range(
+                        emit_begin, Int32(cta_total),
+                        emit_stride, unroll_full=False):
+                    seq_e = Uint32(seq_list[Uint32(pos_iter)])
+                    rank_ord = seq_e >> Uint32(14)
+                    emit_tt = seq_e & Uint32(0x3fff)
+                    emit_e = Uint32(routes[emit_tt])
+                    if rank_ord >= Uint32(self.pair_cap):
+                        cute.printf(
+                            'dep pair overflow rank={} blk={} e={} ord={} cap={}',
+                            rank_idx, block, emit_e, rank_ord, self.pair_cap)
+                        device_trap()
+                    emit_dst = emit_e // Uint32(self.local_experts)
+                    emit_pair = (emit_e % Uint32(self.local_experts)) * \
+                        Uint32(self.num_ranks) + rank_idx
+                    pool_token = emit_pair * Uint32(self.pair_cap) + rank_ord
+                    emit_blk = pool_token // Uint32(self.block_m)
+                    emit_pos = pool_token % Uint32(self.block_m)
+                    dst_base2 = mapped_peer_base(
+                        peer_ptrs, emit_dst, self.num_ranks)
+                    src_token2 = emit_tt // Uint32(self.topk)
+                    if cutlass.const_expr(self.eco_trace):
+                        emit_t0 = read_clock64()
+                    src_act = own_base + Uint64(self.input_x_words * 4) + \
+                        Uint64(src_token2) * Uint64(self.hidden)
+                    dst_act = dst_base2 + Uint64(self.l1_x_words * 4) + \
+                        Uint64(pool_token) * Uint64(self.hidden)
+                    if cutlass.const_expr(self.push_tma):
+                        # TMA staged push (sm120 relay pattern): lane0 streams
+                        # the row through this warp's double-buffered smem
+                        # stage, then issues the remote bulk store. The
+                        # stage/barrier index pair is this warp's slice of
+                        # the idle pull region.
+                        if elect_one_sync():
+                            t_slot = push_emit_seq & Uint32(1)
+                            t_phase = (push_emit_seq >> Uint32(1)) & \
+                                Uint32(1)
+                            t_stage = pull + \
+                                Uint32(physical_warp) * Uint32(
+                                    2 * (self.pull_bytes // 4)) + \
+                                t_slot * Uint32(self.pull_bytes // 4)
+                            t_bar = pull_bar + Uint32(physical_warp) * \
+                                Uint32(2) + t_slot
+                            cute.arch.cp_async_bulk_wait_group(1, read=True)
+                            src_xp = cute.make_ptr(
+                                Uint8, src_act, cute.AddressSpace.gmem,
+                                assumed_align=16)
+                            dst_xp = cute.make_ptr(
+                                Uint8, dst_act, cute.AddressSpace.gmem,
+                                assumed_align=16)
+                            t_stage8 = cute.recast_ptr(t_stage, dtype=Uint8)
+                            bulk_g2s_1d(t_stage8, src_xp,
+                                        Uint32(self.pull_bytes), t_bar)
+                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                t_bar, self.pull_bytes)
+                            cute.arch.mbarrier_wait(t_bar, t_phase)
+                            cute.arch.fence_view_async_shared()
+                            bulk_s2g_1d(dst_xp, t_stage8,
+                                        Uint32(self.pull_bytes))
+                            cute.arch.cp_async_bulk_commit_group()
+                            push_emit_seq += Uint32(1)
+                    else:
+                        # Batched 16B vectors in two waves: each wave issues
+                        # its loads first (independent reads pipeline), then
+                        # drains the remote stores; a fused ld+st would
+                        # serialize each vector on the load latency, while
+                        # one giant batch would exceed the dispatch register
+                        # budget.
+                        for wave in cutlass.range_constexpr(2):
+                            act_vals = []
+                            for vec_k in cutlass.range_constexpr(
+                                    self.hidden // 1024):
+                                act_vals.append(ld_global_u32x4(cute.make_ptr(
+                                    Uint32,
+                                    src_act + Uint64(wave * 2560) +
+                                    Uint64(vec_k * 512) +
+                                    Uint64(lane * 16),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)))
+                            for vec_k in cutlass.range_constexpr(
+                                    self.hidden // 1024):
+                                st_global_u32x4(cute.make_ptr(
+                                    Uint32,
+                                    dst_act + Uint64(wave * 2560) +
+                                    Uint64(vec_k * 512) +
+                                    Uint64(lane * 16),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16), *act_vals[vec_k])
+                    sf_row = emit_blk * Uint32(
+                        (self.block_m + 127) // 128 * 128) + \
+                        (emit_pos & ~Uint32(127)) + \
+                        (emit_pos & Uint32(31)) * Uint32(4) + \
+                        ((emit_pos >> Uint32(5)) & Uint32(3))
+                    src_sf = signals.iterator + self.input_sf_words + \
+                        src_token2 * Uint32(self.hidden // 128)
+                    sf_cols = self.hidden // 128
+                    sf_vals = []
+                    for sf_k in cutlass.range_constexpr(
+                            (sf_cols + 31) // 32):
+                        sf_col = Uint32(lane + 32 * sf_k) % \
+                            Uint32(sf_cols)
+                        sf_vals.append(Uint32(src_sf[sf_col]))
+                    for sf_k in cutlass.range_constexpr(
+                            (sf_cols + 31) // 32):
+                        sf_col = Uint32(lane + 32 * sf_k)
+                        if sf_col < Uint32(sf_cols):
+                            dst_sf_word = dst_base2 + Uint64(
+                                self.l1_sf_words * 4) + \
+                                (sf_col * Uint32(self.sf_ring_tokens) +
+                                 sf_row) * Uint64(4)
+                            cute.make_ptr(
+                                Uint32, dst_sf_word,
+                                cute.AddressSpace.gmem)[0] = \
+                                sf_vals[sf_k]
+                    if lane == Uint32(0):
+                        dst_weight = dst_base2 + Uint64(
+                            self.l1_weight_words * 4) + \
+                            Uint64(pool_token) * Uint64(4)
+                        cute.make_ptr(
+                            Uint32, dst_weight,
+                            cute.AddressSpace.gmem)[0] = signals[
+                                self.input_weight_words + emit_tt]
+                        meta_ptr = dst_base2 + Uint64(
+                            self.metadata_words * 4) + \
+                            Uint64(pool_token) * Uint64(12)
+                        cute.make_ptr(Uint32, meta_ptr,
+                                      cute.AddressSpace.gmem)[0] = rank_idx
+                        cute.make_ptr(Uint32, meta_ptr + Uint64(4),
+                                      cute.AddressSpace.gmem)[0] = src_token2
+                        cute.make_ptr(Uint32, meta_ptr + Uint64(8),
+                                      cute.AddressSpace.gmem)[0] = \
+                            emit_tt % Uint32(self.topk)
+                    if cutlass.const_expr(self.eco_trace):
+                        if lane == Uint32(0):
+                            atom_add_u64(
+                                signals.iterator +
+                                (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4 +
+                                48 * 2,
+                                Uint64(read_clock64() - emit_t0))
+                            atom_add_u64(
+                                signals.iterator +
+                                (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4 +
+                                49 * 2, Uint64(1))
+                    if cutlass.const_expr(self.push_tma):
+                        # Reconverge before the next iteration's
+                        # elect_one_sync: the elected lane may still be
+                        # inside mbarrier_wait while peers run ahead.
+                        cute.arch.sync_warp()
+                    # deepEP chain: this token's release bump carries its data
+                    # into the pair's finish counter; the CTA that retires the
+                    # last token of a pair publishes the pair count (count =
+                    # data-ready flag), which is what the destination polls.
+                    if lane == Uint32(0):
+                        atom_release_gpu_add_u64(
+                            finish_ptr + emit_e * Uint32(2), Uint64(1))
+                        rem = atom_shared_add_u32(
+                            seq_cur + emit_e, Uint32(0xffffffff))
+                        if rem == Uint32(1):
+                            fin_prev = atom_acq_rel_gpu_add_u64(
+                                finish_ptr + emit_e * Uint32(2),
+                                Uint64(1) << 32)
+                            if (fin_prev >> 32) == \
+                                    Uint64(self.dispatch_sms - 1):
+                                # Per-(expert, src) count word: the pair total
+                                # + 1 (0 = not ready).
+                                emit_pair_dst = \
+                                    (emit_e % Uint32(self.local_experts)) * \
+                                    Uint32(self.num_ranks) + rank_idx
+                                st_release_sys_u64(cute.make_ptr(
+                                    Uint64, dst_base2 + ready_off +
+                                    Uint64(emit_pair_dst) * Uint64(8),
+                                    cute.AddressSpace.gmem),
+                                    (fin_prev & Uint64(0xffffffff)) + Uint64(1))
+                if cutlass.const_expr(self.push_tma):
+                    cute.arch.cp_async_bulk_wait_group(0)
+                    global_async_proxy_fence()
+                if cutlass.const_expr(self.eco_trace):
+                    if elect_one_sync():
+                        self._eco_trace_ring(signals, 4, True)   # field 4: last warp finished emission
+                current_expert = Int32(self.local_experts)
             route_base = Uint32((block * self.dispatch_warps + physical_warp) *
                                 tokens_per_warp)
+            pass2_end = route_base if (self.push_dispatch or self.fused_dispatch or
+                                       self.self_route) else num_tokens
             for route_iter in cutlass.range(
-                    route_base, num_tokens, route_stride, unroll_full=True):
+                    route_base, pass2_end, route_stride, unroll_full=True):
                 route_base = Uint32(route_iter)
                 route_token = route_base + Uint32(lane // self.topk)
                 token_topk = route_base * Uint32(self.topk) + Uint32(lane)
@@ -1811,15 +2865,53 @@ class GCMoERoleKernel:
                             atom_sys_add_u64(remote_sum, status)
                     if tid == 0:
                         self._eco_trace(signals, 40, 0)
-            grid_sync(signals, Uint32(block), Uint32(tid), self.dispatch_sms, 0)
-            if cutlass.const_expr(not self.eco):
-                if block == 0:
-                    for expert_iter in cutlass.range(
-                            Uint32(tid), Uint32(self.num_ranks * self.local_experts),
-                            self.dispatch_warps * 32, unroll_full=True):
-                        expert_idx = Uint32(expert_iter)
-                        dst_rank = expert_idx // Uint32(self.local_experts)
-                        dst_local = expert_idx % Uint32(self.local_experts)
+            if cutlass.const_expr(not self.push_dispatch):
+                if cutlass.const_expr(not self.no_gridsync):
+                    grid_sync(signals, Uint32(block), Uint32(tid), self.dispatch_sms, 0)
+            if cutlass.const_expr(self.eco_trace and not self.eco and
+                                  not self.push_dispatch):
+                if block == 0 and tid == 0:
+                    self._eco_trace_ring(signals, 18, False)
+            if cutlass.const_expr(self.eco_trace):
+                if elect_one_sync():
+                    self._eco_trace_rel(signals, 39)
+            if cutlass.const_expr(not self.eco and not self.push_dispatch and
+                                  not self.self_route):
+                # Spread the per-(source, expert) count publish over all
+                # dispatch CTAs: CTA b owns a contiguous expert chunk, so the
+                # remote count stores/reductions leave block0's warps.
+                pub_chunk = (self.num_ranks * self.local_experts +
+                             self.dispatch_sms - 1) // self.dispatch_sms
+                pub_base = Uint32(block) * Uint32(pub_chunk)
+                pub_total = Uint32(self.num_ranks * self.local_experts)
+                if cutlass.const_expr(self.xorder):
+                    # xo_smem carries the per-dst heat table [R*L] int32:
+                    # position p -> round j = p/R, offset k = p%R ->
+                    # dst = (phase + k) % R, local expert = table[dst*L + j].
+                    # phase = rank+1 spreads the R sources over all dsts each
+                    # round while every src still emits each dst's experts in
+                    # the same per-dst order, so dst consumption is unchanged.
+                    xo_r = Uint32(self.num_ranks)
+                    xo_l = Uint32(self.local_experts)
+                    xo_phase = rank_idx + Uint32(1) if self.xorder_rot else Uint32(1)
+                for expert_iter in cutlass.range(
+                        Uint32(tid), Uint32(pub_chunk),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    pos = pub_base + Uint32(expert_iter)
+                    if pos < pub_total:
+                        if cutlass.const_expr(self.xorder):
+                            xo_j = pos // xo_r
+                            xo_k = pos - xo_j * xo_r
+                            xo_dst = xo_phase + xo_k
+                            xo_dst = xo_dst - xo_r if xo_dst >= xo_r else xo_dst
+                            xo_local = xo_smem[Uint32(xo_dst * xo_l + xo_j)]
+                            expert_idx = xo_dst * xo_l + xo_local
+                            dst_rank = xo_dst
+                            dst_local = xo_local
+                        else:
+                            expert_idx = pos
+                            dst_rank = expert_idx // Uint32(self.local_experts)
+                            dst_local = expert_idx % Uint32(self.local_experts)
                         dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
                         status = ld_global_u64(
                             signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4 +
@@ -1830,33 +2922,119 @@ class GCMoERoleKernel:
                             Uint64((rank_idx * Uint32(self.local_experts) + dst_local) *
                                    Uint32(8)), cute.AddressSpace.gmem,
                             assumed_align=8)
-                        st_global_u64(remote_count, status & Uint64(0xffffffff))
-                    # The grid acquire carries all route writes. Transfer
-                    # them, plus every per-rank count store,
-                    # to every publisher before the system release fence.
-                    cute.arch.sync_threads()
-                    fence_acq_rel_sys()
-                    for expert_iter in cutlass.range(
-                            Uint32(tid), Uint32(self.num_ranks * self.local_experts),
-                            self.dispatch_warps * 32, unroll_full=True):
-                        expert_idx = Uint32(expert_iter)
-                        dst_rank = expert_idx // Uint32(self.local_experts)
-                        dst_local = expert_idx % Uint32(self.local_experts)
+                        if cutlass.const_expr(not self.shard_counts):
+                            st_global_u64(remote_count, status & Uint64(0xffffffff))
+                # The grid acquire carries all route writes. Each thread's
+                # release-scoped reduction orders its own count store first.
+                cute.arch.sync_threads()
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    if block == 0 and tid == 0:
+                        self._eco_trace_ring(signals, 19, False)
+                for expert_iter in cutlass.range(
+                        Uint32(tid), Uint32(pub_chunk),
+                        self.dispatch_warps * 32, unroll_full=True):
+                    pos = pub_base + Uint32(expert_iter)
+                    if pos < pub_total:
+                        if cutlass.const_expr(self.xorder):
+                            xo_j = pos // xo_r
+                            xo_k = pos - xo_j * xo_r
+                            xo_dst = xo_phase + xo_k
+                            xo_dst = xo_dst - xo_r if xo_dst >= xo_r else xo_dst
+                            xo_local = xo_smem[Uint32(xo_dst * xo_l + xo_j)]
+                            expert_idx = xo_dst * xo_l + xo_local
+                            dst_rank = xo_dst
+                            dst_local = xo_local
+                        else:
+                            expert_idx = pos
+                            dst_rank = expert_idx // Uint32(self.local_experts)
+                            dst_local = expert_idx % Uint32(self.local_experts)
                         dst_base = mapped_peer_base(peer_ptrs, dst_rank, self.num_ranks)
                         status = ld_global_u64(
                             signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4 +
                             expert_idx * Uint32(2))
-                        remote_sum = cute.make_ptr(
-                            Uint64, dst_base + Uint64(SIGNAL_OFFSETS['expert_recv_count_sum']) +
-                            Uint64(gen * Uint32(self.local_experts * 8)) +
-                            Uint64(dst_local * Uint32(8)),
-                            cute.AddressSpace.gmem, assumed_align=8)
-                        atom_sys_add_u64(remote_sum, status)
+                        if cutlass.const_expr(self.shard_counts):
+                            # Sharded sums: the tagged count lands in this
+                            # src's own recv_count slot (one release atomic
+                            # per (src, dst_local) — no count_sum contention);
+                            # block0 gather-sums the shards into count_sum.
+                            remote_sum = cute.make_ptr(
+                                Uint64, dst_base + Uint64(SIGNAL_OFFSETS['expert_recv_count']) +
+                                Uint64(gen * Uint32(self.num_ranks * self.local_experts * 8)) +
+                                Uint64((rank_idx * Uint32(self.local_experts) + dst_local) *
+                                       Uint32(8)), cute.AddressSpace.gmem,
+                                assumed_align=8)
+                        else:
+                            remote_sum = cute.make_ptr(
+                                Uint64, dst_base + Uint64(SIGNAL_OFFSETS['expert_recv_count_sum']) +
+                                Uint64(gen * Uint32(self.local_experts * 8)) +
+                                Uint64(dst_local * Uint32(8)),
+                                cute.AddressSpace.gmem, assumed_align=8)
+                        if cutlass.const_expr(self.fused_dispatch):
+                            # Fused counters hold the raw per-src count in the
+                            # low word; restate the dispatch_sms arrival tag the
+                            # two-pass merge used to accumulate.
+                            status = (Uint64(self.dispatch_sms) << Uint64(32)) | \
+                                (status & Uint64(0xffffffff))
+                        red_release_sys_add_u64(remote_sum, status)
                 cute.arch.sync_threads()
-                # Each per-expert acquire below imports every rank's route/count
-                # stores, replacing the dispatch rank barrier. Include zero-token
-                # experts: this join orders prior combine reads before new FC2
-                # stores, and generation N's clear before N+2 can publish.
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    if block == 0 and tid == 0:
+                        self._eco_trace_ring(signals, 29, False)
+                if cutlass.const_expr(self.shard_counts):
+                    # Sharded-count gather: block0's warps each own local
+                    # experts (strided by dispatch_warps) and sum that
+                    # expert's num_ranks tagged recv_count slots — one
+                    # release atomic per src, so the slots land at
+                    # plain-store speed with no count_sum contention.  The
+                    # total is published to count_sum in the identical
+                    # (num_ranks*dispatch_sms)<<32|total format, so every
+                    # downstream consumer is unchanged.  The tag poll spins
+                    # without a clock+trap timeout: every src publishes all
+                    # R*L positions, so a missing tag means a real bug, and a
+                    # timeout probe inside this loop miscompiled (IMA).
+                    if block == Uint32(0):
+                        gather_recv = signals.iterator + \
+                            SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
+                            gen * Uint32(self.num_ranks * self.local_experts * 2)
+                        gather_sum = signals.iterator + \
+                            SIGNAL_OFFSETS['expert_recv_count_sum'] // 4 + \
+                            gen * Uint32(self.local_experts * 2)
+                        gather_warp = Uint32(tid) // Uint32(32)
+                        gather_expert = gather_warp
+                        while gather_expert < Uint32(self.local_experts):
+                            gather_total = Uint64(0)
+                            gather_chunk = Uint32(0)
+                            while gather_chunk < Uint32(self.num_ranks):
+                                gather_src = gather_chunk + Uint32(lane)
+                                gather_low = Uint32(0)
+                                if gather_src < Uint32(self.num_ranks):
+                                    gather_slot = gather_recv + (
+                                        gather_src * Uint32(self.local_experts) +
+                                        gather_expert) * Uint32(2)
+                                    gather_val = ld_volatile_u64(gather_slot)
+                                    while Uint32(gather_val >> 32) != Uint32(
+                                            self.dispatch_sms):
+                                        gather_val = ld_volatile_u64(gather_slot)
+                                    gather_val = ld_acquire_sys_u64(gather_slot)
+                                    gather_low = Uint32(gather_val)
+                                gather_total += Uint64(cute.arch.warp_redux_sync(
+                                    gather_low, 'add'))
+                                gather_chunk += Uint32(32)
+                            if lane == Uint32(0):
+                                red_release_sys_add_u64(
+                                    gather_sum + gather_expert * Uint32(2),
+                                    (Uint64(self.num_ranks * self.dispatch_sms) <<
+                                     Uint64(32)) | gather_total)
+                            gather_expert += Uint32(self.dispatch_warps)
+            if cutlass.const_expr(self.eco_trace):
+                if elect_one_sync():
+                    self._eco_trace_rel(signals, 40)
+            # Each per-expert acquire below imports every rank's route/count
+            # stores, replacing the dispatch rank barrier. Include zero-token
+            # experts: this join orders prior combine reads before new FC2
+            # stores, and generation N's clear before N+2 can publish.
             if cutlass.const_expr(self.eco):
                 if block == 0 and tid == 0:
                     self._eco_trace(signals, 36, 0)
@@ -1909,49 +3087,70 @@ class GCMoERoleKernel:
                     if tid == Uint32(0):
                         self._eco_trace(signals, 32, 0)
                 eco_fixed_tokens = cute.arch.warp_redux_sync(lane_tokens, 'add')
-            else:
+            elif cutlass.const_expr(not self.push_dispatch):
                 for wave in cutlass.range_constexpr(
                         (self.local_experts + 31) // 32):
                     expert_idx = Uint32(wave * 32) + lane
                     observed = Uint64(0)
                     if expert_idx < Uint32(self.local_experts):
-                        wait_start = read_clock64()
-                        while Uint32(observed >> 32) != Uint32(
-                                self.dispatch_sms * self.num_ranks):
-                            observed = ld_volatile_u64(
-                                recv_ptr + expert_idx * Uint32(2))
-                            if Uint64(read_clock64() - wait_start) >= Uint64(
-                                    self.nvlink_timeout_secs * 2000000000):
-                                if block == Uint32(0):
-                                    cute.printf(
-                                        'GC recv-count timeout role=1 rank={} expert={} gen={} observed_hi={} expected={}',
-                                        rank_idx, expert_idx, gen, Uint32(observed >> 32),
-                                        self.dispatch_sms * self.num_ranks)
-                                device_trap()
-                        observed = ld_acquire_sys_u64(
-                            recv_ptr + expert_idx * Uint32(2))
+                        if cutlass.const_expr(not (self.xo_lazy_pull or self.prog_native)):
+                            # x-order pool: lane position is a hot-order slot;
+                            # the count to wait on belongs to its mapped expert.
+                            poll_expert = expert_idx
+                            if cutlass.const_expr(self.xorder_pool):
+                                poll_expert = Uint32(xo_smem[Uint32(
+                                    rank_idx * Uint32(self.local_experts) + expert_idx)])
+                            wait_start = read_clock64()
+                            while Uint32(observed >> 32) != Uint32(
+                                    self.dispatch_sms * self.num_ranks):
+                                observed = ld_volatile_u64(
+                                    recv_ptr + poll_expert * Uint32(2))
+                                if Uint64(read_clock64() - wait_start) >= Uint64(
+                                        self.nvlink_timeout_secs * 2000000000):
+                                    if block == Uint32(0):
+                                        cute.printf(
+                                            'GC recv-count timeout role=1 rank={} expert={} gen={} observed_hi={} expected={}',
+                                            rank_idx, poll_expert, gen, Uint32(observed >> 32),
+                                            self.dispatch_sms * self.num_ranks)
+                                    device_trap()
+                            observed = ld_acquire_sys_u64(
+                                recv_ptr + poll_expert * Uint32(2))
                     expert_counts[wave] = Uint32(observed)
             cute.arch.sync_warp()
             if cutlass.const_expr(self.eco_trace):
                 if elect_one_sync():
                     self._eco_trace_ring(signals, 12, True)   # field 12: last dispatch warp holds this rank's counts
 
-            if block == Uint32(0) and physical_warp == Uint32(0):
-                own_pool_blocks = Uint32(0)
-                for wave in cutlass.range_constexpr(
-                        (self.local_experts + 31) // 32):
-                    own_pool_blocks += (expert_counts[wave] +
-                                        Uint32(self.block_m - 1)) // Uint32(self.block_m)
-                total_pool_blocks = cute.arch.warp_redux_sync(own_pool_blocks, 'add')
-                if lane == Uint32(0):
-                    signals[SIGNAL_OFFSETS['routed_pool_blocks'] // 4] = total_pool_blocks
+            if cutlass.const_expr(not self.push_dispatch):
+                if block == Uint32(0) and physical_warp == Uint32(0):
+                    if cutlass.const_expr(not (self.xo_lazy_pull or self.prog_native)):
+                        own_pool_blocks = Uint32(0)
+                        for wave in cutlass.range_constexpr(
+                                (self.local_experts + 31) // 32):
+                            own_pool_blocks += (expert_counts[wave] +
+                                                Uint32(self.block_m - 1)) // Uint32(self.block_m)
+                        total_pool_blocks = cute.arch.warp_redux_sync(own_pool_blocks, 'add')
+                        if lane == Uint32(0):
+                            signals[SIGNAL_OFFSETS['routed_pool_blocks'] // 4] = total_pool_blocks
 
+            if cutlass.const_expr(self.pull_after_shared):
+                # time separation: the pull starts only after every shared block
+                # on this rank finished, so the shared phase runs in a quiet window
+                pa_ptr = signals.iterator + SIGNAL_OFFSETS['expert_send_count'] // 4 + \
+                    SHARED_DONE_WORD
+                if tid == Uint32(0):
+                    while ld_acquire_gpu_u32(pa_ptr) < Uint32(self.shared_l2_tasks):
+                        pass
+                cute.arch.sync_threads()
             # One global warp cursor traverses concatenated, unpadded expert
             # tokens; the pool-block prefix advances by each expert's padded
             # M-block count. Only the TMA and final L1 release elect a lane.
             token_idx = Uint32(block) * Uint32(self.dispatch_warps) + Uint32(physical_warp)
             current_expert = Int32(-1)
             cached_rank_expert = Int32(-1)
+            # x-order pool: the cursor walks hot positions; cur_expert is the
+            # real dst-local expert id used for count/index row lookups.
+            cur_expert = Uint32(0)
             expert_start = Uint32(0)
             expert_end = Uint32(0)
             pool_block_offset = Uint32(0)
@@ -1991,18 +3190,34 @@ class GCMoERoleKernel:
                                         eco_num_fixed, expert_counts, lane,
                                         expert_starts)
                     eco_plan_loaded = Uint32(1)
-            current_expert, expert_start, expert_end, pool_block_offset = \
-                advance_expert(
-                    expert_counts, token_idx, current_expert, expert_start,
-                    expert_end, pool_block_offset, lane, self.local_experts,
-                    self.block_m)
+            if cutlass.const_expr(self.push_dispatch):
+                current_expert = Int32(self.local_experts)
+            elif cutlass.const_expr(self.xo_lazy_pull or self.prog_native):
+                current_expert, expert_start, expert_end, pool_block_offset = \
+                    advance_expert_xo(
+                        expert_counts, token_idx, current_expert, expert_start,
+                        expert_end, pool_block_offset, lane, self.local_experts,
+                        self.block_m, recv_ptr,
+                        tensor_maps if tensor_maps is not None else expert_counts,
+                        rank_idx * Uint32(self.local_experts),
+                        self.dispatch_sms, self.num_ranks,
+                        self.nvlink_timeout_secs, self.prog_native)
+            else:
+                current_expert, expert_start, expert_end, pool_block_offset = \
+                    advance_expert(
+                        expert_counts, token_idx, current_expert, expert_start,
+                        expert_end, pool_block_offset, lane, self.local_experts,
+                        self.block_m)
             eco_peel_start = Uint32(0)
             eco_canon_rank = rank_idx
             eco_canon_slot = Uint32(0)
             eco_idx_ptr = source_idx.iterator
             slot_total = Uint32(0)
-            if cutlass.const_expr(self.pull_chunks == 1 and
-                                  self.pull_stages == 2 and self.pull_pipe):
+            if cutlass.const_expr(self.no_pull):
+                current_expert = Int32(self.local_experts)
+            elif cutlass.const_expr(not self.push_dispatch and
+                                    self.pull_chunks == 1 and
+                                    self.pull_stages == 2 and self.pull_pipe):
                 self._pull_pipeline(
                     signals, peer_ptrs, source_idx, tensor_maps, pull, pull_bar,
                     rank_idx, lane, gen, physical_warp, token_idx,
@@ -2010,9 +3225,27 @@ class GCMoERoleKernel:
                     stored_rank_count, expert_counts, expert_starts, eco_canons,
                     eco_fixed_tokens, eco_num_fixed, eco_epoch, eco_plan_loaded)
                 current_expert = Int32(self.local_experts)
+                if block == Uint32(0) and physical_warp == Uint32(0):
+                    if cutlass.const_expr(self.xo_lazy_pull or self.prog_native):
+                        own_pool_blocks = Uint32(0)
+                        for wave in cutlass.range_constexpr(
+                                (self.local_experts + 31) // 32):
+                            own_pool_blocks += (expert_counts[wave] +
+                                                Uint32(self.block_m - 1)) // Uint32(self.block_m)
+                        total_pool_blocks = cute.arch.warp_redux_sync(own_pool_blocks, 'add')
+                        if lane == Uint32(0):
+                            signals[SIGNAL_OFFSETS['routed_pool_blocks'] // 4] = total_pool_blocks
+            if cutlass.const_expr(self.eco_trace and not self.eco and
+                                  not self.push_dispatch):
+                if elect_one_sync():
+                    self._eco_trace_ring(signals, 20, True)
             while current_expert < Int32(self.local_experts):
                 if cached_rank_expert != current_expert:
                     cached_rank_expert = current_expert
+                    cur_expert = Uint32(current_expert)
+                    if cutlass.const_expr(self.xorder_pool):
+                        cur_expert = Uint32(xo_smem[Uint32(
+                            rank_idx * Uint32(self.local_experts) + Uint32(current_expert))])
                     if cutlass.const_expr(self.eco):
                         # The plan kernel materializes replica slots' per-source counts into the
                         # native receive-count rows, so every slot reads counts identically.
@@ -2056,7 +3289,7 @@ class GCMoERoleKernel:
                                 SIGNAL_OFFSETS['expert_recv_count'] // 4 + \
                                 gen * Uint32(self.num_ranks * self.local_experts * 2) + \
                                 (source_rank * Uint32(self.local_experts) +
-                                 Uint32(current_expert)) * Uint32(2)
+                                 cur_expert) * Uint32(2)
                             if cutlass.const_expr(self.eco and self.eco_recv_counts == 0):
                                 if Uint32(current_expert) >= eco_num_fixed:
                                     stored_rank_count[wave] = self._eco_table_count(
@@ -2154,7 +3387,7 @@ class GCMoERoleKernel:
                     token_topk = Uint32(eco_idx_ptr[
                         Uint32(src_rank) * Uint32(self.capacity) + src_slot])
                 else:
-                    token_topk = source_idx[(Uint32(current_expert) * Uint32(self.num_ranks) +
+                    token_topk = source_idx[(cur_expert * Uint32(self.num_ranks) +
                                              src_rank) * Uint32(self.capacity) + src_slot]
                 if cutlass.const_expr(self.eco_spec):
                     token_topk = min(token_topk, Uint32(self.num_tokens) * Uint32(self.topk) - Uint32(1))
@@ -2176,7 +3409,13 @@ class GCMoERoleKernel:
                         pass
                 if cutlass.const_expr(self.eco and self.eco_trace):
                     pt3 = read_globaltimer()
-                src_base = mapped_peer_base(peer_ptrs, src_rank, self.num_ranks)
+                # Timing probe 5 (output wrong): identical pull work, but every
+                # source address resolves to this rank's own buffer — isolates
+                # cross-rank fabric traffic from the same bytes read locally.
+                src_addr_rank = src_rank
+                if cutlass.const_expr(self.pull_meta == 5):
+                    src_addr_rank = rank_idx
+                src_base = mapped_peer_base(peer_ptrs, src_addr_rank, self.num_ranks)
                 src_x = cute.make_ptr(
                     Uint32, src_base + Uint64(self.input_x_words * 4) +
                     Uint64(src_token) * Uint64(self.hidden),
@@ -2194,6 +3433,9 @@ class GCMoERoleKernel:
                         if token_idx >= eco_fixed_tokens and token_idx < eco_fixed_tokens + \
                                 Uint32(self.dispatch_sms * self.dispatch_warps):
                             self._eco_trace_ring(signals, 13, True)
+                    if cutlass.const_expr(self.eco_trace and not self.eco and
+                                          not self.push_dispatch):
+                        self._eco_trace_ring(signals, 21, True)
                     for chunk in cutlass.range_constexpr(self.pull_chunks):
                         byte_words = chunk * (self.pull_bytes // 4)
                         bulk_g2s_1d(warp_pull, src_x + byte_words,
@@ -2270,6 +3512,9 @@ class GCMoERoleKernel:
                 if cutlass.const_expr(self.eco and self.eco_trace):
                     pt5 = read_globaltimer()
                 if elect_one_sync():
+                    if cutlass.const_expr(self.eco_trace and not self.eco and
+                                          not self.push_dispatch):
+                        self._eco_trace_ring(signals, 22, True)
                     signals[self.l1_weight_words + pool_token % self.ring_tokens] = weight
                     signals[self.metadata_words + pool_token * 3] = src_rank
                     signals[self.metadata_words + pool_token * 3 + 1] = src_token
@@ -2278,17 +3523,27 @@ class GCMoERoleKernel:
                     # it, store the chunk, then publish W1 after S2G finishes.
                     cute.arch.mbarrier_wait(warp_bar, pull_phase)
                     pull_phase ^= Uint32(1)
+                    if cutlass.const_expr(self.eco_trace and not self.eco and
+                                          not self.push_dispatch):
+                        self._eco_trace_ring(signals, 23, True)
                     final_byte_words = (self.pull_chunks - 1) * (self.pull_bytes // 4)
                     bulk_s2g_1d(dst_x + final_byte_words, warp_pull,
                                  Uint32(self.pull_bytes))
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0)
+                    if cutlass.const_expr(self.eco_trace and not self.eco and
+                                          not self.push_dispatch):
+                        self._eco_trace_ring(signals, 24, True)
                     is_last_token = token_idx == expert_end - Uint32(1)
                     full_increment = Uint32(self.block_m) - (pull_token % self.block_m) \
                         if is_last_token else Uint32(1)
                     red_release_gpu_add_u32(
                         signals.iterator + SIGNAL_OFFSETS['l1_full_count'] // 4 + ring_block,
                         Uint32(full_increment))
+                    if cutlass.const_expr(self.eco_trace and not self.eco and
+                                          not self.push_dispatch):
+                        self._eco_trace_ring(signals, 25, True)
+                        self._eco_trace_ring(signals, 26, True)
                     if cutlass.const_expr(self.eco and self.eco_trace):
                         if token_idx >= eco_fixed_tokens and token_idx < eco_fixed_tokens + \
                                 Uint32(self.dispatch_sms * self.dispatch_warps):
@@ -2320,10 +3575,18 @@ class GCMoERoleKernel:
                         expert_counts, token_idx, current_expert, expert_start,
                         expert_end, pool_block_offset, lane, self.local_experts,
                         self.block_m)
+            if cutlass.const_expr(self.eco_trace and not self.eco and
+                                  not self.push_dispatch):
+                if elect_one_sync():
+                    self._eco_trace_ring(signals, 27, True)
             if cutlass.const_expr(self.eco_trace):
                 if elect_one_sync():
                     self._eco_trace(signals, 8, 2)
                     self._eco_trace_ring(signals, 6, True)
+            if cutlass.const_expr(self.eco_trace and not self.eco and
+                                  not self.push_dispatch):
+                if elect_one_sync():
+                    self._eco_trace_ring(signals, 28, True)
             if cutlass.const_expr(self.eco_combine_exact == 1):
                 self._eco_route_peers(signals, tensor_maps, routes, rank_idx, num_tokens, lane,
                                       Uint32(block * self.dispatch_warps + physical_warp), gen, eco_epoch)
@@ -2354,6 +3617,11 @@ class GCMoERoleKernel:
                     prefetch_tensormap(tensor_map_19.iterator)
                     prefetch_tensormap(tensor_map_20.iterator)
                     prefetch_tensormap(tensor_map_21.iterator)
+            if physical_warp == 0:
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    if elect_one_sync():
+                        self._eco_trace_ring(signals, 15, True)
             smem = cutlass.utils.SmemAllocator()
             slab = cute.recast_ptr(
                 smem.allocate(self.shared_layout.field_end, 1024), dtype=Uint8)
@@ -2372,7 +3640,13 @@ class GCMoERoleKernel:
             accum_empty = cute.recast_ptr(slab + self.shared_layout.accum_empty, dtype=Uint64)
             tptr = cute.recast_ptr(slab + self.shared_layout.tmem_ptr, dtype=Uint32)
             cta_rank, _, _ = cute.arch.block_in_cluster_idx()
-            self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane))
+            if cutlass.const_expr(self.eco_trace and not self.eco and not self.push_dispatch):
+                if physical_warp == 0 and elect_one_sync():
+                    self._eco_trace_ring(signals, 32, True)
+            self._initialize_shared_storage(slab, Uint32(physical_warp), Uint32(lane), signals)
+            if cutlass.const_expr(self.eco_trace and not self.eco and not self.push_dispatch):
+                if physical_warp == 0 and elect_one_sync():
+                    self._eco_trace_ring(signals, 34, True)
             # Warpgroup-uniform deallocation/allocation. The first WG
             # runs load/MMA/scheduler; the other two run epilogue.
             if physical_warp < 4:
@@ -2384,6 +3658,9 @@ class GCMoERoleKernel:
             # the persistent parity word (volatile read, fresh from L2).
             gen = ld_volatile_u32(
                 signals.iterator + SIGNAL_OFFSETS['recv_parity'] // 4) & Uint32(1)
+            if cutlass.const_expr(self.eco_trace and not self.eco and not self.push_dispatch):
+                if physical_warp == 0 and elect_one_sync():
+                    self._eco_trace_ring(signals, 35, True)
             recv_ptr = signals.iterator + SIGNAL_OFFSETS['expert_recv_count_sum'] // 4 + \
                 gen * Uint32(self.local_experts * 2)
             l1_count_ptr = signals.iterator + SIGNAL_OFFSETS['l1_task_count'] // 4
@@ -2392,10 +3669,32 @@ class GCMoERoleKernel:
             shared_l2_count_ptr = signals.iterator + SIGNAL_OFFSETS['shared_l2_task_count'] // 4
             expert_counts = cute.make_rmem_tensor(
                 ((self.local_experts + 31) // 32,), Uint32)
+            if cutlass.const_expr(self.dispatch_after_ready):
+                # C1 gate producer: this CTA's thread 0 records that every
+                # warp of this CTA is past the common prologue (storage init,
+                # register resize, volatile signal read). The CTA that
+                # completes a batch of compute_sms stamps the release flag
+                # role1's routing burst spins on.
+                if tid == Uint32(0):
+                    _old = atom_add_u64(
+                        signals.iterator +
+                        (SIGNAL_OFFSETS['expert_recv_count_sum'] +
+                         XO_ROW_OFF) // 4, Uint64(1))
+                    if _old % Uint64(self.compute_sms) == \
+                            Uint64(self.compute_sms - 1):
+                        st_release_u32(
+                            signals.iterator +
+                            (SIGNAL_OFFSETS['expert_recv_count_sum'] +
+                             XO_ROW_OFF) // 4 + 2,
+                            Uint32(_old + Uint64(1)), True)
             if cta_rank == 0 and physical_warp == 3:
                 if cutlass.const_expr(self.eco_trace):
                     if elect_one_sync():
                         self._eco_trace(signals, 9, 1)
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    if elect_one_sync():
+                        self._eco_trace_ring(signals, 31, True)
                 schedule_tasks(
                     task, full, empty, recv_ptr, l1_count_ptr, l2_count_ptr,
                     shared_l1_count_ptr, shared_l2_count_ptr, expert_counts,
@@ -2417,14 +3716,149 @@ class GCMoERoleKernel:
                     self.eco_base,
                     eco_fixed_slots,
                     self.eco_spec,
+                    self.push_dispatch,
+                    self.pair_blocks,
+                    self.total_pair_blocks,
+                    self.dep_data_ready,
+                    self.expert_cap,
+                    self.dense_base // self.block_m,
+                    self.dep_expert_base,
+                    self.dep_blk_cnt,
+                    (signals.iterator + (SIGNAL_OFFSETS['expert_recv_count_sum'] +
+                                         XO_ROW_OFF) // 4
+                     if self.xorder_pool else None),
+                    self.xorder_pool,
+                    self.prog_native,
+                    self.no_routed,
+                    self.shared_dynamic,
                 )
                 if cutlass.const_expr(self.eco_trace):
                     if elect_one_sync():
                         self._eco_trace(signals, 13, 2)
+            if cutlass.const_expr(self.push_dispatch):
+                if cta_rank != 0 and physical_warp == 3:
+                    # dst-side repack: compact each expert's pair windows into
+                    # a dense per-expert token stream (acts + sf + weight +
+                    # metadata), then publish dep_expert_base[e] = total+1.
+                    # Experts are claimed atomically so any non-leader CTA
+                    # warp3 covers all of them regardless of cluster order.
+                    rp_dep = signals.iterator + SIGNAL_OFFSETS['size'] // 4
+                    rp_pc = rp_dep + self.dep_data_ready
+                    rp_eb = rp_dep + self.dep_expert_base
+                    rp_cnt = rp_dep + self.dep_blk_cnt
+                    rp_own = mapped_peer_base(peer_ptrs, rank_idx,
+                                              self.num_ranks)
+                    rp_act = rp_own + Uint64(self.l1_x_words * 4)
+                    rp_sfbm = Uint32((self.block_m + 127) // 128 * 128)
+                    rp_bm = Uint32(self.block_m)
+                    rp_e = Uint32(0)
+                    rp_running = True
+                    while rp_running:
+                        rp_e = claim_task(rp_cnt, Int32(lane))
+                        if rp_e < Uint32(self.local_experts):
+                            rp_off = Uint32(0)
+                            rp_src = Uint32(0)
+                            while rp_src < Uint32(self.num_ranks):
+                                rp_pair = rp_e * Uint32(self.num_ranks) + rp_src
+                                rp_word = ld_acquire_sys_u64(
+                                    rp_pc + rp_pair * Uint32(2))
+                                while rp_word == Uint64(0):
+                                    rp_word = ld_acquire_sys_u64(
+                                        rp_pc + rp_pair * Uint32(2))
+                                rp_c = Uint32(rp_word) - Uint32(1)
+                                rp_stok = rp_pair * Uint32(self.pair_cap)
+                                rp_dtok = Uint32(self.dense_base) + \
+                                    rp_e * Uint32(self.expert_cap) + rp_off
+                                rp_nb = rp_c * Uint32(self.hidden)
+                                rp_sa = rp_act + Uint64(rp_stok) * \
+                                    Uint64(self.hidden)
+                                rp_da = rp_act + Uint64(rp_dtok) * \
+                                    Uint64(self.hidden)
+                                for rp_i in cutlass.range(
+                                        Uint32(lane) * Uint32(16),
+                                        rp_nb, 512):
+                                    rp_v0, rp_v1, rp_v2, rp_v3 = \
+                                        ld_global_u32x4(cute.make_ptr(
+                                            Uint32, rp_sa + Uint64(rp_i),
+                                            cute.AddressSpace.gmem,
+                                            assumed_align=16))
+                                    st_global_u32x4(cute.make_ptr(
+                                        Uint32, rp_da + Uint64(rp_i),
+                                        cute.AddressSpace.gmem,
+                                        assumed_align=16),
+                                        rp_v0, rp_v1, rp_v2, rp_v3)
+                                for rp_i in cutlass.range(
+                                        Uint32(lane), rp_c, 32):
+                                    signals[self.l1_weight_words +
+                                            rp_dtok + rp_i] = signals[
+                                                self.l1_weight_words +
+                                                rp_stok + rp_i]
+                                for rp_i in cutlass.range(
+                                        Uint32(lane),
+                                        rp_c * Uint32(3), 32):
+                                    signals[self.metadata_words +
+                                            rp_dtok * Uint32(3) + rp_i] = \
+                                        signals[self.metadata_words +
+                                                rp_stok * Uint32(3) + rp_i]
+                                for rp_i in cutlass.range(
+                                        Uint32(0), rp_c, 1):
+                                    rp_sp = (rp_stok + rp_i) % rp_bm
+                                    rp_sb = (rp_stok + rp_i) // rp_bm
+                                    rp_dp = (rp_dtok + rp_i) % rp_bm
+                                    rp_db = (rp_dtok + rp_i) // rp_bm
+                                    rp_srow = rp_sb * rp_sfbm + \
+                                        (rp_sp & ~Uint32(127)) + \
+                                        (rp_sp & Uint32(31)) * Uint32(4) + \
+                                        ((rp_sp >> Uint32(5)) & Uint32(3))
+                                    rp_drow = rp_db * rp_sfbm + \
+                                        (rp_dp & ~Uint32(127)) + \
+                                        (rp_dp & Uint32(31)) * Uint32(4) + \
+                                        ((rp_dp >> Uint32(5)) & Uint32(3))
+                                    for rp_col in cutlass.range(
+                                            Uint32(lane),
+                                            self.hidden // 128, 32):
+                                        signals[self.l1_sf_words +
+                                                rp_col * Uint32(
+                                                    self.sf_ring_tokens) +
+                                                rp_drow] = signals[
+                                                    self.l1_sf_words +
+                                                    rp_col * Uint32(
+                                                        self.sf_ring_tokens)
+                                                    + rp_srow]
+                                rp_off += rp_c
+                                rp_src += Uint32(1)
+                            st_release_u32(rp_eb + rp_e, rp_off + Uint32(1),
+                                           False)
+                        else:
+                            rp_running = False
+            if cutlass.const_expr(self.eco_trace and not self.eco and
+                                  not self.push_dispatch and not self.xorder):
+                # [16]=~earliest CTA start (min), [18]=latest (max): separates
+                # launch/scheduling skew from execution time inside the tasks.
+                if physical_warp == 0 and tid == Uint32(0):
+                    dbg2s = signals.iterator + \
+                        (SIGNAL_OFFSETS['expert_send_count'] + SHARED_DBG2_OFF) // 4
+                    dbg_t0s = signals.iterator + \
+                        (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4
+                    el = Uint64(read_globaltimer() - ld_volatile_u64(dbg_t0s + 24 * 2))
+                    red_global_max_u64(dbg2s + Uint32(16),
+                                       Uint64(0xffffffffffffffff) - el)
+                    red_global_max_u64(dbg2s + Uint32(18), el)
+                    # per-cluster warp0 ready-to-consume stamp (inverted -> max
+                    # keeps min, like shared_dbg start); decode el = -1 - flat[160+c]
+                    red_global_max_u64(
+                        dbg2s + Uint32(320) + Uint32(block // 2) * Uint32(2),
+                        Uint64(0xffffffffffffffff) - el)
             # The same two-slot task stream drives both TMA producer warps
             # and the leader MMA warp. All three consume every valid phase.
             if physical_warp == 0:
+                if cutlass.const_expr(self.eco_trace and not self.eco and
+                                      not self.push_dispatch):
+                    if elect_one_sync():
+                        self._eco_trace_ring(signals, 30, True)
                 task_words = cute.make_tensor(task, cute.make_layout((16,)))
+                sh_t0 = Uint64(0)     # this task's start stamp (shared tasks only)
+                dw_t0 = Uint64(0)     # K-block data-wait start (shared tasks only)
                 task_iter = Uint32(0)
                 data_stage = Uint32(0)
                 data_phase = Uint32(0)
@@ -2438,6 +3872,7 @@ class GCMoERoleKernel:
                     if running:
                         pool_block = Uint32(task_words[task_stage * 8 + 4])
                         valid_m = Uint32(task_words[task_stage * 8 + 5])
+                        m_block = Uint32(task_words[task_stage * 8 + 2])
                         shape_k = Uint32(task_words[task_stage * 8 + 7])
                         n_cluster = Uint32(task_words[task_stage * 8 + 3])
                         local_expert = Uint32(task_words[task_stage * 8 + 1])
@@ -2445,17 +3880,44 @@ class GCMoERoleKernel:
                         if cutlass.const_expr(self.shared_experts > 0):
                             is_shared = Uint32(1) if task_phase >= \
                                 Uint32(GCBlockPhase.SharedLinear1) else Uint32(0)
+                        if cutlass.const_expr(self.shared_first):
+                            if is_shared == Uint32(0) and \
+                                    task_phase != Uint32(GCBlockPhase.None_):
+                                if lane == Uint32(0):
+                                    done_ptr = signals.iterator + \
+                                        SIGNAL_OFFSETS['expert_send_count'] // 4 + SHARED_DONE_WORD
+                                    while ld_acquire_gpu_u32(done_ptr) < \
+                                            Uint32(self.shared_l2_tasks):
+                                        pass
+                                cute.arch.sync_warp()
                         if cutlass.const_expr(self.eco_trace and not self.eco and self.shared_experts > 0):
                             # plain shared-expert timeline (ring fields unused outside ECO): 10 first shared L1
                             # task start (inverted max = earliest), 2 last shared L1 start, 5 last shared L2 start
                             if is_shared != Uint32(0):
+                                sh_t0 = read_globaltimer()
                                 if elect_one_sync():
+                                    if cutlass.const_expr(self.eco_trace and not self.eco and
+                                                          not self.push_dispatch and
+                                                          not self.xorder):
+                                        # per-cluster shared block start (stored inverted -> min)
+                                        dbg_t0 = signals.iterator + \
+                                            (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4
+                                        red_global_max_u64(
+                                            signals.iterator +
+                                            (SIGNAL_OFFSETS['expert_recv_count_sum'] +
+                                             SHARED_DBG_OFF) // 4 +
+                                            Uint32(block // 2) * Uint32(4),
+                                            Uint64(0xffffffffffffffff) -
+                                            Uint64(read_globaltimer() -
+                                                   ld_volatile_u64(dbg_t0 + 24 * 2)))
+
                                     if task_phase == Uint32(GCBlockPhase.SharedLinear1):
                                         self._eco_trace_ring(signals, 10, True)
                                         self._eco_trace_ring(signals, 2, True)
                                     else:
                                         self._eco_trace_ring(signals, 5, True)
                         block_idx = pool_block % Uint32(self.ring_blocks)
+
                         if cutlass.const_expr(self.shared_experts > 0):
                             if is_shared != Uint32(0):
                                 block_idx = pool_block
@@ -2499,14 +3961,15 @@ class GCMoERoleKernel:
                         activation_map = generic_tensormap_ptr(activation_map)
                         activation_sf_map = generic_tensormap_ptr(activation_sf_map)
                         if task_phase == Uint32(GCBlockPhase.Linear1):
-                            l1_full_ptr = signals.iterator + \
-                                SIGNAL_OFFSETS['l1_full_count'] // 4 + block_idx
-                            required = self.block_m * \
-                                (pool_block // Uint32(self.ring_blocks) + Uint32(1))
-                            if cutlass.const_expr(self.eco and self.eco_trace):
-                                input_wait_begin = read_globaltimer()
-                            while ld_acquire_gpu_u32(l1_full_ptr) != required:
-                                pass
+                            if cutlass.const_expr(not self.push_dispatch):
+                                l1_full_ptr = signals.iterator + \
+                                    SIGNAL_OFFSETS['l1_full_count'] // 4 + block_idx
+                                required = self.block_m * \
+                                    (pool_block // Uint32(self.ring_blocks) + Uint32(1))
+                                if cutlass.const_expr(self.eco and self.eco_trace):
+                                    input_wait_begin = read_globaltimer()
+                                while ld_acquire_gpu_u32(l1_full_ptr) != required:
+                                    pass
                             if cutlass.const_expr(self.eco_trace and not self.eco):
                                 # plain GEMM timeline: first / last L1 task start (inputs ready) per call
                                 if elect_one_sync():
@@ -2525,9 +3988,17 @@ class GCMoERoleKernel:
                             if task_phase == Uint32(GCBlockPhase.SharedLinear2):
                                 shared_full_ptr = signals.iterator + \
                                     SIGNAL_OFFSETS['shared_l2_full_count'] // 4 + block_idx
-                                while ld_acquire_gpu_u32(shared_full_ptr) != \
-                                        self.l1_clusters * self.shared_experts * 2:
-                                    pass
+                                if cutlass.const_expr(self.shared_full_sep):
+                                    shared_full_ptr = signals.iterator + \
+                                        SIGNAL_OFFSETS['shared_l2_full_count'] // 4 + Uint32(64)
+                                    while ld_acquire_gpu_u32(shared_full_ptr) != \
+                                            ((self.num_tokens + self.block_m - 1) // self.block_m) * \
+                                            self.l1_clusters * self.shared_experts * 2:
+                                        pass
+                                else:
+                                    while ld_acquire_gpu_u32(shared_full_ptr) != \
+                                            self.l1_clusters * self.shared_experts * 2:
+                                        pass
                         # GCL2KBlockDependency belongs to this task, so
                         # the observed XOR-normalized mask survives all
                         # K128 waits and is reset for the next task.
@@ -2564,7 +4035,7 @@ class GCMoERoleKernel:
                                 self.block_m, self.sf_block_m,
                                 self.shared_weight_gran_k,
                                 self.shared_experts > 0,
-                                self.shared_weight_cache_hint,
+                                self._shared_cache_hint(),
                                 self.routed_weight_linger)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
@@ -2573,6 +4044,8 @@ class GCMoERoleKernel:
                     task_iter += Uint32(1)
             elif physical_warp == 1:
                 task_words = cute.make_tensor(task, cute.make_layout((16,)))
+                sh_t0 = Uint64(0)     # this task's start stamp (shared tasks only)
+                dw_t0 = Uint64(0)     # K-block data-wait start (shared tasks only)
                 task_iter = Uint32(0)
                 data_stage = Uint32(0)
                 data_phase = Uint32(0)
@@ -2586,6 +4059,7 @@ class GCMoERoleKernel:
                     if running:
                         pool_block = Uint32(task_words[task_stage * 8 + 4])
                         valid_m = Uint32(task_words[task_stage * 8 + 5])
+                        m_block = Uint32(task_words[task_stage * 8 + 2])
                         shape_k = Uint32(task_words[task_stage * 8 + 7])
                         n_cluster = Uint32(task_words[task_stage * 8 + 3])
                         local_expert = Uint32(task_words[task_stage * 8 + 1])
@@ -2594,6 +4068,7 @@ class GCMoERoleKernel:
                             is_shared = Uint32(1) if task_phase >= \
                                 Uint32(GCBlockPhase.SharedLinear1) else Uint32(0)
                         block_idx = pool_block % Uint32(self.ring_blocks)
+
                         if cutlass.const_expr(self.shared_experts > 0):
                             if is_shared != Uint32(0):
                                 block_idx = pool_block
@@ -2637,7 +4112,7 @@ class GCMoERoleKernel:
                                 self.block_m, self.sf_block_m,
                                 self.shared_weight_gran_k,
                                 self.shared_experts > 0,
-                                self.shared_weight_cache_hint,
+                                self._shared_cache_hint(),
                                 self.routed_weight_linger)
                             data_stage = Uint32(0) if data_stage == \
                                 Uint32(self.math_stages - 1) else data_stage + Uint32(1)
@@ -2655,6 +4130,8 @@ class GCMoERoleKernel:
                 data_desc_hi = (weight_desc_base >> Uint64(32)) << Uint64(32)
                 sf_desc_hi = kmajor_smem_desc_from_start(
                     Uint32(0), Uint32(128), False)
+                sh_t0 = Uint64(0)     # this task's start stamp (shared tasks only)
+                dw_t0 = Uint64(0)     # K-block data-wait start (shared tasks only)
                 task_iter = Uint32(0)
                 data_stage = Uint32(0)
                 data_phase = Uint32(0)
@@ -2667,11 +4144,14 @@ class GCMoERoleKernel:
                     running = task_phase != Uint32(GCBlockPhase.None_)
                     if running:
                         valid_m = Uint32(task_words[task_stage * 8 + 5])
+                        m_block = Uint32(task_words[task_stage * 8 + 2])
                         shape_k = Uint32(task_words[task_stage * 8 + 7])
                         is_shared = Uint32(0)
                         if cutlass.const_expr(self.shared_experts > 0):
                             is_shared = Uint32(1) if task_phase >= \
                                 Uint32(GCBlockPhase.SharedLinear1) else Uint32(0)
+                        if is_shared != Uint32(0):
+                            sh_t0 = read_globaltimer()
                         num_k_blocks = shape_k // Uint32(128)
                         weight_format = Uint32(5)
                         if cutlass.const_expr(self.shared_experts > 0):
@@ -2689,8 +4169,22 @@ class GCMoERoleKernel:
                                 Int32(0), Int32(num_k_blocks),
                                 Int32(1), unroll=4):
                             k_block = Uint32(k_iter)
+                            if cutlass.const_expr(self.shared_dwdbg):
+                                if is_shared != Uint32(0):
+                                    dw_t0 = read_globaltimer()
                             cute.arch.mbarrier_wait(data_full + data_stage,
                                                     data_phase)
+                            if cutlass.const_expr(self.shared_dwdbg):
+                                # [20]=total K-block data wait (ns), [22]=wait count:
+                                # separates "waiting for TMA data" from "MMA busy".
+                                if is_shared != Uint32(0):
+                                    if elect_one_sync():
+                                        dbg2w = signals.iterator + \
+                                            (SIGNAL_OFFSETS['expert_send_count'] +
+                                             SHARED_DBG2_OFF) // 4
+                                        atom_add_u64(dbg2w + Uint32(40),
+                                                     read_globaltimer() - dw_t0)
+                                        atom_add_u64(dbg2w + Uint32(44), Uint64(1))
                             # Keep descriptor layout bits fixed and
                             # advance only the 16-byte SMEM address field.
                             weight_desc_start = Uint32(
@@ -2730,6 +4224,7 @@ class GCMoERoleKernel:
                 if tptr[0] != Uint32(0):
                     device_trap()
                 task_words = cute.make_tensor(task, cute.make_layout((16,)))
+                sh_t0 = Uint64(0)     # this task's start stamp (shared tasks only)
                 iteration = Uint32(0)
                 running = True
                 while running:
@@ -2737,6 +4232,9 @@ class GCMoERoleKernel:
                     generation_phase = (iteration // 2) % 2
                     cute.arch.mbarrier_wait(full + stage, generation_phase)
                     task_phase = task_words[stage * 8]
+                    if cutlass.const_expr(self.shared_experts > 0):
+                        if task_phase >= Uint32(GCBlockPhase.SharedLinear1):
+                            sh_t0 = read_globaltimer()
                     n_cluster = Uint32(task_words[stage * 8 + 3])
                     pool_block = Uint32(task_words[stage * 8 + 4])
                     valid_m = Uint32(task_words[stage * 8 + 5])
@@ -2756,11 +4254,12 @@ class GCMoERoleKernel:
                                 # The final MMA commit completed every K128
                                 # input read. The BF16 peer scatter below uses
                                 # TMEM, so L1 may now reuse the input ring.
-                                ring_block = pool_block % Uint32(self.ring_blocks)
-                                red_gpu_add_u32(
-                                    signals.iterator +
-                                    SIGNAL_OFFSETS['l2_empty_count'] // 4 + ring_block,
-                                    Uint32(1))
+                                if cutlass.const_expr(not self.push_dispatch):
+                                    ring_block = pool_block % Uint32(self.ring_blocks)
+                                    red_gpu_add_u32(
+                                        signals.iterator +
+                                        SIGNAL_OFFSETS['l2_empty_count'] // 4 + ring_block,
+                                        Uint32(1))
                         if task_phase == Uint32(GCBlockPhase.Linear2):
                             # The reference joins every epilogue warp after
                             # the elected routed L2 ring release.
@@ -2777,12 +4276,13 @@ class GCMoERoleKernel:
                                     Uint32(GCBlockPhase.SharedLinear1) else Uint32(0)
                             ring_block = pool_block % Uint32(self.ring_blocks)
                             generation = pool_block // Uint32(self.ring_blocks)
-                            if not is_shared_l1:
-                                l2_empty_ptr = signals.iterator + \
-                                    SIGNAL_OFFSETS['l2_empty_count'] // 4 + ring_block
-                                while ld_acquire_gpu_u32(l2_empty_ptr) != \
-                                        generation * Uint32(self.l2_clusters * 2):
-                                    pass
+                            if cutlass.const_expr(not self.push_dispatch):
+                                if not is_shared_l1:
+                                    l2_empty_ptr = signals.iterator + \
+                                        SIGNAL_OFFSETS['l2_empty_count'] // 4 + ring_block
+                                    while ld_acquire_gpu_u32(l2_empty_ptr) != \
+                                            generation * Uint32(self.l2_clusters * 2):
+                                        pass
                             output_block = ring_block
                             if is_shared_l1:
                                 output_block = pool_block
@@ -3139,8 +4639,55 @@ class GCMoERoleKernel:
                                                 dst, words[0], words[1],
                                                 words[2], words[3])
                         sync_aligned(256, 2)
+                    if cutlass.const_expr(self.shared_first or self.pull_after_shared or
+                                          self.dispatch_after_shared or
+                                          self.route_after_shared):
+                        if task_phase == Uint32(GCBlockPhase.SharedLinear2):
+                            if cta_rank == 0 and physical_warp == 4:
+                                if elect_one_sync():
+                                    red_release_gpu_add_u32(
+                                        signals.iterator +
+                                        SIGNAL_OFFSETS['expert_send_count'] // 4 +
+                                        SHARED_DONE_WORD, Uint32(1))
+                    if cutlass.const_expr(self.shared_experts > 0 and not self.eco and
+                                          not self.push_dispatch and not self.xorder):
+                        if cutlass.const_expr(self.eco_trace):
+                            if task_phase == Uint32(GCBlockPhase.SharedLinear2):
+                                if physical_warp == 4 and elect_one_sync():
+                                    dbg_t0 = signals.iterator + \
+                                        (self.eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4
+                                    red_global_max_u64(
+                                        signals.iterator +
+                                        (SIGNAL_OFFSETS['expert_recv_count_sum'] +
+                                         SHARED_DBG_OFF) // 4 +
+                                        Uint32(block // 2) * Uint32(4) + Uint32(2),
+                                        Uint64(read_globaltimer() -
+                                               ld_volatile_u64(dbg_t0 + 24 * 2)))
+                                    # [4] = total L2 work (ns), [6] = L2 task count
+                                    dbg2 = signals.iterator + \
+                                        (SIGNAL_OFFSETS['expert_send_count'] +
+                                         SHARED_DBG2_OFF) // 4
+                                    atom_add_u64(dbg2 + Uint32(4), read_globaltimer() - sh_t0)
+                                    atom_add_u64(dbg2 + Uint32(6), Uint64(1))
                     is_w1_release = task_phase == Uint32(GCBlockPhase.Linear1)
                     if cutlass.const_expr(self.shared_experts > 0):
+                        if cutlass.const_expr(self.eco_trace and not self.eco and
+                                              not self.push_dispatch):
+                            if task_phase == Uint32(GCBlockPhase.SharedLinear2):
+                                if physical_warp == 4:
+                                    if elect_one_sync():
+                                        # field 4: last shared-expert task's epilogue done
+                                        self._eco_trace_ring(signals, 4, True)
+                        if cutlass.const_expr(self.eco_trace and not self.eco and
+                                              not self.push_dispatch and not self.xorder):
+                            if task_phase == Uint32(GCBlockPhase.SharedLinear1):
+                                if physical_warp == 4 and elect_one_sync():
+                                    # [0] = total L1 work (ns), [2] = L1 task count
+                                    dbg2 = signals.iterator + \
+                                        (SIGNAL_OFFSETS['expert_send_count'] +
+                                         SHARED_DBG2_OFF) // 4
+                                    atom_add_u64(dbg2, read_globaltimer() - sh_t0)
+                                    atom_add_u64(dbg2 + Uint32(2), Uint64(1))
                         is_w1_release = is_w1_release or \
                             task_phase == Uint32(GCBlockPhase.SharedLinear1)
                     if is_w1_release:
@@ -3153,9 +4700,10 @@ class GCMoERoleKernel:
                                         signals.iterator + SIGNAL_OFFSETS['l2_full_mask'] // 4 +
                                         ring_block * 2,
                                         Uint64(1) << n_block)
-                                    red_gpu_add_u32(
-                                        signals.iterator + SIGNAL_OFFSETS['l1_empty_count'] // 4 +
-                                        ring_block, Uint32(1))
+                                    if cutlass.const_expr(not self.push_dispatch):
+                                        red_gpu_add_u32(
+                                            signals.iterator + SIGNAL_OFFSETS['l1_empty_count'] // 4 +
+                                            ring_block, Uint32(1))
                                 else:
                                     if cutlass.const_expr(self.shared_experts > 0):
                                         if task_phase == Uint32(GCBlockPhase.SharedLinear1):
@@ -3163,6 +4711,11 @@ class GCMoERoleKernel:
                                                 signals.iterator +
                                                 SIGNAL_OFFSETS['shared_l2_full_count'] // 4 +
                                                 pool_block, Uint32(1))
+                                            if cutlass.const_expr(self.shared_full_sep):
+                                                red_release_gpu_add_u32(
+                                                    signals.iterator +
+                                                    SIGNAL_OFFSETS['shared_l2_full_count'] // 4 +
+                                                    Uint32(64), Uint32(1))
                         cute.arch.sync_warp()
                     running = task_phase != Uint32(GCBlockPhase.None_)
                     iteration = Uint32(iteration + Uint32(1))
@@ -3190,11 +4743,13 @@ class GCMoERoleKernel:
                     cute.arch.griddepcontrol_wait()
                 else:
                     self._initialize_shared_storage(
-                        combine_smem, Uint32(physical_warp), Uint32(lane))
+                        combine_smem, Uint32(physical_warp), Uint32(lane), signals)
             # Role 1's epoch remains immutable throughout this role-3 launch.
             # Each warp caches it independently; the footer advances recv_parity.
             ready_epoch = Uint64(ld_volatile_u32(
                 signals.iterator + SIGNAL_OFFSETS['role3_epoch'] // 4))
+            if cutlass.const_expr(self.no_routed):
+                ready_epoch = Uint64(0)
             if cutlass.const_expr(not (self.finalize_output and self.shared_experts > 0)):
                 sync_unaligned(FINALIZE_THREADS, 1)
             if cutlass.const_expr(self.eco_trace):
@@ -3247,14 +4802,15 @@ class GCMoERoleKernel:
                     max_number_threads=(self.dispatch_warps * 32, 1, 1),
                     min_blocks_per_mp=1)
             elif cutlass.const_expr(activation_clamp is None and activation_alpha is None):
-                self.kernel(signals, peer_ptrs, rank_idx, num_tokens).launch(
+                self.kernel(signals, peer_ptrs, rank_idx, num_tokens,
+                            tensor_maps).launch(
                     grid=(self.dispatch_sms, 1, 1),
                     block=(self.dispatch_warps * 32, 1, 1),
                     max_number_threads=(self.dispatch_warps * 32, 1, 1),
                     min_blocks_per_mp=1)
             else:
                 self.kernel(signals, peer_ptrs, rank_idx, num_tokens,
-                            None, None, None,
+                            tensor_maps, None, None,
                             activation_clamp, activation_alpha).launch(
                     grid=(self.dispatch_sms, 1, 1),
                     block=(self.dispatch_warps * 32, 1, 1),

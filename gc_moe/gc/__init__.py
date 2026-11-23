@@ -57,10 +57,19 @@ class GCSymmBuffer:
                                      hidden, intermediate_hidden, ring_tokens,
                                      sf_ring_tokens, num_shared_experts, eco=eco)
         if base is None:
-            allocator = torch if group.size() == 1 else symm_mem
+            # Attribution probe only: plain (non-symmetric) allocation with every
+            # peer mapped to this rank's own buffer. Valid when the call does no
+            # peer access (no pull, no routed dispatch) — isolates the symmetric
+            # allocation's local access path from the multi-rank configuration.
+            plain_alloc = (group.size() == 1 or
+                           __import__('os').environ.get('GC_MOE_PLAIN_ALLOC', '0') == '1')
+            allocator = torch if plain_alloc else symm_mem
             self.buffer = allocator.empty(self.layout.nbytes, dtype=torch.int8, device='cuda')
-            self.handle = (types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-                           if group.size() == 1 else symm_mem.rendezvous(self.buffer, group=group))
+            if plain_alloc:
+                self.handle = types.SimpleNamespace(
+                    buffer_ptrs=[self.buffer.data_ptr()] * group.size())
+            else:
+                self.handle = symm_mem.rendezvous(self.buffer, group=group)
             peer_addresses = tuple(int(ptr) for ptr in self.handle.buffer_ptrs)
             if (len(peer_addresses) != group.size() or
                     any(ptr <= 0 or ptr % 16 for ptr in peer_addresses) or
@@ -239,11 +248,13 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
                     activation_alpha: Optional[float] = None,
                     eco_meta: Optional[torch.Tensor] = None,
                     eco_state: Optional[torch.Tensor] = None,
-                    eco_logical_experts: int = 0) -> None:
+                    eco_logical_experts: int = 0,
+                    xorder_table: Optional[torch.Tensor] = None) -> None:
     if hasattr(sym_buffer, 'num_shared_experts'):
         assert (sym_buffer.num_shared_experts > 0) == (shared_l1_weights is not None)
     from ..apis.gc_moe import fp8_fp4_gc_moe as launch
     launch(y, l1_weights, l2_weights, sym_buffer, shared_l1_weights,
            shared_l2_weights, cumulative_local_expert_recv_stats, recipe,
            activation, activation_clamp, fast_math, shared_recipe, activation_alpha,
-           eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts)
+           eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts,
+           xorder_table=xorder_table)

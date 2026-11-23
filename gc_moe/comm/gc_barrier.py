@@ -11,6 +11,7 @@ from ..layout.sym_buffer import mapped_peer_base
 from ..ptx.ld_st import (
     atom_release_gpu_add_u32,
     ld_acquire_gpu_u32,
+    nanosleep_u32,
     ld_acquire_sys_u32,
     ld_acquire_sys_u64,
     red_gpu_add_u32,
@@ -25,6 +26,10 @@ from ..ptx.utils import (
 
 DEFAULT_NVLINK_BARRIER_TIMEOUT_SECS = 3600
 _WAIT_TIMEOUT_CYCLES = 60 * 2_000_000_000
+# Spin-wait pacing (ns slept between polls). 0 keeps the reference tight spin;
+# a few hundred ns cuts the poll rate by orders of magnitude without changing
+# what is waited for. GC_MOE_SYNC_BACKOFF=<ns>.
+_SYNC_BACKOFF_NS = int(__import__('os').environ.get('GC_MOE_SYNC_BACKOFF', '0'))
 
 
 @cute.jit
@@ -73,6 +78,8 @@ def grid_sync(signals: cute.Tensor, block: Uint32, tid: Uint32,
         start_clock = read_clock64()
         while ((current ^ previous) & Uint32(0x80000000)) == Uint32(0):
             current = ld_acquire_gpu_u32(counter)
+            if cutlass.const_expr(_SYNC_BACKOFF_NS > 0):
+                nanosleep_u32(Uint32(_SYNC_BACKOFF_NS))
             if ((current ^ previous) & Uint32(0x80000000)) == Uint32(0) and \
                     Uint64(read_clock64() - start_clock) >= Uint64(_WAIT_TIMEOUT_CYCLES):
                 cute.printf(

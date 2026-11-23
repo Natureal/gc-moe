@@ -68,13 +68,26 @@ def bulk_g2s_1d(dst_smem: cute.Pointer, src_gmem: cute.Pointer,
 
 
 @dsl_user_op
+def l2_evict_last_policy(*, loc=None, ip=None) -> Uint64:
+    """Fractional L2 policy: keep the touched lines (evict last). Usable as the
+    L2::cache_hint operand of cp.async.bulk, so it survives CUDA-graph capture
+    (unlike a stream access-policy window)."""
+    policy = llvm.inline_asm(
+        T.i64(), [], 'createpolicy.fractional.L2::evict_last.b64 $0, 1.0;',
+        '=l', has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip)
+    return Uint64(policy)
+
+
+@dsl_user_op
 def bulk_s2g_1d(dst_gmem: cute.Pointer, src_smem: cute.Pointer,
-                num_bytes: Uint32, *, loc=None, ip=None) -> None:
+                num_bytes: Uint32, *, cache_hint: int = EVICT_NORMAL,
+                loc=None, ip=None) -> None:
     llvm.inline_asm(
         None, [dst_gmem.toint(loc=loc, ip=ip).ir_value(),
                src_smem.toint(loc=loc, ip=ip).ir_value(),
                num_bytes.ir_value(loc=loc, ip=ip),
-               Uint64(EVICT_NORMAL).ir_value(loc=loc, ip=ip)],
+               Uint64(cache_hint).ir_value(loc=loc, ip=ip)],
         'cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint '
         '[$0], [$1], $2, $3;',
         'l,r,r,l,~{memory}', has_side_effects=True,

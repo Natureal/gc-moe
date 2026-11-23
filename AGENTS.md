@@ -1077,3 +1077,1115 @@ eager trace（P512，barrier 之后，rank 均值，µs）：
 - 带 1 个 shared expert：shared L1 第一个任务 2.0 开始、最后一个 3.0 开始，shared L2 最后一个 9.5 开始（约 12 µs 前做完）；routed L1 首个任务 21.5–21.9；拿到计数 15.4–16.2；最晚 GEMM 完成 eplb448 87.2 / oracle c32 83.7。不带 shared：routed L1 首个 20.9–22.1，最晚 GEMM 86.8 / 84.5 → shared expert 完全藏在 dispatch 里，不推迟 routed GEMM。
 - 计时（cold-l2，40 call）：oracle c32 shared1 92.53 vs shared0 92.74（无差）；eplb448 shared0 95.56，shared1 那次被干扰（mean 247 / median 338），需重测。
 - 含义：shared 算完后到 routed L1 开工之间 GEMM SM 仍空闲约 9 µs（约 12 → 21 µs），等 dispatch（计数 ~16 µs、首个 routed block 凑齐 ~21 µs）。trace 模式下 benchmark 打印的计时（~1300 µs）不可用，只看 trace 时间线。
+
+### 8.39 标准测试约定（用户一句 prompt 触发）
+- **代码**：仓库 `/data0/home/nanjun.cp/ep64_exp/gc-moe` 分支 `eco_ep64_up`；改动后 `push32.sh gc-moe-u<NN>` 推 8 节点（md5 逐节点校验），`PKG=gc-moe-u<NN> ./se_run.sh <tag> "<env>" <args>` 跑 EP32（8 节点 × 4 卡），结果 `~/work/mpo/ep64/results/se/<tag>.json`。
+- **benchmark**：`benchmarks/benchmark_gc_moe_eco.py`。固定设定：`--off @D/r32d/routing_off.npy --block-m 96 --cold-l2`；shared expert 默认 1（gran_k 32），`--num-shared-experts 0` 为对照。
+- **标准 mode 集**（同一次 run 内 call 交错）：`plain384:plain:384`、`eplb448:eplb:448:$DD/routing_eplb448.npy`、`ora512cXX:ora:512:$DD/ora512cXX_b96f.npy`（+`--phy2log $DD/eco{P}cXX_metas_phy2log.npy`）、`eco512cXX:eco:512:$DD/eco512cXX_metas.npy`（hydro 在线），XX ∈ {c32, c24}；`DD=@D/r32d`。
+- **hydro env**：`GC_MOE_ECO_SPLIT_COUNTS=1 GC_MOE_ECO_HYDRO=1 GC_MOE_ECO_UNIT_HSPLIT=1 GC_MOE_ECO_UNIT_HORD=1`（其余走代码默认：ROUTING_WARPS=24、COMBINE_EXACT=2、串行拉取）。
+- **触发短语**：
+  - "跑标准 check"：`--calls 4 --check`（新代码先过），verify 加 `GC_MOE_ECO_ROUTE_VERIFY=1`。
+  - "跑标准 A/B"：先 check，再 `--calls 40 --warmup 3 --iters 10 --inner-iters 20`，全 mode 集，≥2 轮（<1 µs 的差异 ≥4 轮交错）。
+  - "跑标准 trace"：`GC_MOE_ECO_TRACE=1 --calls 20 --warmup 1 --iters 2 --inner-iters 2 --trace-calls 3`（只作归因，不报性能）。
+  - "改完跑标准验证" = push 新包 + check + 标准 A/B。
+- 噪声 ±0.5 µs，报中位数；trace 模式下打印的计时不可用。参考点（shared1/bm96/cold-l2）：eplb448 ~94.6、ora512c32 ~92.5–93.0、hydro c32 ~95.8–96.5 µs。
+
+### 8.40 "2 块 unit + 再平衡" 规划：离线实现 + L20A 32 卡 A/B（2026-11-17）
+- **离线参考实现**（`/tmp/r32d_ora_2b.py`，hydro-w plan → 合并副本（每槽最多 2 块）→ token 再平衡）烘焙成 oracle routing `r32d/ora512c32_b96f_2b.npy`：blk peak 16.07 不变，active mean 13.77→12.75，最慢 rank active 14.47→14.34，det max 53.85→**52.92**，E[max] 55.67→**55.13**（σ=1.35，2000 次噪声）。正确性：4.2M 路由 0 不匹配，每专家 token 总量守恒。
+- **L20A 32 卡 A/B**（16 台 L20A 中挑 8 台空闲：.72/.86/.87/.88/.92/.76/.96/.84；容器内 `/opt/conda310` torch 2.13+cu130、`gcenv/site` cutlass、`ep64s/dg341`、包 `ep64s/pkg/gc-moe-u23`；NCCL 必须 `NCCL_SOCKET_FAMILY=AF_INET NCCL_SOCKET_IFNAME=eth0`，否则被容器环境强制 IPv6/bond0 卡住）。4 轮交替模式顺序，每轮 40 call、cold-l2、bm96、shared1：
+  | 轮 | ora0（hydro plan） | ora2b（2 块+再平衡） | 差 |
+  |---|---|---|---|
+  | r1 | 93.55 | 90.70 | −2.85 |
+  | r2 | 92.79 | 91.81 | −0.98 |
+  | r3 | 93.82 | 91.04 | −2.78 |
+  | r4 | 92.07 | 91.59 | −0.48 |
+  | 均值 | **93.06** | **91.29** | **−1.77** |
+- 4/4 轮同向；模型预测 det max −0.93、e2e 约 −0.5，L20A 上实测 −1.77（L20A 只有 148 SM、更算力受限，block/active 优势转化更充分）。L20A 绝对耗时约 92 µs，与 B300 EP32 的 94–99 不同硬件不可直接比。
+- 工具：`l20a_launch.sh`（8 容器 torchrun）、`l20a_run.sh <tag> <args>`、`l20a_q2b.sh`（4 轮 A/B）；数据经容器内网 http（.86:25298）分发，500 MB/s。
+
+### 8.41 在线再平衡 pass（`GC_MOE_ECO_UNIT_HREBAL=K`，默认 0）
+- **kernel 实现**（`eco_unit_kernel.cu`，BFS 之后、publish 之前，warp0）：K 轮，每轮取 f = kWB·blocks + kWA·active + tokens 最大的 rank（并列取最小下标），把该 rank 某槽的 t 个 token 挪到同一专家的另一个副本（别的 rank），t ∈ [q%bm 或 bm, 16, 48]；按 key = 1000·max(f) + sum(f) 选最优（并列取最小候选下标）。候选裁剪：每槽最多看 8 个副本、只考虑活跃副本（离线代价 +0.07 det max），pair = slot<<3|copy 移位解码。
+- **正确性**：`hydro_role_test.py`（参考 = HydroPlanner + hydro_rebal.py，同整数权重）40 call × 1 层 **0 quota / 0 start mismatch**，块峰值一致；调试确认 round0 选择与参考逐位相同（a=1, key 8492968, s=27, b=75, t=78）。
+- **开销**（plan kernel，warm，kcycles）：基线 plan 24.2 / publish 32.5；K=8 → bfs +4.0~5.5k（约 2–2.7 µs），K=16 → +7k（约 3.5 µs）。默认关，A/B 后再定。
+- **离线收益**：hydro-w 53.85 → K8 53.39 / K16 53.26（det max），块峰值 16.07 不变；E[max] 55.67 → 55.47 / 55.39。
+- 同时把 `ECO_TIME_WEIGHTS[96]` 从 (335, 38) 更新为重拟合值 **(384, 82)**。
+- **待办**：集群 A/B（L20A 或 EP32）确认 +2–2.7 µs 的 publish 延迟不会吃掉约 0.5 µs 的收益；若超预算，降低 K 或把 top-3/sumf 改成增量维护。
+
+### 8.42 再平衡 pass 的寄存器化重写（开销从 ~5.5k 降到 ~1.5k cycles）
+- **重写要点**：每个 rank 的 blocks/active/tokens 放进寄存器（lane = rank），每轮只用 4 个 warp CREDUX（max、次大、第三大、sum）+ 每候选 2 个 shfl 读目标 rank 的状态；不再用 shared memory 数组、atomic 初始化、5 步 shuffle 归约。候选循环用**均匀 trip count**（`kPairIt = ceil(kS*8/32)`）保证 shfl 在 warp 内收敛。
+- **修掉一个真 bug**：key 里的 sum 项用了本 lane 的 f，应为源 rank（r1）的 f（`sumf - v1 - f(rb) + fa + fb`）。
+- **正确性**：`hydro_role_test.py` 40 call × 1 层 **0 quota / 0 start mismatch**（K=8、K=16 均通过），参考 `hydro_rebal.py`（cap=8 按副本下标、active-only，与 kernel 语义一致）。
+- **开销**（warm，kcycles，40 call）：基线 plan 24.2 / publish 32.5；K=8 与 K=16 均为 plan 25.7 / publish 33.7（**+1.5k / +1.2k cycles ≈ 0.6–0.75 µs**）——多数 call 在 4–6 轮后无改进即退出，K 的上限很少跑满。
+- **离线收益**（cap8+active）：hydro-w 53.85 → K8 53.44 / K16 53.35（det max），块峰值 16.07 不变。
+- **已验证无效/不划算的简化**：整槽移动（t=q[s]）无收益；去掉 sum 项损失 0.08；去掉第三大（others 用全局 max）损失 0.18；只试最轻副本损失 0.43。
+
+### 8.43 再平衡的端到端 A/B（L20A 32 卡，烘焙 plan，4 轮交错）
+- 把 kernel 等价 plan（hydro-w + `hydro_rebal(rounds=8, cap=8, active_only=True)`）烘焙成 `r32d/ora512c32_b96f_k8.npy`（det max 53.44、块峰值 16.07、active 均值 13.65）。
+- 4 轮交错（每轮 40 call，cold-l2，bm96，shared1），每轮取 40 call 最慢 rank 中位数（µs）：
+  | 轮 | ora0（hydro） | orak8（再平衡） | ora2b（merge+LS） |
+  |---|---|---|---|
+  | r1 | 93.61 | 91.90 | 90.82 |
+  | r2 | 92.26 | 92.38 | 91.71 |
+  | r3 | 92.83 | 92.78 | 91.72 |
+  | r4 | 93.13 | 92.19 | 91.89 |
+  | 均值 | **92.96** | **92.31（−0.65）** | **91.54（−1.42）** |
+- 结论：K8 再平衡的**规划质量收益约 −0.65 µs**（4 轮中 3 轮为正，单轮噪声约 ±0.5）；merge+LS 的更强 plan 约 −1.42。
+- **在线 eco 路径在 L20A 容器上挂住**（NCCL "Connected all rings" 之后无进展，>14 min），未完成在线 A/B；烘焙 plan 的对比隔离了规划质量，但"publish 晚 1.2k cycles（约 0.6 µs）是否被 plan 等待的 slack 吸收"仍需在线验证。容器内可能需要 nvcc / JIT 缓存前置，待查。
+
+### 8.44 在线 eco A/B（L20A）：publish 延迟不被吸收，再平衡在线为负收益
+- **修复的两个基础设施问题**：① 8 台容器中 .84 缺 `eco512c32_metas.npy`（分发只带了 routing 文件），一个 rank 抛 FileNotFoundError，其余 rank 卡在 barrier（表现为"挂住"）；② 早期清理只 `pkill -f torch.distributed`（torchrun 父进程），bench 子进程残留并占住 26311/25311 端口与显存，导致后续 run `EADDRINUSE`。现在 runner 同时 `pkill -9 -f benchmark_gc_moe_eco`。
+- **在线 A/B**（8 容器 × 4 卡，40 call，cold-l2，bm96，shared1，同 run 内三模式交错）：
+  | 轮 | K | ora0 | ora2b | eco（在线 hydro） | eco−ora0 |
+  |---|---|---|---|---|---|
+  | r1 | 0 | 93.05 | 92.09 | 96.22 | +3.17 |
+  | r2 | 8 | 93.09 | 91.62 | 97.34 | +4.25 |
+  | r4 | 0 | 93.00 | 91.60 | 96.03 | +3.02 |
+  | r3/r5/r6 | — | 失败（JSON 空 / 引号导致 $W 未展开），作废 |
+- **结论**：
+  1. 在线 hydro 比烘焙的同一 plan（ora0）慢约 **3.0–3.2 µs**（ECO 机制开销：plan 等待 + 副本拉取顺序），与历史一致；
+  2. **K=8 的再平衡在线更慢约 1.1 µs**（97.34 vs 96.2）——publish 晚 1.2k cycles（约 0.6 µs）**没有被 plan 等待的 slack 吸收**，反而放大了；
+  3. 与烘焙 plan 的 −0.65 µs 质量收益相抵后，在线版本为负。与 HPOST 的教训一致：任何 publish 延迟都会吃掉规划质量收益。
+- **可行方向**：把再平衡并进现有 relocate/BFS（不新增 pass）、或把 K 降到 2–4 并验证 publish 不变；否则只能作为离线/oracle plan 使用。
+
+### 8.45 Push dispatch 设计定稿（deepEP-LL 思路改造，2026-11-17 深夜）
+- **动机**：单 call 50 次回放 trace（`results/dumps/single_call_eager/`）显示 `l1_first` 中位 ~22 µs，而 shared expert 在 ~10 µs 内结束 → routed GEMM 有 ~10 µs 气泡；各 rank 开工偏差中位 ~3.8 µs / 最大 ~7.5 µs，与 block 优化收益（~4.2 µs）同量级，必须把首 block 数据到达提前到 shared 结束之前。
+- **现状机制**（`gc_moe/impls/sm100_fp8_fp4_gc_moe.py`）：pull 模式——源端 routing 循环写 4B source-index（`(dst_local*num_ranks+src)*capacity+pos` 处写 `token_topk`），目的端 dispatch warps 按 slot 序逐 token resolve（count 行+index 行 acquire）→ TMA `bulk_g2s` 拉 activation → drain 写 `l1_acts[pool%ring]` + `l1_acts_sf` + `l1_topk_weights` + `token_src_metadata` + `red_release l1_full_count[ring_b]`。首 block 下界 = max_src(routing_end) + pull 流时间。
+- **实测**（本机 8×L20D，NV18 全互联）：remote `st.global` 写带宽 **~706 GB/s**（≈本地 HBM）；remote `atom.add` 串行延迟 **~1.8 µs** 但完全流水化（2560 并行 ≈ 0.01 µs/op）。每 rank 入向数据 ~4MB → 纯传输 ~6 µs；当前 pull 的 15–25 µs 窗口主要是远程读往返 + index/resolve 串行等待。
+- **设计（v1，非 ECO/EPLB 先行）**：
+  1. **src 侧 assignment**：routing 循环改为只算不写远端 index——每 CTA 把 (dst_rank,dst_local,pos,token_topk) 记进 smem 发表（pos = 现有 `atom_shared_add_u32` 游标，与 pull 的 canonical src-major 序一致）。
+  2. **count 矩阵广播**：src 的 (src→slot) 计数行不再只发给 slot owner，而广播到**所有 rank**（复用 `source_idx` 区域做 overlay：32×512×u64=64KB ≪ 8MB 原索引区）→ 每个 rank 本地有完整矩阵，~2–3 µs 可得。
+  3. **src 计算 pool 位置**（全本地）：`pool_pos = pool_base(s) + prefix_{j<src}(s) + pos`，`pool_base(s)` = dst r 上前序 slot 的 padded block 前缀、`prefix` = src-major 前缀——与 pull 的 peel/canonical 序**逐位一致**（输出 bit-exact）。
+  4. **X 序发射**：X = 对所有 dst 轮转、每个 dst 按其 slot 的 pool 序（role2 消费序）；每个 rank 用同一矩阵算同一 X；src 把其 (dst,slot) 分片按 X 位置排，逐片：远程写 act(5120B)+sf(160B)+w(4B)+meta(12B) 到确切 pool 地址，片尾 `red.release` 加 `l1_full_count[ring_b]`（**协议与 pull drain 完全相同 → role2/role3 零改动**）。
+  5. **armed 门**：src 的第一个远端写之前，需确认 dst 已清完本 gen 的 `l1_full_count`——dst 在 call 开始置 `push_armed_count`（remote add），src 本地 poll ==num_ranks 后发第一个数据写（约 +1–2 µs，可和 assignment 重叠）。
+  6. **dst 侧**：dispatch warps 跳过整条 pull pipeline（无 index、无 resolve、无 remote read）；l1_full_count 仍由 src 的 release-add 驱动；GEMM 不变。
+- **为什么不需要原子声明/3D 340MB staging**：pos 本来就是源端本地游标；跨 src 的 slot 内偏移靠"计数矩阵广播 + 本地前缀"解决，代价仅 ~4KB×32 的计数广播和 ~2–3 µs 等待，换来零额外数据 buffer。
+- **已知边界**：① gen>0（pool>ring 1920 tokens）时 src 需远端 poll `l1_empty_count` 才能复用 ring——EP32/P512 pool~17 block < ring 20 不触发，留兼容逻辑；② ECO 副本 token 的 copy 选择要等 `plan_published`（~15 µs）——v1 仅做非 ECO；ECO 扩展：单副本走 push（t≈0），副本 token 或在 plan 后用 quota 表本地算 copy、或保留 index+pull 混合路径；③ 多节点（MNNVL）release 需 `red.release.sys`（u32 版要补 PTX），单机 EP8 原型用 gpu scope。
+- **备选方案（已比较放弃）**：per-src FIFO staging + dst compact（+130MB buffer、+2–3 µs 本地搬运）；atomic-claim + 2D 定容 slot 区（+87–174MB、省 count 等待但角色大改）；deepEP-LL 三维 (slot,src,pos) 340MB。
+- **预测**：routing/assignment ~2–3 µs + 首批 slice 发射 ≈ 首 block ~5–8 µs（vs 现在 ~22 µs）；shared 结束（~10 µs）后 routed GEMM 无缝接上。
+- **实施顺序**：① 本设计落地 AGENTS ✓ → ② layout 加 push 信号/matrix overlay → ③ kernel 非 ECO 路径：routing 记表 + 广播 + X 序发射（GC_MOE_PUSH_DISPATCH 门控）→ ④ dst 跳 pull + armed 门 → ⑤ 本机 EP8 bit-exact + 时序 → ⑥ 在线 EP32。
+- **Phase A 实现落地（2026-11-17，EP8 本机，与上条同文件）**：`GC_MOE_PUSH_DISPATCH=1` + 非 ECO + `_push_fits`（matrix overlay ≤ source_idx 区、hidden%64==0、capacity*topk≤16384、seq 数组 ≤ pull smem 区）门控。
+  - **协议**：pass-1 各 CTA smem 计数 → `atom_add_u64` 发布到 `expert_send_count`（同时把 CTA 基址写回 `expert_token_count`，ord_g = 基址+局部序 = rank 级全局 ord）；pass-2 不碰远端，只做 `ord_g`/`ord_l`（CTA 内 seq_cnt 原子）双声明；每 CTA 把 384 计数行广播写进所有 dst 的 matrix bank（source_idx 区 overlay，按 gen 双 bank，tag=parity+1）→ 各 CTA 等全部 8 个 tag 后本地建 emit_base/prefix/total 三张表（src-major 前缀 + 块对齐 pool 前缀，**与 pull 的 canonical 序逐位一致**）。
+  - **X 序发射**：CTA 内 counting sort（seq_cnt→chunk sums→X-permuted pfx→scatter 到 seq_list），X 位置 = `(e%L)*R + e//L`（相邻实例打向不同 dst，每个 dst 的首个 slot 都在前 R 个 X 位置）；warp 按 `pos ≡ warp mod 16` 步进 seq_list，全 lane 协作拷贝 act(10×16B batched-load→store)+sf+weight+meta，`fence_acq_rel_sys`+`sync_warp`+lane0 `red_release_sys_add_u32` 到 dst `l1_full_count[ring_b]`（inc：末 token 补 `block_m - pos%block_m`，与 pull drain 同协议）；gen>0 远端 poll `l1_empty_count`。
+  - **教训/坑**：`copy_global_16`（ld+st 融合 asm 带 ~memory clobber）**逐拷贝吃满 load 延迟、完全不流水**——必须拆成"整组 `ld_global_u32x4` 进寄存器 → 整组 `st_global_u32x4`"（v1 慢 ~71µs 的主因）；DSL `cutlass.range` 循环变量实为 Int32（混用 Uint32 边界触发 TYPE_UNSTABLE_JOIN）；smem 里跨 warp 的 packed 表不需要 valid 位——重读 `routes` 判有效性即可。
+  - **trace 打点**（`GC_MOE_ECO_TRACE=1`，ring fields）：f2=矩阵广播完，f5=矩阵全就绪，f12=counts 齐，f4/f6=发射完，f11/f15=routing 完（max 聚合，取的是最慢 call，注意解读）。**v1 基线（token-major、串行拷贝）**：bit-exact 对拍 8 rank × 2 call 全 0，但 kernel_us_est 256 vs pull 190——emission 段独占 ~71µs（f5 20.5 → f4 91.6），修复方向即本条两优化。
+  - **v2 实测（2026-11-18，EP8 T=128 plain routing_off，8×B300）**：bit-exact 8 rank × 2 call 全 0 ✓；kernel_us_est **206.1 vs pull 210.6**；trace ring（µs）：role1_end **53.9**（v1 91.8，pull 55.4）、f3 GEMM start 143.7（pull 144.3）、role3_start 163.6（pull 164.1）、role3_end **187.2**（pull 188.3）、period **208.4**（pull 218.5）。→ **emission 瓶颈完全消除，push ≈ pull 平手或略优**；批量拷贝（2 波 ×5 vec，20 reg）+ X 序 counting sort 生效。
+  - **结论与解读**：① f2/f5/f4 探针在 v2 trace 中失真（f2/f5=0、f4≈10.7）是 persistent kernel 的**跨 call 归属噪声**——block0 先于慢 CTA 更新 slot24/33+清 entry，迟到 CTA 的早期探针落进下一 call 的 entry（elapsed≈0），不是协议错误（bit-exact 为证）；要精确打点需 per-CTA call 序号。② push 未赢的真正原因：**首块提前到达没转化成 GEMM 提前**——f3/f1 与 pull 逐位一致，role2/role3 启动被 shared expert 尾巴（~163µs）门控而非首块到达；此规模（T=128 EP8）下矩阵 wait ~15-20µs 也不在关键路径上。③ push 的理论收益（消掉 pull drain 串行窗口）在本工作负载被 shared-tail 主导的结构里兑现不了，**更大 T 或 shared 更短的配置才可能显出差距**。
+  - **v3 结构优化（2026-11-18，已实测）**：**push 的 pass-2 整段消除**——pass-1 的 `atom_shared_add_u32` 返回值本来就是 CTA-local ord（存 `seq_ord[tt]`），publish 循环顺手把 `seq_cnt[e]` 填成 pre-swap 计数，`ord_g = etc[e](基址) + ord_l` 在发射时现推（`emit_prefix[e]` 构建时折入 `etc[e]`，发射循环零改动）；pass-2 路由遍历对 push 变空转（`pass2_end = route_base`）。token 在 (slot,src) 段内排布变为 pass-1 声明序（与 pull 不同的置换），meta 自带 src_token/topk_slot → per-token 输出不受影响。**实测（干净窗口，kernel_us_est µs）**：s2(imb47) 185.3 vs pull 186.3；s0(imb19) **186.7 vs 194.8**；T256 **205.2 vs 208.6**（trace 下 role1_end 96.9，2× 数据线性扩展）；T128 off 181.7 vs 183.2——**全部干净样本 push ≥ pull，倾斜/大 T 优势更大**（早前 T256 235、s0 +4.5、T256t-pull 276 均为外部作业污染样本，标注 procs_now>0 即弃）。对拍：off/s0/s2/T256 全部 max|diff|=0。另加 `_push_fits` 不满足时的显式 stderr 警告（防 EP32 smem 收紧下静默回退 pull）。
+  - **待补**：ECO 扩展（副本 slot 需 plan 后 copy 选择）；gen>0 ring 复用路径未实测（EP8 pool_blocks<ring_blocks 不触发）；更大 T / EP32 的 A/B（push 收益可能随 dispatch 占比上升显现）；EP32 下 `_push_fits` 的 smem 约束（pull_stages=1 时 seq 表 ~131KB 可能超 pull 区）。
+
+## push dispatch 进度（2026-11-18，deepep-dispatch 分支，未提交）
+- 现状：**pair 布局 + deepEP 新协议**（pass-1 1µs / publish 本地原子 / 计数排序 1.5µs / 发射无等待 / 每 (expert,src) 一次 count 推送）。EP8 中位 ~1150µs，EP4 实测 1254µs，bit-exact 已验证（早期 push114 对照 0.0）。
+- 已验证的替代：**稠密直写**（publish 改远端原子 → 跨 rank 序数 → 写 `local*capacity+ord`）EP4 实测 **425µs**（3×），但 bit-exact 未通过（地址映射：发射端窗口化 vs 消费端紧凑，已加"发布窗口化块号"修复待验证）。
+- 已排除：TMA 远端 bulk store（~100µs/op）、每 token 远端原子（768/rank 太贵 +70-90µs）、专职 count warp（32 lane 并发 release.sys 互相拖慢）、gather 多段 TMA（swizzle 需 8 行对齐，EP32 每源仅 2 行）。
+- 下一步（P2-P4）：**pair 写入 + dst 侧窗口内 repack**（role2 warp3@CTA≠0 空闲 warp 做拷贝，shared-expert GEMM 期间并行），目标 l1_first 10-16µs + 总 ~425µs。
+- 关键实测：远端原子 ~1.8-2.5µs；fabric 每 rank 写带宽 ~27GB/s；GEMM 每块固定开销 ~3µs；块数 EP4 370→96（稠密）、EP8 274→48。
+
+### push-repack 方案（pair 写 + dst 侧 repack → dense 消费）进行中（2026-11-19）
+- 设计：emission 不变（pair 窗 + pair count）；role2 非 leader CTA（cta_rank!=0）warp3 做 repack——
+  claim_task(dep_blk_cnt 当计数器) 领 expert → 等 R 个 pair count → 顺序 cumsum 得 dense offset →
+  拷贝 acts(hidden B) + weight(4B) + meta(12B) + sf(块内 pos*4 布局 160B) → st_release_u32 发布
+  dep_expert_base[e]=total+1。scheduler 按 dense 解码（bound=local_experts*min(eblocks,R*pair_blocks)），
+  publish pool_block=dense_block+e*eblocks+m；消费端/epilogue 零改动。
+- 已修 bug：footer 清扫范围 pool_blocks=total_pair_blocks→pair_rows//block_m（dense 块 1536-4415
+  的生命周期计数器原来永不清，call≥2 挂死）。
+- 环境：env_b300.sh + GC_MOE_PUSH_DISPATCH=1 + torch.distributed.run nproc=8 + routing_off.npy bm32。
+  注意：主机 GPU 与其他用户作业共享（lingqingyan symmetric_ae_scan），性能数需等空卡。
+- 之前失败教训：TYPE_UNSTABLE_JOIN 用 while/cutlass.range 规避；make_ptr 要 Uint8 重铸或裸 Uint64 地址；
+  卡死定位法 cuda-gdb -p <worker> -batch -ex "info cuda warps"（attach 到 worker 不是 torchrun 父进程）。
+
+## pull dispatch 优化：融合单遍 + count 发布并行实验（2026-11-19，deepep-dispatch 分支）
+- **背景**：EP8 plain pull trace（bm32，T=128，routing_off）：barrier ~10µs、count_ready ~13-20µs（spread ~0.4µs）、l1_first ~19.7µs、call ~194µs。count_ready−barrier ≈ 6µs = block0 单 CTA 发布（384 expert × st+atom）+ NVLink 传播 + dst 轮询。
+- **融合单遍 dispatch（已实现，bit-exact 验证，env `GC_MOE_FUSED_DISPATCH` 默认 1，=0 回退）**：pass1 直方图 + merge + pass2 索引重扫 → 单循环 `slot=atom_add_u64(send_count[e],1)`（gmem 原子，返回值即 slot、终值即 count）+ 远端 `dst_index` 写；发布时把 `(dispatch_sms<<32)|count` 补标。send_count 复用 role3 footer 每 call 清零区域，零新增状态，dst/scheduler 协议零改动。
+  - **必须 gating 的点**：pass2 循环靠 `pass2_end = route_base if (push_dispatch or fused_dispatch)` 置空跳过——漏掉会让旧 pass2 用未初始化 smem 计数二次写 index，输出错（max|diff|~8.6，dump-y A/B 抓到）。
+  - **性能结论（EP8 A/B，4 calls）**：barrier/count_ready/l1_first/pull_end 全部持平（±0.5µs 噪声内），总时延 fused 200.4 vs 非 fused 207.9（单次，噪声 ±5µs）。**dispatch 段瓶颈是 768 次/ rank 远端 index store 本身，融合只省直方图+重扫 ~1-2µs，被 gmem 原子 slot 依赖吃掉大半**。保留：结构更简、EP32/64 routes 更多时收益可能更大；默认开。
+- **count 发布并行化（已实现→实测回退）**：全部 dispatch CTA 按 expert 连续分块发布（CTA b → experts [b*48,(b+1)*48)，恰好=dst b 的全部 local experts）。结果：barrier −0.7µs、count_ready −0.8µs **改善**，但 l1_first **+2µs 恶化**、总时延 **+8~15µs 恶化**（两次复测一致，非噪声）。推断：8 SM 同时向各 dst 打 48 个远端 atom 的瞬时突发在 dst L2 形成 atom-RMW 积压，挤占随后 pull 读的 fabric/L2 带宽；block0 串行发布的 ~3µs  trickle 反而匹配 dst 排空速率。**已回退为 block0 发布**。教训：远端原子突发的时序模式比总数更敏感，发布并行化此路不通。
+- **剩余 count_ready→l1_first 间隙（~5µs）构成**：发布 issue ~2-3µs（block0 两 loop 各 3 轮远端 op）+ 传播 ~1-2µs + dst acquire/轮询 ~1µs。可挖空间 ~1-2µs（如 block0 单 loop 融合 st+fence+atom 省一轮），收益有限。
+- **bit-exact 方法**：`--check --dump-y DIR`（dump-y 必须配 --check 才生效，在首个采样 call 存 `<mode>.rank<R>.npy`）；跨 env A/B 用 `GC_MOE_FUSED_DISPATCH=0/1` 各跑一次再 np.abs diff——fused 修复后 8 rank 全 exact。
+- **环境备注**：fused=0 的 dump run 出现过一次 7.7ms 异常慢（疑共享主机/首启），y 输出仍有效；EP32/EP64 集群仍被 sat_app 角色卡住，EP8 本地是唯一验证环境。
+
+### pull dispatch 深挖：publish 才是真瓶颈（2026-11-19 补充）
+- **分段探针**（`_eco_trace_rel` slots 37-40 + bench `probe_ns`，GC_MOE_ECO_TRACE=1 plain 也写）：
+  37=route-loop 起点 ~1.0µs | 38=pass 末 ~2.0µs（**融合 pass 仅 ~1.0-1.2µs**）| 39=grid_sync 后 ~3-4µs |
+  40=publish+sync 后 ~9-10µs（**block0 发布 ~5.5-6.5µs = dispatch 元数据的 60%+**）| barrier f0 ~10µs。
+- **publish 成本结构**：block0 单 SM 发 384 matrix st + 384 `atom.relaxed.sys`（每线程 3 轮串行远端 op）——远端 op 注入速率/延迟 bound，非带宽。
+- **优化尝试**：① count 发布 8-CTA 分块（pubpar）→ count_ready -0.8µs 但 atom 突发在 dst L2 背压，总时延 +8~15µs **回退**；② `atom_sys_add_u64`→`red_release_sys_add_u64`（fire-and-forget release 归约，同时替代 fence_acq_rel_sys）+ **pubpar 复用**（red 无 RMW 回读，突发对 dst 更温和）→ probe 显示 publish ~6.5→~3µs，**bit-exact 8 rank 全过**（y_cur vs y_off exact）。干净计时待 GPU 空闲（13:00 起 rtp_llm 8 卡作业 100% 占用）。
+- **认知修正**：index 与 count 在 fused 单遍里本就是同一原子操作的两面（slot 分配+计数累计），不存在"先 index 后 count"的串行；count 无法更早的根因是 count[e,src] 需全部 routes 扫完。真正的串行段是 publish 的 768 次远端 op。
+- **剩余间隙**：count_ready(~16)−barrier(~10) ≈ 6µs = dst 自身 dispatch 未完成不能 poll + NVLink 传播 + acquire——dst 侧 poll 前移（与 publish 重叠）是下一个候选但需防死锁（wait/publish 循环依赖）。
+
+### x-order 首块优先 dispatch（2026-11-19 设计定稿；阶段 A 已实现待验证）
+
+完整设计文档：**`XORDER_DISPATCH.md`**（仓库根目录）。要点：
+- 核心思想：发送序 ≡ 池序 ≡ 消费序，统一 x-order（每 dst 内按历史热度降序、全局按 dst 轮转交错）；src 按 x-order 发 count、dst pool_block 前缀按 x-order 算 → 早到 count 直接对应早 pool_block。
+- x-order 在**专家权重重排时生成一次、复用至下次重排**（零在线成本，隐式商定）；bench 先从 routing_off.npy 聚合 top-K/dst 注入。
+- 已证伪：per-src 独立首块选择（8 src 交集≈0）、在线商定（成本否决）、静态 top-1（命中率~5%）；静态 top-8/dst best-of 期望 ~85 tokens/call（oracle 125）。
+- dst 侧约束：count 等待 per-lane 独立但 warp wave 末尾收敛 → 主线是 **x-order 驱动的渐进调度**（count 到一个排一个，逻辑最简；两阶段只是其特例）。
+- x-order 选集：**greedy max-coverage**（直接优化 E[本call集合内最热expert tokens]，K=8/dst → ~90 tokens、P≥32 78%；K=12 → ~106/90%）。热度跨段稳定 ~90%，单表即可。热度必要性：GEMM 块按 bm 补齐，半空块占 TC 时间等同满块——热度序让早窗口填满块（~2-4× 早期吞吐）。
+- **ECO 约束**：早发布集只能选 fixed/单副本 slots（replica 的 count 走 eco_quota ~15-35µs，dispatch count 无人读）；表生成按 EcoMeta num_fixed/phy2log 过滤候选。
+- 预期：l1_first ~18-20→~10-14µs（物理下限 ~8-11µs 的 ~85-90%）；call -3~4%。pull 吞吐不变（带宽 bound）。
+- 实施分 A（表+src 按序发布）/B（dst 渐进调度）/C（可选残余）三阶段，env `GC_MOE_XORDER` 回退。
+- **阶段 A 实现（2026-11-21，未提交）**：`GC_MOE_XORDER=1` + `GC_MOE_XORDER_ROT=0/1`（默认 1）。
+  表经 role1 空闲的 `tensor_maps` 槽位传入（non-eco 专用；eco/push 不兼容，prepare 侧校验+静默关闭）。
+  发布循环把 canonical expert-id 序改为 per-src 相位旋转序：位置 p→轮 j=p/R、偏移 k=p%R→
+  dst=(rank+1+k)%R、local=table[dst*L+j]；两循环（matrix 行+sum atom）同序。CTA 仍按位置分块。
+  链路：`fp8_fp4_gc_moe(xorder_table=t)` → `launch_gc_moe` → `prepare_role_binaries`（校验
+  int32 CUDA [R*L]、cache key 加 flag、compile_args pos5=xo_view、role1_args 7 元组）；
+  `_binary_key` 含 kernel vars 自动区分 cubin。bench `--xorder K`（plain 模式）从 off 聚合
+  greedy 表（`build_xorder_table`，已在 ep8 routing_off.npy 验证：置换正确、早集/晚集热度比 ~1.4×）。
+  阶段 A 无时延收益（dst 仍等全量 count），价值=正确性验证+阶段 B 地基+ROT 开关可单独 A/B
+  （理论上消同地址 atomic 串行或反而加速 publish）。待 GPU 空档：--check bit-exact + trace。
+
+### x-order 阶段 B 结果 + native 渐进 pull（2026-11-21/22，deepep-dispatch 分支，未提交）
+
+**EP32 三方 trace 结论（p384:plain:384, bm96, T=128, routing_off.npy 真实路由, 8 calls × 32 rank）**：
+
+| µs（slowest-rank 中位） | native | xorder+lazy off | xorder+lazy on |
+|---|---|---|---|
+| barrier（route+pub 发完） | 10.0 | 12.1 | 12.1 |
+| count 全到（field12） | 17.3 | 22.4 | ~21（lazy 跳过轮询） |
+| pull_end | 36.3 | 41.9 | 40.8 |
+| l1_first | **24.9** | 30.3 | 29.2 |
+| gemm_done | 80.9 | ~88 | ~87 |
+
+**x-order 在 EP32/bm96 净负 ~4.3µs l1_first**：前端 +2µs（smem staging+自行发态+旋转发布）、
+首块=最热 expert 满块 96 token（vs native local0 ~64 token 半块），"热 count 早到"不成立
+（每 dst_local count 仍需 32 src release-atomic 齐到，~15-20µs）。XORDER_DISPATCH.md 的
+~10-14µs 目标是 EP8/bm32 外推，无效。`GC_MOE_XORDER` 保持默认关。
+B1（x-order pool 布局）+ B2a（scheduler 渐进发布）+ B2b（lazy pull `GC_MOE_XO_LAZY`）
+全部 bit-exact（32 dumps MATCH）；期间修了 peek-claim 竞态 + off-by-one 两个死锁 bug。
+lazy pull 净效应 ~-0.7µs（count 簇到，skew 仅 ~1.2µs < 轮询开销）。
+
+**native 渐进 pull（prog_native，用户选定"基于 native 微调"）——代码已完成，未验证**：
+- 机制：复用 advance_expert_xo/xo_cover/xo_wait_position 全套，加 `native_order` constexpr
+  （poll_expert=pos 恒等映射，无 xo 表无发布行）。role1 pull 游标按 local expert 序
+  0..L-1 到哪个等哪个 count；role2 scheduler 同序渐进摄入，routed_m_blocks 渐长。
+- impls：`self.prog_native`（env `GC_MOE_PROG_PULL` 默认 '1'；要求 not xorder/eco/push、
+  pull_pipe+chunks==1+stages==2）。bulk count 等待跳过（`not (xo_lazy_pull or prog_native)`×2）、
+  两处 advance_expert_xo 调用点 + post-pull own_pool_blocks 门控放宽、
+  `tensor_maps if tensor_maps is not None else expert_counts` 兜底 xo 参数、
+  schedule_tasks 调用加 `self.prog_native`。
+- scheduler：`prog_native` param；count-init `elif xorder_pool or prog_native`（flag 等待
+  仅 xorder_pool 内）；两处 xo_cover 调用 `xorder_pool or prog_native` + 传 prog_native 作
+  native_order + `xo_ptr if xo_ptr is not None else recv_ptr`；l1_warmup seed 同放宽。
+  locate 后 `local_expert=xo_ptr[..]` remap 保持 xorder_pool-only（native 恒等自动跳过）。
+- **待办**：推送 `gc_moe/scheduler/gc_moe.py` + `gc_moe/impls/sm100_fp8_fp4_gc_moe.py` 到
+  8 节点 **`$W/ep64s/pkg/gc-moe-u30/gc_moe/`**（l20a_launch.sh 的 PYTHONPATH/bench 均指向
+  ep64s/pkg/gc-moe-u30，非 sgpkg/gc-moe！）；先 `--check --dump-y` bit-exact（32 dumps），
+  再 trace A/B（`GC_MOE_PROG_PULL=1` vs `=0`，同 tr_native 参数无 --xorder），
+  对比 l1_first/pull_end/total vs native 基线（24.9/36.3/152.8 trace, ~136 非 trace）。
+- **集群变更（2026-11-20）**：job 重启为 session S915073，wt sat_app 授权失效；
+  新入口 `ssh hole-<IP>`（用户提供）。新集群 = task lk_L20A_35554b93.inference 的
+  parts {0,1,10,11,12,13,14,15}：node-rank→IP = 0:.79(part0,master) 1:.72(part1)
+  2:.87(part10) 3:.96(part11) 4:.92(part12) 5:.76(part13) 6:.90(part14) 7:.88(part15)。
+  包树 = `$W/sgpkg/gc-moe`（gcenv/env.sh 的 PYTHONPATH），bench =
+  `sgpkg/gc-moe/benchmarks/benchmark_gc_moe_eco.py`。启动脚本 `l20a_hole_launch.sh`/
+  `l20a_hole_run.sh`（~/work/mpo/ep64/）。无 env 的 part{3,4,5,7,8} 不可用（.84 另有外部 GPU 负载）。
+- **prog_native 实测（2026-11-20，新集群 EP32 p384:plain:384 bm96）**：
+  bit-exact 通过（32 rank dump ON/OFF 全 MATCH）；非 trace 计时 ON 114.36 vs OFF 113.59µs
+  （**+0.77µs 净负**）；trace（GC_MOE_ECO_TRACE=1, 8 calls）l1_first 26.63 vs 27.27（-0.64µs
+  机制生效）但下游 +1~1.5µs → 总 142.00 vs 141.18。**结论同 xo_lazy_pull：count 在 EP32
+  成簇到达，渐进等待的逐位置 poll+sync 开销 > skew 节省，净负**。
+  `GC_MOE_PROG_PULL` 已改默认关（=1 才启用），代码保留作对照。
+  `GC_MOE_PROG_PULL` 已改默认关（=1 才启用），代码保留作对照。
+
+- **sharded count sums（GC_MOE_SHARD_COUNTS，用户选定）——已实现+bit-exact+实测：中性，默认关**：
+  设计：src 把 tagged count（(dispatch_sms<<32)|count，release-atomic）写进
+  `recv_count[src*L+dst_local]` 自有槽位（替代原 loop1 plain store + loop2 count_sum
+  原子两条远端 op → 只剩 1 条/位置）；block0 的 dispatch warps（warp=expert，lane=src）
+  轮询 32 个槽、warp_redux 求和、`red_release_sys_add_u64` 写回 `count_sum[local]`
+  （格式 (num_ranks*dispatch_sms)<<32|total 与原子累加结果完全一致 → 全部消费端零改动：
+  role1 bulk wait、role2 schedule_tasks、role3 stats、prog_native/xo 路径都不用动）。
+  recv_count 明细读取方全部 `Uint32()` 截断取 low32=count，tag 高位无影响。
+  - **坑1（已修）**：gather 轮询内的 `read_clock64()` 超时 + `device_trap()` 触发
+    ptxas/cutlass 误编译 → IMA/unspecified launch failure。去掉超时（纯自旋）即正常——
+    发布侧保证全 (dst,local) 槽必到，死等只在真 bug 时挂。若要恢复超时需换写法再验证。
+  - **坑2（已修）**：`cutlass.range` 的 Uint32 实参触发 TYPE_UNSTABLE_JOIN；改 while 循环
+    + 显式 Uint32 变量规避。
+  - 实现位置：impls `self.shard_counts`（env `GC_MOE_SHARD_COUNTS` 默认 '0'；要求
+    not xorder/eco/push_dispatch）；发布 loop1 的 st 改 `if not shard_counts`，
+    loop2 的 remote_sum 在 shard 下指向 recv_count 槽；gather 块在发布 sync_threads 后、
+    `_eco_trace_rel(40)` 前（block0 only）。
+  - **实测（EP32 p384:plain:384 bm96，同集群）**：bit-exact 32 rank dump 全 MATCH；
+    非 trace 16-call mean 113.36 vs native 113.59（-0.2µs 噪声级）；trace（同 tr_native
+    8 calls）：barrier 字段（=gather 完成≈count-ready）16.83 vs 原生 field0 8.9
+    （原生 count-ready 在 field12≈17.3）→ **count-ready 两种协议都是 ~17µs，原子排干
+    不是瓶颈**；l1_first 24.91 vs 24.96、pull_end 34.04 vs 33.89、gemm_done 76.45 vs
+    76.52、role3 131.8 vs 132.4 → **全持平**。
+  - **结论**：~17µs count-ready 由 src 侧 route-pass 完成 skew + NVLink 飞行时间主导，
+    dst 侧原子串行排干可忽略；且 l1_first 本来就被首块 pull 投递（~17µs）卡住，
+    count 提前也传导不到 l1_first。**这是第 4 个被证伪的 count 侧方案
+    （x-order / xo_lazy / prog_native / shard sums）——count-ready 与首块投递都是
+    fabric-bound，dst 侧无解。下一个真杠杆只剩 pull 投递路径本身（Stage C）。**
+
+## native pull 细粒度 profiling（2026-11-20，deepep-dispatch 分支）
+
+基础设施（已部署 L20A hole- 集群 8 节点，md5: impls a4ac753f, bench c63f8644, layout 16b64dbb）：
+- `ECO_TRACE_RING_FIELDS` 16→32；role1 新增 14 个相位戳（ring fields 16-29，ns since role1 start，
+  u32；min 字段走 inverted-max：13,14,16,20-25；max：17-19,26-29 中 26/27/28，单写者 store：18/19/29）。
+  串行 pull 路径与 _pull_pipeline 各有一套同字段戳（本 config bm96 走串行 while 循环）。
+- bench `--profile-calls N --profile-dir DIR`：计时后把 call() 抓成 CUDA graph，torch.profiler 下
+  replay N 次（rank 间保持启动同步，避免 eager ~ms 错开吹大跨 rank 等待），导出 kineto rank<R>.json
+  + ring 行 profile_ring_ns [rank][call][32]。
+- 本地合成：`~/work/mpo/ep64/merge_perfetto.py <bench.json> <rankdir> <out.json> p384` →
+  Perfetto/Chrome JSON（ui.perfetto.dev Import JSON）。role 按 grid 区分（16=role1 dispatch/768thr，
+  136=role2 compute，64=role3 finalize+bf16），call 按 kineto correlation id 聚类（每 replay 一组），
+  ring 行锚定 role1 kernel ts（kineto µs = ring ns/1000，period 校验 188.4=188.4 ✓）。
+
+run6（prof_native6）32-rank 稳态相位（med over 32r×8calls，集群退化期 ~+25%）：
+route 0.4→17.7 | grid_sync+join →22.1 | pub1 22.8 | pub2(count_sum原子issue) 26.0 | f0 26.7 |
+counts_ready 54.3（等原子排干 ~27.6µs）| pull_entry 54.5 | first_issue 55.8 | sf 56.4 |
+x_arrive 56.7 | s2g 57.0 | pub_min 59.9 | l1_first 62.4 | pub_max 74.2 | pull_exit 74.7 |
+role1_exit 75.3 | role2 GEMM ~110.7 | role3 ~68.9 | period 188.3。
+kernel dur: role1 77.8 / role2 110.7 / role3 68.9µs。首块窗口 counts_ready→l1_first ≈ 8µs。
+注意：x_arrive 仅 ~0.3µs 是 L2 热数据假象（replay 复用同一 x）；冷启动会更长。
+集群状态：11:11 后 fabric 相位整体 ~2×（tr_native 17.4µs counts vs 54µs），timed median
+130→166µs；GPU 空闲、温度正常，疑似租户 NVLink 争抢，非插桩开销（guarded 单写者戳）。
+
+## native pull 时间线标准测试流程（nat_tr1 方法，2026-11-20 确立，以后就这么测）
+
+要"某模式的 32-rank 相位时间线"一律走这条：benchmark 直跑 + ring 打点 + trace-calls，
+**不要再用 prof_wrap.py / --profile-calls / eager profiling 那套**（那些是 kernel 边界
+视角；相位分解只认 ring）。
+
+### 跑法（L20A hole- 集群 EP32，8 节点 × 4 卡 = 32 rank）
+
+- 代码：本仓库 `deepep-dispatch` 分支；改动后把 `gc_moe/`、`benchmarks/` 推到 8 节点
+  `$W/sgpkg/gc-moe/`（`ssh hole-<IP>` 逐文件 `cat | ssh` 推送 + md5 校验；包树是
+  sgpkg/gc-moe 不是 ep64s/pkg）。
+- 命令模板（`~/work/mpo/ep64/`）：
+
+  ```bash
+  ./l20a_hole_run.sh <tag> "GC_MOE_ECO_TRACE=1" \
+    --off sgpkg/data/routing_off.npy --calls 20 --block-m 96 --cold-l2 \
+    --mode plain384:plain:384 \
+    --warmup 1 --iters 2 --inner-iters 2 --trace-calls 3 \
+    --output-json runs/<tag>.json
+  ```
+
+  - env 必须作为第 2 个参数传（放前面只影响本地 wrapper，远端 torchrun 收不到）。
+  - `--off` 用节点上的 `sgpkg/data/routing_off.npy`（已是 EP32 版 [1200,32,128,6]）；
+    `--output-json runs/<tag>.json` 由 l20a_hole_run.sh 从节点0抓回 `results/se/<tag>.json`。
+  - mode 按需换（native pull = `plain384:plain:384`；其它见 §8.39 mode 集）；
+    shared expert 默认 1（gran_k 32），`--num-shared-experts 0` 为对照。
+- 产出：`results/se/<tag>.json` → `results.<mode>.per_call`（20 个均匀采样 call_id）×
+  `trace_us`（8 个命名里程碑）+ `trace_raw_us`（32 rank × 32 ring 字段，µs 自本 rank
+  role1 起点）。trace-calls 每 call 建"flush+清 ring+call"graph 回放 3 次取稳态、
+  3 个 run 取中位（§8.39 已述）。
+
+### ring 字段表（ECO_TRACE_RING_FIELDS=32，µs since role1 start）
+
+聚合语义：inverted={10(仅 plain),13,14,16,20,21,22,23,24,25} 存 `0xffffffff-elapsed`
+取**最早**；`is_max=True` 取**最晚**；`is_max=False` 仅 block0/tid0 单写。
+bench 已自动反演 {13,14,16,20-25}；**字段 10 需手动 `4294967.295 - v` 反演**。
+
+| f | 含义 | f | 含义 |
+|---|---|---|---|
+| 0 | post-publish 点（pub2 后） | 16 | route pass start（最早） |
+| 1 | role3 start = gemm_done | 17 | route pass done（最晚 warp） |
+| 2 | last shared L1 start* | 18 | grid_sync done（b0t0） |
+| 3 | last routed L1 start | 19 | recv_count publish issued（b0t0） |
+| 4 | route 尾（pass 间） | 20 | pull loop entry（最早） |
+| 5 | last shared L2 start* | 21 | first bulk_g2s issue（最早） |
+| 6 | pull_end | 22 | SF+weight done（最早） |
+| 7 | last routed L2 start | 23 | first x arrive/mbar done（最早） |
+| 8 | last role2 CTA exit | 24 | s2g done（最早） |
+| 9 | role3 done | 25 | first l1_full publish（最早） |
+| 10 | first shared L1 start*（plain 倒置） | 26 | 同 25（串行路径同点戳） |
+| 11 | routing/period（多写者，慎用） | 27 | pull loop exit（最晚） |
+| 12 | counts held（最晚 warp） | 28 | role1_exit |
+| 13 | first routed L1 inputs ready | 29 | count_sum publish issued（b0t0） |
+| 14 | first routed L2 start | 30/31 | 未用（plain） |
+| 15 | eco 专用（role2 input wait ns） | | |
+
+*shared 系字段仅 `shared_experts>0` 且非 eco 时写。串行 while 路径与 `_pull_pipeline`
+同字段两套戳；bm96/T128 走串行路径（run4 实测 fields 20-27 只在串行戳有效）。
+
+### 可视化
+
+```bash
+python3 ~/work/mpo/ep64/nat_tr1_chrome.py results/se/<tag>.json <mode> results/<tag>_chrome.json
+```
+
+→ Chrome/Perfetto JSON：pid=call_id(20) × tid=rank×{dispatch,compute}(64) × ~15 相位带
+（dispatch：prologue/route/grid join/publish/wait counts/pull 五段/tail；
+compute：shared L1+L2/wait routed/L1 GEMM/L2 GEMM/combine）。
+打开 https://ui.perfetto.dev → Import JSON。参考产出：`~/work/mpo/ep64/results/nat_tr1_chrome.json`
+（nat_tr1 run：plain384 bm96 cold-l2 shared1，10900 events）。
+
+### 注意
+
+- trace 模式下 JSON 打印的 mean/median **不可用**（trace run 污染计时），只看时间线；
+  要性能数字另跑不带 TRACE env 的计时（§8.39 标准 A/B）。
+- `--cold-l2` 每 replay 前刷 L2：绝对值偏大，相位结构有效。
+- shared expert 相位结尾 = `f5 + 2.5µs`（shared L2 GEMM 时长估计，sse_tr1 验证
+  64 个 rank-mode 对误差 0；换 bm/配置需重估）。
+- nat_tr1 call631 中位数参考（集群健康期）：route_done 11.6 / counts held 42.3 /
+  pull_exit 62.9 / l1_first 51.3 / gemm_done 103.9 / role3_done 167.9µs；
+  dispatch 全程 ~58µs vs compute ~168µs，compute 是关键路径。
+
+### nat_eplb 变体（2026-11-20，同流程换 eplb448 routing）
+
+同 nat_tr1 流程，仅 `--mode plain384:plain:384` →
+`--mode eplb448:eplb:448:sgpkg/data/routing_eplb448.npy`（EP32 数据集
+`~/work/mpo/data/ep32/`，md5 3147ac95…，已推 8 节点 `sgpkg/data/`；
+**注意 hole 集群 `sgpkg/data/routing_off.npy` = data/ep32 版 md5 8989b4…，
+不是 r32d 版**——eplb 文件必须与 off 同数据集）。产出
+`~/work/mpo/ep64/results/nat_eplb_chrome.json`（10893 events）。
+
+**⚠️ 跑前必须验卡 + 注意 fabric 噪声**：hole 集群是 lk_L20A 共享推理任务的
+parts {0,1,10-15}，NVLink fabric 域横跨整个任务，**其它 part 租户的流量会
+和我们跨节点 count/pull 原子争抢同一条 fabric，nvidia-smi 看不见**。实测
+run-to-run 噪声 ±10µs（dispatch 相位）。规程：跑前 `nvidia-smi` 确认 4 卡
+util 0%（GPU 级），但 fabric 级只能靠重复 run / 对照识别；单次 run 的
+fabric 相位绝对值可能虚高 ~10µs，**A/B 结论要用干净窗口的重复 run 确认**。
+（nat_eplb_v1 即被污染：counts_ready 35.9 vs 干净 26.0；nat_tr1 不敏感因
+自身 routing 不均衡淹没噪声。）
+
+干净数据（v2，已验证 8 节点 4 卡全 0% util，20-call 中位 µs med[rank min..max]）：
+
+| 相位 | nat_tr1 plain384 v2 | nat_eplb eplb448 v2 | nat_eplb_r32d |
+|---|---|---|---|
+| route_done f17 | 11.3 [9–25] | 11.3 [5–15] | 11.4 [5–15] |
+| wait counts f12−f29 | 15.2 [3–22] | **8.6** [3–16] | 8.2 |
+| counts_ready f12 | 38.7 | **26.0** | 25.6 |
+| pull_exit f27 | 59.4 | **48.6** | 48.0 |
+| l1_first f13 | 47.1 | **35.2** | 35.2 |
+| gemm_done f1 | 99.3 | 96.1 | 95.4 |
+| role3_done f9 | 162.8 | **106.9** | 106.1 |
+| shared band 宽 | 24.3 [18–34] | **17.0** [12–22] | 17.1 |
+
+结论（修正版）：
+- **eplb448 在干净数据上收益比 v1 以为的大**：counts −12.7µs、wait −6.6、
+  l1_first −11.9、role3_done −56µs、band −7.3µs。
+- **ep32 vs r32d eplb448 routing 性能完全等价**（v2 vs r32d 逐项相同）；
+  之前"ep32 更难"是 v1 污染误导。
+- **shared band ~17µs 是 hole 集群基线**（v1/v2/r32d 三次稳定 17.0-17.3），
+  sse_tr1 的 9.9µs 是 e32 专用空闲机的水平——band 宽度主要由集群 fabric
+  质量决定，routing 内容只影响最差 rank 尾部（ep32 曾 33，干净后 22）。
+- wait-counts 窗口 eplb 仍更窄（8.6 vs 15.2）但非归零：max 由最慢 rank
+  route pass 决定，eplb 把 skew 换了 rank 没消除（route_done 极差仍 ~10µs）。
+
+## native pull 启动段 stall 定位：三轮 trace 结论（2026-11-20 晚，nat_st1_v2 / nat_st2_v1 / nat_st3_v1）
+
+问题：role2（compute）从 kernel 启动到进任务循环有 ~13-25µs 的 stall，且尾部精确跟着 route_done 走
+（f2 末次 shared L1 claim ≈ route_done ±1µs，corr 0.98）。三轮插桩 trace（EP32 L20A hole，T=128，
+block_m 96, shared 1, 20 calls, GC_MOE_ECO_TRACE=1, ring 扩到 36 字段）逐条排除：
+
+| 假设 | 戳 | 数据 | 结论 |
+|---|---|---|---|
+| tensormap prefetch 风暴（~2700 次 descriptor fetch） | f15 warp0 prefetch 后 | **1.4-1.7µs max，20 call 恒定** | **证伪**（异步指令不占 issue） |
+| `griddepcontrol_wait` PDL 门控 | f33(barrier1 后)→f34(init 返回) | **+0.4µs** | **排除**（sm100 无 launch_dependents） |
+| `recv_parity` volatile 全局读被洪水堵 | f34→f35 | **+0.5µs** | **排除** |
+| barrier 后路径整体 | f33→f30 | **~1.3-1.7µs** | 全部快 |
+| CTA 启动错峰 | f15（136 CTA 的 warp0） | **1.7µs 全部启动完** | **排除** |
+| SM 争抢 | Green Context 分区 | compute+dispatch==total | 已排除（前作） |
+| **最后到达 init barrier 的 CTA 与 route_done 的关系** | f32（每 CTA warp0，136 原子） | **corr(max, f17)=0.929**，med 11.0 / max 22.3µs | **唯一强相关量** |
+
+机制判断：stall 全部在 `_initialize_shared_storage` 的 cluster barrier 前/中；barrier 之后的
+griddep/volatile 读/指针设置合计仅 ~1.3µs。f15→f32 之间只有 ~10 条纯算术指令，却量到 10-20µs，
+说明**插桩本身（每戳 2 次 volatile 读 + 1 atom_max）在洪水峰值期被 L2 拖慢**——这反过来证明：
+该窗口内任何非缓存全局访问都会被 route 写洪水拖 10µs 量级。role2 启动段没有可"消除"的全局读，
+**SMEM tensormap 方案无效**（prefetch 已证无罪）。
+
+推论：shared band 拉宽的根因 = route pass 的 **24.5K 笔散乱 4B 远端 source_idx 写**造成的 L2/NoC 饱和，
+不是 role2 的某条读。修复杠杆只有两个方向：(a) 降洪水强度（减少远端写事务数），(b) 时间错开。
+self-route（dst 自算路由，消灭全部远端 index 写）是唯一能同时改善 band 和启动确定性的方案。
+
+仪器注意：ring 字段 32-35 为本轮新增（layout ECO_TRACE_RING_FIELDS 32→36），32=CTA 到 barrier、
+33=barrier1 放行、34=griddep 后、35=recv_parity 后；f32 必须每 CTA 一个 warp（全 warp 会造成
+1632 原子/rank 串行化 ≈12µs 自扰，nat_st2_v1 即为此污染版）。
+数据：results/se/nat_st1_v2.json（f15/f30/f31）、nat_st2_v1.json（污染版）、nat_st3_v1.json（干净版）。
+
+## self-route 实现与实测（2026-11-20 夜，deepep-dispatch 分支，未提交）
+
+结论：**self-route 已完整实现并 bit-exact 通过，e2e 中位 −13 µs（≈−8%）**，机制与三轮 trace 的
+推断完全一致（role2 启动段 cluster barrier 从 ~33 µs 塌到 ~2 µs）。实现细节、踩坑、相位数据
+全部写在 `SELF_ROUTE_PLAN.md`（已更新为完成态），这里只留要点：
+
+- 开关 `GC_MOE_SELF_ROUTE=1`（默认 0）。**pull 是 role1 做的**，所以整个方案在 role1 内部：
+  每个 dispatch CTA 独占整条 source（`src = block + k*dispatch_sms`，waves=ceil(R/dispatch_sms)），
+  每 src 一次 `bulk_g2s_1d` 读 peer 的 `num_tokens*topk*8` 字节到空闲 pull staging 区，
+  768 线程并行扫描后本地写 `source_idx` + `(src,expert)` count，sum 用 GPU-scope release atomic
+  打 `(dispatch_sms*owned)<<32|subtotal` 让原到达门闭合。role1 跳过远端 index 写和 count 发布，
+  保留 per-rank `grid_sync`（把本地行发布给自己 CTA 的 pull 循环）。
+- 三个隐蔽坑：**capacity=1920 ≠ T=128**（第一版按 capacity 定缓冲 → 守卫静默禁用，跑出来的
+  "on" 其实是旧路，务必看日志有没有 `GC_MOE_SELF_ROUTE=1 ignored`）；count 发布必须
+  `physical_warp == 0`（全 warp 会 24× 打 tag → recv-count timeout trap）；cute-dsl 不允许
+  dynamic for 套 dynamic if（TYPE_UNSTABLE_JOIN），要用 masked stop 把循环提出来。
+- 实测（EP32 hole，T=128 bm96 cold-L2 20 calls，off/on 交替）：off 中位
+  172.2/166.2/175.3/169.0/163.4/161.7/164.4（mean 167.5），on 152.9/152.0/154.1/156.3/155.2
+  （mean 154.1）→ **−13 µs / −8%**，Mann-Whitney p≈0.0013，两组完全不重叠。bit-exact：
+  32 rank × 655,360 bf16，max|diff|=0。
+- 相位（trace 横向对比）：pull_entry 47.8→32.3、pull_exit 109.3→83.7、role2 scheduler 33.3→2.1、
+  role2 barrier1 33.2→1.9、gemm_done 168.6→140.2、role3_done 173.4→145.2 µs。
+  扫描本身只花 ~2.1 µs（f16 earliest 0.83→2.98）。
+- 稳定性：on 6 次里 1 次崩（rank8 首发 LAUNCH_FAILED，其余 rank token-readiness timeout peer=8），
+  off 7 次 0 崩；与本集群历史 flaky 故障同形态，样本不足以归因，采用前需更多重复。
+- 后续价值排序：扫描分块支持大 T（T≥2048 会被守卫禁用）；稳定性采样后再谈默认打开。
+  注：f16/f17 的 27 µs 差大概率是插桩自扰（384 次 atom_max 打同一地址），不是真实 CTA 错峰；
+  **不要扩 ECO_TRACE_RING_FIELDS**——本轮把它 36→40 加干净戳，trace 模式连续两次挂
+  （token readiness timeout / SIGTERM），退回 36 立刻恢复，要加戳就改现有字段的发射者。
+
+## shared 耗时不均的根因排查（2026-11-21/22，EP8+EP16，deepep-dispatch）
+
+结论先行：**shared 的跨 rank 差异与 pull / routed / barrier / 内存带宽全都无关**；它是
+"同一块 shared tile 在特定 GPU 上执行时间本身会 1.6–2.4× 波动"，且只在多 rank（symm_mem 分配）
+下出现、随 rank 数放大。下面是把这条路走完的完整口径与排除清单，避免以后重复踩。
+
+### 新测量工具（都在工作树里，默认关，不改变生产路径）
+
+- `--dump-shared-dbg DIR`（bench）：落 `shared_dbg.rank<R>.npy`(68×2, 每 cluster `~start/done`)，
+  `shared_dbg2.rank<R>.npy`(68×4, 见下)，`trace_ring.rank<R>.npy`(64×36)。
+  eager 路径现在也会分配 ECO 区（`args.eager_iters or args.dump_shared_dbg`），否则 trace ring /
+  role1-start 槽在 buffer 之外（UB）。
+- `SHARED_DBG2_OFF`（layout，byte offset，16B 对齐）= `expert_send_count` 字段尾部；
+  u64 槽位（注意 `signals.iterator` 是 Uint32 指针，**+N 是 N 个 word = N/2 个 u64**）：
+  `[0]` L1 总工时 ns、`[1]` L1 任务数、`[2]` L2 总工时 ns、`[3]` L2 任务数、
+  `[8]` ~最早 CTA 启动（min）、`[9]` 最晚 CTA 启动（max）。工时用 `sh_t0`（每个 epilogue warp 在
+  任务开始时自己读 `read_globaltimer()`）累加，role2 的**三份任务循环（warp0/warp1/warp>=4）各要一份**。
+- 探针开关（全部默认 0，输出可能错，只用于归因）：
+  `GC_MOE_PULL_META=1|2`（peer 的 topk-weight / +SF 整表 bulk 到本地 scratch，pull 改本地读）、
+  `=3`（完全不读远端 SF/weight）、`=4`（不写 ring）、`=5`（源地址全本地化）；
+  `GC_MOE_NO_PULL=1`（role1 只路由，需配 NO_ROUTED）、`GC_MOE_NO_GRIDSYNC=1`（跳过 rank barrier）、
+  `GC_MOE_SCAN_LOCAL=1`（self-route 扫描读本地表）、`GC_MOE_SYNC_BACKOFF=<ns>`（grid_sync 自旋退避，
+  `nanosleep_u32`）、`GC_MOE_NO_ROUTED=1`（role2 不跑 routed）。
+- 运行器：`/data0/home/nanjun.cp/work/mpo/ep64/pm_run.sh <tag> <hosts-csv> <nnodes> "<env>" <args>`，
+  自带空闲门禁（apps==0 且 max_mem<=200 MiB）、结果落 `results/se/<tag>.json`；
+  `python3 /tmp/shsum.py`（或按需重写）打印 `eager_shared_ranks` 的 med/min/max/spread。
+  EP8 = `.72`+`.96`（数据在 `sgpkg/data/routing_id8_t96.npy` / `_t192` / `routing_id{2,4}.npy`）。
+
+### shared 的真实几何（解读一切数字的前提）
+
+`l1_clusters = (2*intermediate/128)//2 = 18`，`l2_clusters = (hidden/128)//2 = 20`；
+L1 任务 = `m_blocks*l1_clusters`（T=128,bm96 → 36），L2 任务 = `m_blocks*l2_clusters`（40）；
+`publish_shared_phase` 在 `total <= compute_sms//2` 时走**静态分配**（cluster c 领 task c），否则全局认领。
+**L2 任务必须等 `shared_l2_full_count == l1_clusters*shared_experts*2`**，即 L1 全部完成后才开始 →
+L1/L2 之间有硬屏障，任一 L1 慢就整体后移。
+
+### 排除清单（EP8/EP16 干净窗口，每项都跑过对照）
+
+| 嫌疑 | 实验 | 结果 |
+|---|---|---|
+| pull 的 SF/weight 散读 | `PULL_META=1/2` bulk 化 | 无变化 |
+| 同上 | `PULL_META=3` 完全不读 | 无变化（23.8/2.25×） |
+| ring 脏写 | `PULL_META=4` | 无变化 |
+| fabric 流量 | `PULL_META=5` 全本地化 | 无变化 |
+| pull 整体 | `NO_PULL=1`（+NO_ROUTED） | 仍 2.41×（20.2/15.2–36.7） |
+| routed GEMM | `NO_ROUTED=1` | 仍 ~2× |
+| role1 barrier 自旋+驻留 | `NO_GRIDSYNC=1` | 26.0/2.61×，无改善 → 退避也无意义 |
+| role1 的 16×6KB peer 读 | `SCAN_LOCAL=1` | EP8 29.1/2.79×、EP16 26.0/4.49×，无改善 |
+| 时钟 / SM 数 / L2 | `clk_stats` + device props | 全部 2062/3996 MHz、152 SM、129.2 MB，逐 rank 相同 |
+| HBM 带宽 | 2 GB copy + 60 s 循环 | 13.4–13.5 TB/s copy、12.5–12.9 read，p95 一致，**无外部干扰** |
+| symm vs torch 本地带宽 | 128 MB sum/fill、SF 列主序散读 | 比值 0.95–1.16，无差异 |
+| 共享权重物理位置 | `--se-offset-sweep 4`（0/64/128/192 MB padding） | 快 rank 不敏感（14–17）；慢 rank 同一分配 20→41 µs 漂移，**无单调趋势** |
+
+### 正向结论（可复现）
+
+1. **纯 shared（R=1×N 进程，plain torch 分配）**：13.6–15.4 µs，1.08–1.26×，逐卡一致。
+2. **R=16 探针（pull/routed/barrier 全关）**：20.2–26.0 µs，2.4–2.9×；R=8 探针 17–29 µs，1.6–1.8×；
+   R=4 探针 **.96 = 15.7/15.7/15.9/15.8（1.01×，完全均匀）**，**.72 = 14.9/20.8/17.0/15.9（1.40×）**。
+   → 差异随 rank 数放大，且**按节点/GPU**区分（.72 的 g0–g2 系统性偏慢，g3 与 .96 全卡正常）。
+3. 拆相（`SHARED_DBG2` 工时累加器）：慢 rank 是**每任务工时**更大，不是排队——
+   rank0：L1 12.1 µs/任务、L2 6.7；rank1：L1 19.1、L2 16.2（1.6–2.4×）；CTA 启动偏斜只有 ~3 µs 且各 rank 相近。
+4. 逐 cluster 的 start/dur 呈周期 4/8 结构（同一 rank 内），相位随 rank 变；慢的总是"早启动"的 L2 任务
+   （与后一批 L1 重叠）→ L1/L2 硬屏障 + 重叠是放大器，不是根源。
+5. 慢 rank 在同一权重分配上会在一次 run 内从 20 µs 漂到 41 µs（`se_sweep` 的 ref 列）→ **间歇性**。
+
+### 下一步（未做完）
+
+- 用 `GC_MOE_DBG_COMPUTE_MINUS` 或改 `compute_sms`，确认 role2 的 green-context 实际拿到多少 SM
+  （136 CTA 需要 136 SM；若某些卡只给到 128 会退化成两波 → 正好是 2× 的形态）。
+- 在慢卡上用 `--profile-calls` 抓一次 per-rank timeline，看 shared tile 是"等 TMA"还是"等 MMA"。
+- 若确认是 green-context/CTA 放置问题：把 role2 的 CTA 数压到实际可用 SM 数以下，或固定 SM 亲和。
+
+### 追加（同日）：几何与放大器确认
+
+- `publish_shared_phase`：`total = m_blocks*n_clusters`；`total <= compute_sms//2` 时静态分配
+  （cluster c 领 task c），否则全局认领。T=128,bm96 → L1 36 个、L2 40 个，**各一波**（68 cluster 够用）。
+- L2 的门是**按 M-block**的：L1 epilogue 每个 cluster 的 2 个 CTA 各 `+1` 到
+  `shared_l2_full_count + pool_block`，阈值 `l1_clusters*shared_experts*2`（=36，正好一块的量）。
+  所以 shared 总时间 ≈ **max(36 个 L1 tile) + max(40 个 L2 tile)**：任一 tile 慢就整相位后移，
+  慢卡上会**每个相位各乘一次**。
+- `GC_MOE_DBG_COMPUTE_MINUS=2/8`（compute_sms 136→134/128）：EP8 spread 2.19×/2.06×，
+  与 136（2.01×）无差别 → **不是 role2 CTA 放不下/green-context SM 不足**。
+- 跨 6 次 EP8 run，**rank1（.72 GPU1）始终最慢（26.9–34.3 µs，其余 15–20）**；
+  `.96` 在 R=4 下是 1.01× 完全均匀。时钟/SM/L2/带宽/分配器/权重位置全部相同 → 结论：
+  **残差是机器级（特定 GPU）的执行时间异常，不是软件并发**；软件侧唯一的放大器是上面那个两相位结构。
+- 实用含义：shared 的"均衡"不要指望跨 rank 一致；要压它的时间只能减少相位串行（例如把 L1/L2 融合，
+  或让慢卡少分 tile），而 pull/routed 侧的优化与它无关。
+
+### 根因（本轮收敛）：**"每相位取最慢 tile" × 两相位串行**，不是任何流量源
+
+用 `shared_dbg2` 的逐 cluster 相位戳（e8s1，EP8 T=96 探针）算出来的决定性数据：
+
+| rank | L1_max | L2_max | L1_min | L2_min | span |
+|---|---|---|---|---|---|
+| 3–7（快） | 10.7–11.2 | 10.2–10.6 | 8.2–8.8 | 7.4–7.8 | 17.5–17.9 |
+| 2 | 12.1 | 13.2 | 8.6 | 7.8 | 20.3 |
+| 0 | 14.6 | 17.3 | 8.8 | 7.5 | 24.3 |
+| 1 | 16.2 | 22.7 | 8.8 | 8.0 | 30.8 |
+
+- **典型 tile 在每个 rank 上都是 8–10 µs（min 完全一致）** → 工作量本身逐 rank 相同；
+- 差异全部来自**相位内的慢 tile**：慢 rank 上 36 个 L1 tile 里有 17 个 >1.3×min、
+  36 个 L2 tile 里有 18–26 个；快 rank 上只有 0–1 / 4–12 个；
+- shared 的结构是 **L1 波（36 tile 一波）→ 每 M-block 的门（`shared_l2_full_count`）→ L2 波（40 tile）**，
+  相位时长 = 该波最慢 tile → **慢 tile 的惩罚被完整暴露两次**（span ≈ L1_max + L2_max − 重叠）。
+
+因此"根因"分两层：
+1. **直接原因（可改）**：两相位串行 + 每相位取 max，使任何 tile 抖动按 ~2× 放大；
+2. **抖动来源（不可控/环境）**：某些 rank/GPU 上相位内一大片 tile 变慢 1.3–2.8×，且随 run 漂移；
+   已排除时钟/SM/L2/HBM 带宽（13.4 TB/s，p95 一致）/分配器/权重物理位置/共租（空闲采样 0%/0MiB）/
+   green-context SM 数（`DBG_COMPUTE_MINUS=2/8` 无变化）/CTA 启动偏斜（~3 µs，各 rank 相近）。
+
+**下一步实验（还没做）**：把 L2 门改成"等所有 L1 tile"（全相位分离），看 spread 是否下降 →
+若下降，说明 L1(block1) 与 L2(block0) 的重叠是那个"一片变慢"的来源，可以按这个方向改调度；
+若不下降，就只剩 tile 级的 L2/NoC 仲裁，软件侧唯一手段是减少相位串行（融合 L1/L2）或细分 tile 摊平 max。
+
+### 根因（最终）：**K-loop 是延迟受限（35% 等 TMA 数据）+ 两相位取 max**，逐 GPU 的 TMA/L2 供给延迟差异被 1:1 放大
+
+新增测量：在 MMA leader 的每个 K-block `mbarrier_wait(data_full)` 前后打点，累加到
+`SHARED_DBG2` 的 `[20]`(总等待 ns) / `[22]`(等待次数)。EP8 T=96 探针（`.72`+`.96`，8 次 eager call）：
+
+| rank | L1 总工时 | L2 总工时 | 等数据 | 等待占比 |
+|---|---|---|---|---|
+| 0–2（.72 g0–g2） | 597–612 µs | 371–399 | 354–374 | 36.4–37.0% |
+| 3–7（.72 g3 + .96 全部） | 502–518 | 305–338 | 277–295 | 33.8–34.6% |
+
+关键推论（把"带宽"彻底排除）：
+- **L1 读 23.6 MB（W1），L2 只读 11.8 MB（W2），但两者耗时几乎相同**（快 rank：L1_max 10.7–11.2 vs
+  L2_max 10.2–10.6）→ tile 时间**与字节数无关**，是**每个 K-block 的固定流水成本 + TMA 延迟**，
+  不是 HBM 带宽（13.4 TB/s 的 1/3 都没用满，与前面所有带宽类实验的否定结果自洽）；
+- 约 **35% 的时间在等 `data_full`**，说明流水深度（`stages` 已按 SMEM 上限取最大，见
+  `heuristics/gc_moe.py: stages = budget_stages`）不足以完全掩盖 TMA 延迟 → tile 时间 ≈
+  40 个 K-block × (每块固定成本 + 未被掩盖的 TMA 延迟)；
+- 因此**逐 GPU 的 TMA/L2 供给延迟差异（1.3–2.8×）会 1:1 变成 tile 时间差异**，再被
+  "L1 波 → 门 → L2 波，每波取最慢 tile"暴露两次 → rank 级 1.3–2.9× 的 spread。
+- 逐 GPU 的慢是**稳定**的（`.72` g0–g2 在 8+ 次 run 里始终最慢；`.87` g1/g3、`.92` g0 各出现过），
+  但**无法归因到任何可测硬件量**：时钟 2062/3996 MHz 全程无 throttle（`clocks_throttle_reasons=0x0`，
+  功率 215–229 W，温度 31–32 °C）、152 SM、129.2 MB L2、HBM copy 13.4 TB/s（60 s 循环 p95 一致）、
+  symm≈torch、权重物理位置无单调趋势、`COMPUTE_MINUS` 无变化、CTA 启动偏斜 ~3 µs、空闲 0%/0MiB。
+
+**结论一句话**：shared 耗时不均是"**延迟受限的两相位结构 × 逐 GPU 的 TMA 供给延迟差异**"，
+不是带宽争用、也不是 pull/routed/dispatch/barrier 的任何流量；软件侧唯一杠杆是**减少相位串行**
+（融合 L1/L2 或细分 tile 让 max 摊平），或**加深 K-loop 流水**（受 SMEM 上限约束，当前已取最大）。
+
+### 补充：内存类型不是根因；根因是 .72 的 GPU0–2 在"大块对称分配"下的执行异常（2026-11-22）
+
+- **`GC_MOE_PLAIN_ALLOC=1`**（R=8 强制普通 `torch` 分配 + `peer_addresses` 自映射；探针下无 peer 访问，安全）：
+  实测**更差**——总工时 spread 2.22×/2.29×（symm 是 1.38×/1.86×），且整体变慢。
+  → **对称内存不是问题，反而比普通分配好**；之前"symm 映射是慢路径"的假设被否定。
+- **`GC_MOE_ALLOC_PAD_MB=<N>`**（在 `get_symm_buffer_for_gc_moe` 之前垫 N MB，移动对称分配的物理落点）：
+
+| pad | rank0 | rank1 | rank2 | rank3 | rank4–7 |
+|---|---|---|---|---|---|
+| 0 | 920 | 1125 | 872 | 820 | 813–826 |
+| 64 | 1183 | 1505 | 1040 | 815 | 811–831 |
+| 192 | 1164 | 1592 | 991 | 831 | 786–826 |
+| 384 | 958 | 1230 | 829 | 815 | 772–823 |
+
+  → **rank3–7（.72 g3 + .96 全部）恒在 772–831（±4%），对落点完全不敏感**；
+  **rank0–2（.72 g0–g2）始终更高且随落点 920→1592→1230 大幅波动**。
+- ECC / Retired Pages / Remapped Rows：两节点全部干净且一致；时钟、SM 数、L2、HBM copy 带宽也一致。
+  → 这个退化**只有这个 workload 能看见**（延迟受限的 TMA 通路），常规健康检查全部漏检。
+
+**最终根因（本集群口径）**：shared 耗时不均 = **两相位取 max 的结构放大器** ×
+**.72 GPU0–2 在大块对称分配下的执行退化（1.2–1.9× 总工时，且对物理落点敏感）**；
+健康的 GPU（.72 g3 + .96 全部）逐 rank 稳定在 ±4%。R=1 纯 shared 之所以均匀，是因为那次是
+**小分配 + plain torch + 单 rank**，退化不出现。
+
+**实用建议**：EP 级实验前用 `SHARED_DBG2` 的 `[0]+[2]`（shared 总工时）做**逐卡健康门禁**——
+比 clocks / bandwidth / ECC 敏感得多；发现某卡总工时比其他卡高 >10% 就换卡。
+
+### 重要更正（2026-11-22）：**插桩会抬高 shared 时长 ~23%，此前"多 rank 更慢"的结论作废**
+
+`SHARED_DBG2 [20]/[22]`（K-block 等数据）的实现是**每个 K-block 一次 `read_globaltimer()` + 2 次 `atom_add_u64`**
+（一个 call ~3000 次），实测把 shared span 从 15.5 µs 抬到 19.4 µs（**+23%**）。
+所有"多 rank / 跨节点更慢"的数据都是在**带插桩的构建**上测的，而"R=1 很快"的数据是**无插桩**的旧构建
+→ 那 30% 的差距是插桩差异，不是 rank 数差异。**该插桩已改为默认关闭（`GC_MOE_SHARED_DWDBG=1` 才开）**。
+以后任何 A/B 必须保证**插桩开关一致**，否则结论无效。
+
+**干净构建（无该插桩）的最终数据**：
+
+| 配置（探针：NO_ROUTED+NO_PULL+NO_GRIDSYNC+SCAN_LOCAL） | 逐 rank（µs） | 中位 | 比值 |
+|---|---|---|---|
+| R=4，单节点 `.96`（两次） | 15.6 15.4 15.5 15.3 / 15.3 15.0 14.8 14.9 | 15.5 / 14.9 | **1.02× / 1.03×** |
+| R=4，单节点 `.72`（两次） | **21.1 22.7** 15.6 14.9 / **20.6** 15.3 **17.0** 15.0 | 18.3 / 16.1 | **1.52× / 1.37×** |
+| R=8，跨节点 `.72`+`.96` | **19.8 22.6 18.0** 15.8 \| 16.1 15.7 **18.0** 16.7 | 17.3 | 1.44× |
+| R=1（4 个独立单 rank 进程/节点，无插桩） | 13.6–15.4（16 个 GPU） | 15.4 | 1.13× |
+
+**结论（干净口径）**：
+1. **只要 GPU 是健康的，shared 就是均匀的**（`.96` 四次测量：1.01–1.03×，14.8–15.6 µs，与 R=1 的 15.4 一致）；
+2. 不均**全部来自特定 GPU**：`.72` 的 g0/g1/g2 是 17.0–22.7 µs，而 g3 与 `.96` 全部是 14.8–16.1；
+3. **没有**"多 rank / 跨节点 / 分配器 / NCCL"效应——那些是插桩偏差 + run 噪声；
+4. shared 的两相位（L1 波 → 每 M-block 门 → L2 波，每波取最慢 tile）把单卡慢 15–45% 放大成 rank 级 1.4–1.5×。
+
+## EP16 shared gate 不稳定：根因 = CTA mod-8 共调度 stagger，修复 = GC_MOE_SHARED_DYNAMIC（2026-11-22）
+
+问题：`.96`/`.82` 在 EP8 下 shared gate 时间稳定（19–21 µs，≤1.1×），EP16 下不稳定
+（24–41 µs，最高 1.72×–2.6×）。以下全部实验在探针配置（`NO_ROUTED+NO_PULL+NO_GRIDSYNC+SCAN_LOCAL`）
+下做，排除 pull/routed/barrier 干扰。
+
+### 根因链（已逐级证实）
+
+1. **现象**：EP16 下 shared L1 任务**启动时刻**按 cluster 索引呈**周期 8 的 4+4 分组**
+   （`LLLLeeeeLLLLeeee…`，相位逐 rank 偏移），晚组比早组晚 8–16 µs 启动；而**完成时刻几乎相同**
+   → gate 被最晚启动的 cluster 钉死。EP8 无此现象（全部 ~4 µs 启动）。
+2. **触发条件**（四组对照）：`max(num_ranks, dispatch_sms) ≥ 16` 即触发；两者任一到达 16 都会：
+   EP8+ds16（compute=136）不稳、EP16+ds8（compute=144，SM 划分与 EP8 完全相同）也不稳、
+   只有 EP8 默认（ranks=8, ds=8）稳。**不是** compute_sms/workspace 尺寸本身。
+3. **排除项**：散写 source_idx / count 交换（SELF_ROUTE=1 后 pattern 仍在）、workspace 撑大
+   （e8pad86）、L2 cache 策略（evict_last）、NCCL 后端（gloo）、`GC_MOE_BALANCED_WORKQUEUES=0`。
+4. **定位**（新增 per-cluster warp0 loop-entry 插桩，`shared_dbg2` flat u64 160+c，inverted-max 存储）：
+   **stagger 完全在 consumer 侧 CTA 就绪**（prologue 完成、进入消费循环的时刻）：
+   r6：loopE 3.6 vs 12.3 µs ≈ 100% 的 start stagger；r0/r5/r13：loopE 占 80–100%。
+   任务本身早就发布好了（早组 pickup 延迟仅 ~0.5 µs）→ **调度器/publish 不是瓶颈**。
+5. **硬件根源**：L20A `smCount=152, smCoscheduledAlignment=8` —— CTA 按 8-SM 对齐组共调度，
+   交替组就绪时刻不同 → cluster（2 CTA/组×4）按 mod-8 分早晚。role1 足迹变大
+   （rank 或 dispatch SM 到 16）把该 skew 从 ~1–2 µs 放大到 8–16 µs，进入 gate 可见区间。
+
+### 修复：`GC_MOE_SHARED_DYNAMIC=1`（已实现 + 已验证）
+
+把 shared 阶段的调度从"静态一 cluster 一任务"切到**原子全局抢占**（复用既有 dynamic claim 路径，
+3 处 `publish_shared_phase` 调用点传入 `sh_sched_sms=0` 强制走 claim 循环）：
+早就绪的 cluster 先抢任务，晚调度的 CTA 抢不到直接跳过，shared 不再被晚组钉死。
+
+**EP16 探针实测（4 节点 16 rank，`routing_id16_t96`，bm96）**：
+
+| 配置 | gate 范围 | 比值 | start pattern |
+|---|---|---|---|
+| baseline（static） | 24.1–41.5 µs | **1.72×** | `LLLLeeeeLLLL…` |
+| `SHARED_DYNAMIC=1` | 19.6–25.9 µs（15/16 rank 在 19.6–21.5） | **1.32×** | **全 `eeee…`（mod-8 消失）** |
+
+**bit-exact**：EP16 full mode（self_route+真实路由）`--check --dump-y`，static vs dynamic
+16 个 rank 全部 **bitwise-identical**（max|diff|=0）；e2e 2573.2 → 2564.9 µs（略优）。
+
+注意：修复针对的是"调度 stagger"这一层；单卡偶发慢（如 r14 一次 25.9 µs）仍可能由
+不健康 GPU 造成，两类问题要用 per-cluster 数据区分（mod-8 pattern vs 孤立离群）。
+
+### C1 实验（GC_MOE_DISPATCH_AFTER_READY=1，2026-11-22）：机制证实，但不是正确的修复
+
+实现：软门（不动 graph 拓扑）——role1 照常启动（保留 per-call clears/epoch 次序），但在路由流量开始前
+自旋等 role2 全部 CTA 过 prologue。握手字放在 x-order row 尾部（plain 路径无人使用，buffer 创建时
+`zero_()` 保证初值为 0）：每个 role2 CTA 的 tid0 对 u64 ready 计数 atom_add；凑满 compute_sms 个的
+CTA 用 `st_release_u32` 盖 release flag；role1 的 tid0 自旋 `ld_acquire` 直到 flag 离开入口快照，
+然后 `sync_threads` 放行整个 CTA。
+
+**EP16 探针四方对比（同机同配置，routing_id16_t96，bm96）**：
+
+| 配置 | gate 范围 | 比值 | span 中位 | 任务落在哪些 cluster |
+|---|---|---|---|---|
+| baseline（static） | 24.1–41.5 µs | 1.72× | 18.6 | 固定 0–19 |
+| C1 gate | 30.9–43.8 µs | 1.42× | **29.8** | 固定 0–19（start 干净 2–5 µs） |
+| C1+DYNAMIC | 24.0–33.2 µs | 1.38× | 23.1 | 混合（0,2,3,9,10,11,18,19…） |
+| **DYNAMIC（纯）** | **19.6–25.9 µs** | **1.32×** | **15.4** | **mod-8-early 位置（4,5,6,12,15,29,30,31…）** |
+
+结论：
+1. **机制证实**：C1 门让 role2 的 readiness stagger 完全消失（start 2–5 µs，mod-8 pattern 没了）——
+   直接因果证明 role1 的 burst 拉伸 role2 的 CTA 就绪窗口（根因确认）。
+2. **但作为修复失败**：role1 的 burst 释放点正好落在 shared GEMM 的权重流窗口上，全部 20 个 cluster
+   的 span 均匀拉到 ~29–31 µs（与 SM 位置无关）——竞争没有消失，只是从"readiness 窗口"搬到
+   "GEMM 窗口"，gate 绝对值反而更差（30.9–43.8 vs 24.1–41.5）。
+3. **附带发现**：纯 DYNAMIC 的优势有两个来源——(a) 早就绪 cluster 先抢任务；(b) 抢到任务的 cluster
+   恰好是 mod-8-early 的**快路径 SM 组**，其 GEMM 权重流对 role1 并发流量有韧性（span 15 µs 不变）。
+   C1+DYNAMIC 把 readiness 抹平后，抢任务变成 atom_add 落地顺序的随机竞争，claimers 混合了
+   快/慢路径组，span 居中（23.1）。
+4. **最终排序：纯 SHARED_DYNAMIC >> C1+DYNAMIC > C1 > baseline**。e2e 四者持平（2496–2552 µs）。
+
+残留问题（若未来要更进一步）：慢路径 SM 组（mod-8 late）的 GEMM 在 role1 流量下 span 拉伸的
+微结构（L2 slice / 内存通道映射）未直接测到；C2（role1 重流量避开 shared 窗口、错到 routed 窗口）
+是理论上的下一档，但 routed 相位的敏感性未知，且 e2e 已持平，收益存疑。
+
+### DYNAMIC 干净环境复测（2026-11-22 晚：完美均衡 routing + 筛选后的 16 卡）
+
+动机：此前 DYNAMIC 的 1.32× 里 r14 是单卡慢（span 20.2 vs 群体 15.x）——用逐卡门禁筛出的
+干净 16 卡 + identity routing（imbalance **1.00×**，每 rank 精确 2304 对）重测，排除硬件混淆。
+
+环境：9 台候选 R=4 门禁（三口径，阈值 ≤1.15×/end≤22µs）后选 **.96+.82+.92+.87**
+（本轮 1.02/1.09/1.03/1.05×；.79/.87 从早前 FAIL 恢复——GPU 健康会漂移，门禁必须每次跑）。
+同硬件同 routing 干净 A/B（probe，routing_id16_t96）：
+
+| | STATIC | DYNAMIC |
+|---|---|---|
+| gate | 24.1–48.3 µs，**2.00×**（去最大 1.86×） | 19.4–24.5 µs，**1.26×**（去最大 **1.12×**） |
+| span 中位 | 14.8–27.4（混合） | 15.0–21.0（15/16 在 15.0–16.0） |
+| start pattern | `LLLLeeee`/`eLLLLeee`/`eeee`（mod-8 在） | **全 `eeee`** |
+| start 范围 | 3.8–**32.7** µs | 2.8–**6.0** µs |
+
+结论：
+1. **同硬件同路由下，DYNAMIC 把 gate 从 2.00× 压到 1.26×（去单卡离群 1.12×）**，start 从
+   32.7 µs 的 stagger 压到 6.0 µs 以内——干净环境下 DYNAMIC 的效果比之前（1.72×→1.32×）更显著；
+2. 唯一残余仍是**单卡慢**：.92 g0 的 span 21.0 vs 群体 15.5（门禁时 1.03× 没抓到——单次 R=4
+   筛查对边际卡的检出力有限，EP16 满载才显形）；排除后 **1.12× = EP8 健康基线同级（1.07–1.10×）**；
+3. 完美均衡 routing 不改变结论（shared 与 routing 无关，m_blocks 只看 num_tokens）。
+
+### #4 测量口径 + #1 任务细粒度化（2026-11-22 深夜，干净 16 卡 + DYNAMIC + identity routing）
+
+**#4（bench 改动，已部署）**：`benchmark_gc_moe_eco.py` 的 eager 计时循环现在**逐 call 读 shared_dbg**
+（6 次计时各读一次），三口径各取跨 call 的 **median/max/min**；新增输出行：
+`shared gate (us, N-call median): min..max ratio | worst-call | best-call | per-rank[...]`，
+JSON 增加 `eager_shared_end_worst/best_ranks` 与 `shared_calls` 序列。此前单 call 采样的噪声被消除。
+
+**#1（任务细粒度化）**：读代码后发现 **N 维切细被 MMA 硬约束挡死**（`MixedMmaTile` 强制
+BN128 × 2-CTA = 每任务固定 256 列，`n_cluster*2+cta_rank` 定位）。可行的是 **M 维**：
+`--block-m` 从 96 降到 64/32 → `m_blocks` 1→2/3，任务数 20→40/60，且 L2(m=0) 与 L1(m=1) 流水。
+
+EP16 干净 16 卡（.96+.82+.92+.87）+ DYNAMIC + identity routing（1.00×）实测：
+
+| block_m | m_blocks | 任务数/相位 | gate 中位（跨 rank） | 比值 | worst-call | e2e |
+|---|---|---|---|---|---|---|
+| 96 | 1 | 20 | 19.7–24.0（中位 ~20.4） | 1.21× | 1.32× | 2492 µs |
+| **64** | **2** | **40** | **17.8–22.3（中位 ~18.4）** | 1.25× | 1.37× | 2509 µs |
+| 32 | 3 | 60 | 20.8–24.9（中位 ~23.0） | 1.19× | 1.19× | 2540 µs |
+
+结论：
+1. **bm64 是甜点**：两相位流水（40 个 cluster 各扛半尺寸 M-tile，L2(m0) 与 L1(m1) 重叠）把 gate
+   绝对值降 ~2 µs（-10%）；bm32 过头（M=32 tile 的 MMA 效率损失吃掉粒度收益）。
+2. **比值不随粒度改善**（1.19–1.25× 持平）——跨 rank 比值由**单卡漂移**决定（三次 run 的离群
+   rank 各不相同：bm96 是 r8、bm64 是 r5/r10/r15、bm32 是 r5），这正是 #4 新指标暴露出来的：
+   每卡 6-call 中位很稳，但卡与卡之间会漂。
+3. N-split 方向（半宽 tile）硬件不可行；M-split（block-m 调参）已榨出可得的绝对值收益，
+   对"跨 rank 不均"无进一步贡献——再次确认残余全部是单卡硬件层。
+
+### +pull 层实验（2026-11-22 深夜）：activation pull 对 shared gate 零增量（结构性地不重叠）
+
+设定：EP16（.96+.82+.92+.87，重扫空闲后沿用），`SHARED_DYNAMIC=1` + `ECO_TRACE=1`，
+真实路由 `routing_r16.npy`（T=128，imbalance 1.61×），bm96（m_blocks=2，40 任务/相位），
+NO_ROUTED=1 保持 routed 关闭。两个 arm 只差 pull 一个变量（均为真实 scan + gridsync，非 scan_local 探针）：
+
+| arm | 配置 | gate 6-call 中位 | 比值 | worst-call | e2e |
+|---|---|---|---|---|---|
+| A | `NO_ROUTED=1 NO_PULL=1`（dispatch only） | 21.5–27.6（均值 ~24.9） | 1.28× | 1.53× | 2494 µs |
+| B | `NO_ROUTED=1`（dispatch + pull） | **21.6–27.2（均值 ~24.3）** | **1.26×** | 1.38× | 2541 µs |
+
+结论：
+1. **pull 对 shared gate 零增量**（均值 24.9 → 24.3，噪声内）；e2e +47 µs 证明 pull 确实在跑。
+2. **结构性原因**：role1 的相位序是 scan/count（~2µs 起）→ rank grid barrier（count 交换完成在
+   ~100–200µs，trace f12）→ pull（barrier 之后）。而 shared 的窗口是 4–28µs——**pull 的流量
+   落在 shared 完成之后 ~170µs**，物理上不可能干扰。pull 只拉长 role1 自身（+47µs e2e）。
+3. 附带发现：**真实路由的完整 dispatch 流量**（peer 扫描 + source_idx 写 + count 交换，Arm A）
+   比 scan_local 探针口径（identity，gate 均值 ~20.4）**贵 ~4µs**——dispatch 层在真实路由下更重。
+4. 三个 run 的离群 rank 继续轮换（ArmA: r1/r5/r8/r10/r15；ArmB: r5/r13/r15）——间歇尖峰特征不变。
+
+### +routed 层 + shared_first 开关（2026-11-22 深夜）：routed 零增量；shared_first 有害
+
+设定：EP16（.96+.82+.92+.87），`SHARED_DYNAMIC=1` + `ECO_TRACE=1`，真实路由 `routing_r16.npy`
+（T=128），bm96，完整流程（dispatch+pull+shared+routed）。两 arm 只差 `GC_MOE_SHARED_FIRST`：
+
+| arm | 配置 | gate 6-call 中位 | 均值 | 比值 | e2e |
+|---|---|---|---|---|---|
+| C | 完整流程（shared_first 关，默认 routed∥shared） | 20.7–26.6 | **~22.9** | 1.29× | 2640 µs |
+| D | 完整流程 + `SHARED_FIRST=1`（routed 等 shared） | 23.9–32.8 | **~27.2** | 1.38× | 2708 µs |
+
+### 五层增量全表（shared gate 均值，同 16 卡、DYNAMIC 开）
+
+| 层 | gate 均值 | 增量 | 结论 |
+|---|---|---|---|
+| 探针（scan_local + identity 路由） | ~20.4 | 基线 | dispatch 结构流量造成 stagger（已修复） |
+| + 真实路由 dispatch（peer 扫描+source_idx+count） | ~24.9 | +4.5 µs | dispatch 层在真实路由下更重 |
+| + activation pull | ~24.3 | ~0 | 时序错开（barrier 后才 pull） |
+| + routed GEMM（完整流程，默认并行） | ~22.9 | ~0 | 48 个非 shared cluster 的 routed 权重流不伤 shared |
+| + shared_first=1 | ~27.2 | **+4.3 µs（变差）** | **有害，勿开** |
+
+### shared_first 有害的机制
+
+`shared_first` 的实现是每个拿到非 shared 任务的 warp 先 `ld_acquire` 自旋等 `SHARED_DONE_WORD`
+（单个全局字）。完整流程下 ~48 个非 shared cluster 的全部消费 warp（~400+ 线程）在整个 shared
+期间**风暴式锤这一个 cacheline**，而 shared L2 的完成恰恰要对同一个字做 `red_release_gpu_add`——
+读写对撞把 shared 的收尾拖慢（gate +4.3 µs），e2e 还要再付串行化代价（+68 µs）。两头都输。
+
+### 最终结论（增量拼图收口）
+
+- **shared gate 的全部干扰来自 dispatch 层**（scan/count 交换的早期窗口）；pull 和 routed 因
+  时序/结构错开，零增量；
+- 生产口径（完整流程 + DYNAMIC + 默认并行）：gate 20.7–26.6 µs（1.29×），残余是轮换的
+  单卡间歇尖峰（环境性），与调度无关；
+- `shared_first` 在本集群上有害（spin 风暴设计缺陷），默认关闭是对的。
+
+### C2 实验（GC_MOE_DISPATCH_AFTER_SHARED=1，2026-11-22 深夜）：延后 dispatch 窗口不改善 gate
+
+实现：把 role1 的整个路由 burst（scan+count 交换+source_idx 写）门到**全部 shared L2 完成之后**
+（`SHARED_DONE_WORD >= shared_l2_tasks`，顺带启用该字的清零/递增机制）。与 C1（门到 readiness，
+burst 砸 GEMM 窗口 span 2×）不同，C2 把整个 shared 窗口清空。完整流程 + DYNAMIC + 真实路由，
+同 16 卡，跑两次：
+
+| run | gate 6-call 中位 | 比值 | worst-call | e2e |
+|---|---|---|---|---|
+| Arm C（默认对照） | 20.7–26.6 | 1.29× | 29.4（1.36×） | 2640 µs |
+| C2 #1 | 21.3–26.0 | 1.22× | **54.8（2.25×）** | 2732 µs |
+| C2 #2 | 21.8–28.3 | 1.30× | 34.9（1.56×） | 2652 µs |
+
+结果：
+1. **中位 gate 无改善**（1.22×/1.30× vs 1.29×，噪声内）；
+2. **机制上生效**：抽样 rank 的 per-cluster start 全部 5 µs（vs 默认的 3.6–12.3 散布）——窗口确实被清空了；
+3. **为什么没用——这是本次最有价值的发现**：DYNAMIC 已经把 gate 与干扰**解耦**了。stagger 只影响
+   晚就绪的 cluster，而它们在 DYNAMIC 下**本来就抢不到任务**；gate 由早就绪 cluster（~5 µs）的
+   GEMM 工时（~16 µs）决定，那部分本来就不受干扰。清空窗口只是让晚 cluster "干净地闲置"，
+   gate 不变。**绕开（DYNAMIC）与清空（C2）在 gate 上等价，但 C2 还要付串行化代价**；
+4. 54.8 µs 尖峰未复现（第二次 worst 34.9，正常范围）——环境尖峰，非门自旋的系统性反馈；
+5. full 模式下残余 stagger（门住 role1 后 start 仍散到 12.6 µs）来自 role2 内部流量
+   （warp3 的 routed count-poll 等），但它对 gate 无影响（同第 3 条）。
+
+### 三种方案最终排序（gate 视角）
+
+| 方案 | 思路 | gate | 结论 |
+|---|---|---|---|
+| C1（门到 readiness） | 清空 readiness 窗口 | span 2×，gate 变差 | ✗ |
+| C2（门到 shared done） | 清空整个 shared 窗口 | 持平 + e2e 代价 | 无增益 |
+| **DYNAMIC（抢任务）** | **绕开干扰** | 最优且零代价 | ✓ 生产默认 |
+
+### 16-rank full 模式可视化 profile（2026-11-22 深夜）：DYNAMIC 生产配置的完整时间线
+
+文件：`prof/e16_full_dynamic_16rank_perfetto.json`（https://ui.perfetto.dev → Open trace file）。
+生成：full 模式（无 probe/门/shared_first）+ `SHARED_DYNAMIC=1` + 真实路由 routing_r16 + bm96，
+16 卡（.96+.82+.92+.87），`--profile-calls 1`（计时后 torch.profiler 下重放 1 次 captured call），
+`merge_perfetto.py` 合并（本次扩展：sharedL1_first/last、sharedL2_last 字段名 + per-cluster
+shared 条（tid 3）+ SHARED GATE 标记，来自 profile_shared_dbg_seq）。
+
+结构：16 rank × 3 条 track（kernels / role1 phases (ring) / shared clusters）+ 1183 事件。
+每个 rank 的 t=0 = 它自己的 role1 kernel 启动（跨节点时钟不同步，只看 rank 内相对时间）。
+
+实测读数（单次 replay）：
+
+| | 范围 |
+|---|---|
+| role1_dispatch（dispatch+pull 融合 kernel） | 37–173 µs（rank 间差 = barrier 等待） |
+| role2_compute | 86–215 µs |
+| role3_finalize | 7–43 µs |
+| **SHARED GATE（相对各自 role1 start）** | **20.1–28.5 µs** |
+
+关键画面：**SHARED GATE 全部落在 role1 尚在执行的区间内**（role1 最短 37µs > gate 最长
+28.5µs）——shared 在 dispatch+pull 还没跑完时就已完成，DYNAMIC 下不被卡住的直观证据。
+shared 条只出现在抢到任务的 cluster 上（DYNAMIC）；dispatch 相位标记 route_start→route_done→
+grid_join→pull_entry→pull_exit 可在 role1 kernel 内部看到 pull 在 barrier 之后。
+
+### 可视化 profile v2（重新生成，2026-11-22 深夜）：四阶段 span + 触发时刻标记
+
+`prof/e16_full_dynamic_16rank_perfetto.json` 重新生成（同一次 run 的数据，纯后处理更新）。
+结构：16 rank × 4 条 track：
+- `kernels`：role1_dispatch / role2_compute / role3_finalize（kineto）
+- `role1 phases (ring)`：dispatch 全相位（route_start/done、grid_join、pull_entry、first_bulk_issue、
+  sf_done、x_arrive、s2g_done、**first_publish（第一个 block 拉取完成、l1_full 发布=触发 routed GEMM）**、
+  last_publish、pull_exit、role1_exit）+ routed 的 l1_first/l1_last/l2_first/l2_last + **SHARED GATE**
+- `shared clusters`：per-cluster shared 条（start→done，DYNAMIC 下只出现在抢到的 cluster）
+- `phase spans`（新增）：**DISPATCH: route / DISPATCH: pull / SHARED EXPERT (full) / ROUTED GEMM (full)**
+  四个汇总条
+
+16 rank 实测（单次 replay，相对各自 role1 start）：
+
+| span | 中位 | 范围 |
+|---|---|---|
+| DISPATCH: route | 10.3 µs | 4.7–20.7 |
+| DISPATCH: pull | 18.3 µs | 11.8–44.6（barrier 之后才开始） |
+| **SHARED EXPERT (full)** | **18.6 µs** | 15.2–22.8（起点 ~4-6 µs，GATE 20-28 µs） |
+| ROUTED GEMM (full) | 76.8 µs | 70.5–103.1（从 l1_first ≈ first_publish+2µs 起） |
+
+时间线（r0 例）：route 0.5–12.5 → count 交换/barrier 至 114.6 → pull 114.9–132.3 →
+first_publish 120.6（触发）→ routed L1 first 122.7 → routed 至 ~195；**shared 4.7–23.5 完全
+在前段完成**。first_publish → l1_first 间隔 1.0–5.9 µs（16 rank）。
+
+**遗留诊断项**：profiled replay 的 ring 字段 f10/f2/f5（shared 时间线）与同次 replay 的
+shared_dbg 矛盾（f10 反解 19.3µs vs dbg 首起点 4.7µs；f5=34.1 > gate=23.5 不可能）。同行的
+dispatch/routed 字段链（counts→pull→publish→l1_first）自洽且 role1_exit(133.4) 与 kineto
+role1 时长(136) 吻合——只有 shared 三字段异常，原因未明（待查 _eco_trace_ring 在 graph replay
+下的行为）。已改为 shared 相位一律用 shared_dbg（全程验证过的数据源）。
+
+### 可视化 profile v3（最终版，2026-11-22 深夜）：sse_tr1 风格六相位 + 修正后的计数口径
+
+`prof/e16_full_dynamic_16rank_perfetto.json` 最终版。`phase spans` track 改为 sse_tr1 风格六相位，
+**边界按最新（修正后）口径重算**：
+
+| 相位 | 边界（新口径） | 旧脚本的错误 |
+|---|---|---|
+| dispatch: routing + count exchange | f16 route_start → **f12 counts_ready**（含 fabric 等待 peers counts） | 旧 `[f16,f17]` 漏掉了 count 交换（实测交换占 ~95µs，route_done 只是本地 scan） |
+| dispatch: token pulls | f20 pull_entry → f27 pull_exit | 同 |
+| shared expert L1+L2 | **shared_dbg** min start → SHARED GATE（已验证源） | 旧用 f10→f5+**硬编码 2.5µs 估计**，且 f5 是异常字段 |
+| wait for routed tokens | SHARED GATE → f13 l1_first（role2 视角等 token 到位） | 旧的 shared_end 是估计值 |
+| routed GEMM | f13 l1_first → f8 role2_exit | 旧拆 L1/L2 两段 |
+| combine | f1 role3 entry → f9 role3 done | 同 |
+
+16 rank 实测（中位 / 范围，µs）：routing+count exchange **118.3**（18.0–128.5，大头是 fabric 等
+peers）；token pulls 18.3（11.8–44.6）；**shared expert 18.6（15.2–22.8）**；wait for routed tokens
+104.7（2.1–113.8，与 count 交换/pull 重叠——role2 视角）；routed GEMM 73.9（68.2–100.7）；
+combine 31.4（4.7–39.9）。自洽性：wait 最短 2.1µs 的 rank 正是 count 交换最快（18µs）的 rank。
+
+### native vs self_route 六相位对比（2026-11-22 深夜，16 卡 full+DYNAMIC+真实路由，单次 replay）
+
+文件：`prof/e16_full_dynamic_16rank_perfetto.json`（native）与
+`prof/e16_full_dynamic_selfroute_16rank_perfetto.json`（self_route），同口径同 merge 脚本。
+
+| 相位（中位 µs） | native | self_route | Δ |
+|---|---|---|---|
+| dispatch: routing + count exchange | **116.2** | **12.5** | **-103.7** |
+| dispatch: token pulls | 18.1 | 20.1 | +2.1 |
+| shared expert L1+L2 | 18.5 | 23.1 | +4.6 |
+| wait for routed tokens | **102.0** | **4.2** | **-97.8** |
+| routed GEMM | 73.6 | 80.4 | +6.7 |
+| combine | 31.1 | 32.0 | +0.8 |
+| **role1 kernel（kineto）** | **140.3** | **37.1** | -103.2 |
+| **role2 kernel（kineto）** | **183.8** | **91.2** | **-92.6** |
+| e2e（bench） | 2690 | 2662 | -28 |
+
+结论：
+1. **count 交换的 fabric 等待被彻底消除**（116→12.5µs）——self_route 用 bulk topk 拷贝替代散写
+   + 免 count 交换，backlog 不再存在；
+2. **routed 关键路径整体前移 ~98µs**：wait for routed tokens 102→4.2µs，routed GEMM 提前启动，
+   role2 kernel 总时长 183.8→91.2µs（GPU 管线 -92.6µs；e2e 只降 28µs 因为 bench 的 host 开销
+   掩盖了 GPU 侧收益）；
+3. **shared 不受影响**（18.5 vs 23.1，单样本噪声；6-call 中位口径：native 21.2-25.8/1.22×，
+   self_route 21.5-37.0/1.72×——self_route 的 shared gate 离群更多，与其共享 bulk 拷贝流量
+   有关，但都在 DYNAMIC 修复后的量级）；
+4. routed GEMM 本体 +6.7µs（80.4 vs 73.6）——self_route 的路由派生开销/不同的 pull 模式
+   略增 GEMM 前准备，远小于换来的 -98µs。
+
+### profile 文件跨 rank 对齐修复（2026-11-22 深夜）
+
+现象：合并后的 perfetto 文件里各 rank track 起点不一（rank0 从 0 开始，其他节点 rank 从
++248/+543/+914µs 开始）。原因：**跨节点 kineto 时间戳来自不同步的 host 时钟**（四台机器
+时钟基点差 248-914µs），而 profile 前 bench 的 dist.barrier() 使真实启动偏差只有 2.5-11.6µs
+（节点内）。修复：`merge_perfetto.py` 归一化每个 rank 的事件到它自己的 role1 kernel 起点
+（t=0 = 本 rank role1 start），两个文件（native/self_route）均已重新生成，16 条 track 全部
+左对齐。注意：归一化后跨 rank 仍不可比绝对墙钟（时钟不同步），但 rank 内相对时间线完全可比，
+且相位标记本来就是 rank 相对的。
+
+### self_route + 均衡 routing + PULL_AFTER_SHARED 实验（2026-11-22 深夜）：两个假设都被否定
+
+**假设 1：routing 不均衡是 shared 抖动的主因 → 否定**
+
+| 配置 | routing | gate 比值 |
+|---|---|---|
+| self_route + DYNAMIC + 真实路由（1.61×） | r16 | 1.72× |
+| **self_route + DYNAMIC + identity（1.00×）** | id16_t96 | **1.65×** |
+
+identity routing 下 gate 仍 1.65×，6/16 rank 出现 LLLL pattern。**routing 不均衡不是主因**。
+
+**假设 2：PULL_AFTER_SHARED 可以修复 self_route 的 shared 抖动 → 否定**
+
+| 配置 | gate 比值 |
+|---|---|
+| self_route + DYNAMIC（无 PAS） | 1.65× |
+| **self_route + DYNAMIC + PULL_AFTER_SHARED** | **1.60×**（span 散布更大 10.5-24.1） |
+
+PULL_AFTER_SHARED 只延迟 activation pull，**不延迟 self_route 的 bulk topk 表读取**——那些
+fabric 读发生在路由派生阶段（pull 之前），仍然撞 shared 窗口。
+
+**根因修正**：self_route 下 shared 抖动的干扰源不是 activation pull（PAS 已延迟它），
+而是 **bulk topk 表的 fabric 读**（self_route 必须从 15 个 peer 批量拷贝 topk_idx 来本地
+派生路由，这些读紧接 role1 启动开始，正好落在 shared 的 readiness/权重流窗口）。
+这与 routing 分布无关（identity 也一样），也与 activation pull 无关（PAS 无效）。
+
+### self_route + shared 完整方案排序（最终）
+
+| 方案 | gate | routed 路径 | 建议 |
+|---|---|---|---|
+| native + DYNAMIC | **1.22×** | 慢（count 交换 ~95µs） | shared 稳定优先 |
+| self_route + DYNAMIC | 1.65-1.72× | **快（-98µs）** | routed 速度优先 |
+| self_route + PAS | 1.60× | 快 | PAS 无效，勿开 |
+| **待做**：self_route + 延迟 bulk topk 读到 shared 完成后 | ? | 稍慢 | 需改 kernel |
+
+如果需要同时保住两头（shared 稳定 + routed 快），需要把 self_route 的 bulk topk 读也门到
+shared 完成后——即把 SHARED_DONE_WORD 的等待从 PULL_AFTER_SHARED 扩展到路由派生阶段。
+但这会让路由更晚完成，routed 路径回吐 ~15-20µs（仍然远优于 native 的 -98µs）。
+
+### ROUTE_AFTER_SHARED 实验（2026-11-22 深夜）：mod-8 LLLL pattern 消除，gate 1.65→1.49×
+
+实现：`GC_MOE_ROUTE_AFTER_SHARED=1`——把 self_route 的 bulk topk 表读取门到全部 shared L2
+完成后（SHARED_DONE_WORD 自旋），同时启用该字的清零/递增机制。
+
+identity routing（1.00×），同 16 卡，DYNAMIC 开：
+
+| 配置 | gate 比值 | start pattern | span_med |
+|---|---|---|---|
+| native + DYNAMIC | 1.22× | `eeee` | 紧 |
+| self_route + DYNAMIC（无门） | 1.65× | 6/16 `LLLL` | 13.6-19.1 |
+| self_route + PULL_AFTER_SHARED | 1.60× | 仍有 `LLLL` | 10.5-24.1 |
+| **self_route + ROUTE_AFTER_SHARED** | **1.49×** | **基本全 `eeee`（仅1 rank 1个L）** | 9.9-22.0 |
+
+结论：
+1. **LLLL pattern 被消除**（bulk topk 读被成功门住）——readiness stagger 源头被切断；
+2. **gate 1.65→1.49×**（改善 0.16×）但仍未到 native 的 1.22×；
+3. 残余 1.49× 来自 **span 散布**（9.9-22.0µs）而非 start stagger——可能原因：
+   (a) 门自旋本身对 SHARED_DONE_WORD 的 cacheline 竞争（16 CTAs × 1 线程自旋
+   ~15-20µs，shared L2 的 release-add 要写同一个字）；(b) 单卡方差；
+4. e2e 2407µs（vs 无门 self_route 2353µs，+55µs = shared 完成才开始读 topk 的代价）。
+
+### 完整方案排序（最终更新）
+
+| 方案 | gate | routed 路径 | e2e | 建议 |
+|---|---|---|---|---|
+| native + DYNAMIC | **1.22×** | 慢（-0µs） | ~2500 | shared 稳定优先 |
+| self_route + DYNAMIC | 1.65× | **快（-98µs）** | ~2350 | routed 速度优先 |
+| self_route + ROUTE_AFTER_SHARED | **1.49×** | 快（-40µs） | ~2407 | **折中：可接受** |
+| self_route + PAS | 1.60× | 快 | ~2450 | 无效，勿开 |
+
+## 完整 EP16/EP32 MoE 性能测试（2026-11-23，原生方法论 CUDA graph + self_route + DYNAMIC + identity routing）
+
+### 配置
+- benchmark_gc_moe_eco.py，CUDA graph 模式（`--iters 30 --inner-iters 100 --warmup 10`，
+  与原生 _se bench 同 methodology：背靠背 graph replay、inner_iters 摊销、无 host 同步）
+- `GC_MOE_SELF_ROUTE=1 GC_MOE_SHARED_DYNAMIC=1`
+- identity routing（T=128/rank，imbalance 1.00×）
+- `--mode plain384:plain:384 --num-shared-experts 1 --block-m 96`
+- EP16：.96+.82+.92+.87（4 节点）；EP32：+.79+.88+.76+.72（8 节点）
+- 两遍：第一遍纯 timing，第二遍 `--profile-calls 1` + torch.profiler
+
+### 整体延迟（CUDA graph，慢 rank 中位，µs/call）
+
+| 规模 | e2e |
+|---|---|
+| EP16 | **93.31** |
+| EP32 | **66.70** |
+
+EP32 更快：每 rank 本地专家更少（12 vs 24），routed GEMM 工作量减半。
+
+### 六相位详细数据（单次 profiled replay，µs）
+
+| 相位 | EP16 med | EP16 min | EP16 max | EP32 med | EP32 min | EP32 max |
+|---|---|---|---|---|---|---|
+| dispatch: routing + count exchange | 15.7 | 8.2 | 27.7 | 12.7 | 9.8 | 25.4 |
+| dispatch: token pulls | 17.4 | 14.5 | 28.7 | 14.7 | 13.1 | 25.8 |
+| **shared expert L1+L2** | **18.7** | **9.1** | **30.7** | **16.3** | **15.1** | **19.4** |
+| wait for routed tokens | 2.5 | 0.0 | 14.4 | 3.6 | 0.5 | 10.9 |
+| routed GEMM | 75.1 | 71.1 | 81.9 | 45.8 | 41.4 | 60.3 |
+| combine | 4.4 | 3.9 | 4.8 | 4.9 | 4.3 | 5.5 |
+| role1 kernel | 36.6 | 27.0 | 47.0 | 33.5 | 28.5 | 45.5 |
+| role2 kernel | 91.7 | 86.9 | 107.0 | 60.4 | 56.0 | 67.3 |
+| role3 kernel | 6.9 | 6.0 | 7.8 | 7.2 | 6.1 | 8.5 |
+
+### shared expert 跨 rank 稳定性
+
+| 规模 | med | min | max | max/min | 判定 |
+|---|---|---|---|---|---|
+| EP16 | 18.7 | 9.1 | 30.7 | **3.37×** | **不稳定**（self_route bulk 读干扰，与之前发现一致） |
+| **EP32** | **16.3** | **15.1** | **19.4** | **1.28×** | **稳定** ✓ |
+
+EP32 下 shared expert 明显更稳定（1.28× vs 3.37×）——可能原因：
+(a) 每 rank 本地专家更少（12 vs 24），bulk topk 读量更小；
+(b) 32 rank 的 self_route 路由派生窗口更短（12.7 vs 15.7µs），与 shared 的重叠更少；
+(c) DYNAMIC 抢占在更多 cluster 下更均匀。
+
+### Profile 文件
+
+- `prof/e16_cg_sr_dynamic_16rank_perfetto.json`（EP16，16 rank，968 事件）
+- `prof/e32_cg_sr_dynamic_32rank_perfetto.json`（EP32，32 rank，1946 事件）
+- 每个 rank 4 条 track：kernels / role1 phases (ring) / shared clusters / phase spans
+- 所有 rank 归一到各自 role1 start（t=0）
+
+### 与原生 _se benchmark 的对齐说明
+
+使用 `benchmark_gc_moe_eco.py` 的 CUDA graph 模式（非 eager），methodology 与
+`benchmark_gc_moe_se.py` 一致：背靠背 graph replay、inner_iters 摊销、无 host 同步。
+`benchmark_gc_moe_se.py` 原版在节点上因 deep_gemm 初始化挂起无法直接运行。
+
+### 三配置对比（2026-11-23，EP16/EP32，identity routing T=128，CUDA graph）
+
+| 规模 | 配置 | 一次 MoE call（µs） |
+|---|---|---|
+| EP16 | native | **93.98** |
+| EP16 | self_route only | **92.21** |
+| EP16 | self_route + DYNAMIC | **93.31** |
+| EP32 | native | **66.97** |
+| EP32 | self_route only | **65.74** |
+| EP32 | self_route + DYNAMIC | **66.70** |
+
+identity routing 下三配置基本持平（差 ≤2 µs）——native 的 count 交换弱点在 identity
+routing 下不暴露（零跨 rank token，count 行全部为零，交换即刻完成）。self_route 的
+优势（消除散写风暴）在此场景无差别。真实路由下的差异见之前实验。

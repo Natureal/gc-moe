@@ -426,7 +426,8 @@ def _assemble_role_value_params(ptx: str, role: int,
                                 dump_dir: str, *, target: str,
                                 use_small_tile_path: bool,
                                 ptxas_options: tuple[str, ...] = PTXAS_OPTIONS,
-                                eco: bool = False) -> tuple[str, bytes, str]:
+                                eco: bool = False,
+                                xorder: bool = False) -> tuple[str, bytes, str]:
     """Build each role with relative peer value, plus role2's value maps.
 
     ECO: role1 has a static metadata pointer; roles 2/3 have a trailing single-copy slot count.
@@ -435,7 +436,7 @@ def _assemble_role_value_params(ptx: str, role: int,
     ptx = _clean_cute_ptx(ptx)
     if ptx_target(ptx) != target:
         raise RuntimeError('CuTe generated a different device target')
-    expected = {1: (('ptr', 'ptr', 'u32', 'u32', 'ptr', 'f32', 'f32') if eco else
+    expected = {1: (('ptr', 'ptr', 'u32', 'u32', 'ptr', 'f32', 'f32') if (eco or xorder) else
                     ('ptr', 'ptr', 'u32', 'u32', 'f32', 'f32')),
                 2: (('ptr', 'ptr', 'u32', 'u32', 'ptr', 'f32', 'f32') +
                     ('ptr',) * (map_count - 1)),
@@ -570,7 +571,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                           sym_buffer, shared_l1_weights=None,
                           shared_l2_weights=None, stats=None,
                           context=None, eco_meta=None, eco_state=None,
-                          eco_logical_experts: int = 0):
+                          eco_logical_experts: int = 0, xorder_table=None):
     """Encode live maps once per pointer set and compile each role once/shape.
 
     ECO (`eco_meta`: the layer's int32 EcoMeta, `eco_state`: optional u16 [P + E] warm-plan state): a fourth
@@ -618,6 +619,26 @@ def prepare_role_binaries(config, y: torch.Tensor,
     dbg_compute_minus = 0 if eco else int(os.environ.get('GC_MOE_DBG_COMPUTE_MINUS', '0'))
     if dbg_compute_minus < 0 or dbg_compute_minus % 2:
         raise ValueError('GC_MOE_DBG_COMPUTE_MINUS must be a non-negative even SM count')
+    # x-order count publish: role1's tensor_maps slot carries the per-dst heat
+    # table [num_ranks * local_experts] int32 (plain pull only; ECO and push
+    # dispatch keep their own tensor_maps/publish paths).
+    _xo_env = os.environ.get('GC_MOE_XORDER', '0') == '1'
+    xorder_on = (_xo_env and not eco and xorder_table is not None and
+                 os.environ.get('GC_MOE_PUSH_DISPATCH', '0') != '1')
+    if _xo_env and not eco and xorder_table is None and \
+            os.environ.get('GC_MOE_PUSH_DISPATCH', '0') != '1':
+        raise ValueError('GC_MOE_XORDER=1 requires xorder_table: int32 CUDA '
+                         '[num_ranks * local_experts] per-dst heat table')
+    if xorder_table is not None and (
+            xorder_table.dtype != torch.int32 or not xorder_table.is_cuda or
+            not xorder_table.is_contiguous() or
+            xorder_table.numel() != sym_buffer.group.size() * config.local_experts):
+        raise ValueError('xorder_table must be a contiguous CUDA int32 tensor '
+                         'of num_ranks * local_experts entries')
+    if xorder_on and sym_buffer.group.size() * config.local_experts >             sym_buffer.num_experts:
+        # role1 stages the table in the smem region reserved for ECO's copy
+        # table (num_experts u32 + slack); refuse configs that would overflow it.
+        raise ValueError('xorder needs num_ranks * local_experts <= num_experts')
     dispatch_sms = context.dispatch_sms
     # GC_MOE_ECO_NO_RESERVE=1: compute launches on the whole partition; the cluster that overlaps the plan CTA's SM
     # starts when the plan exits (tasks are claimed dynamically, nothing waits on that cluster starting)
@@ -664,7 +685,8 @@ def prepare_role_binaries(config, y: torch.Tensor,
                        role_resources, combine_resources,
                        compiler_identity) + ((eco_logical, eco_rows_after_pub, eco_split_counts, eco_route_prep,
                                               eco_spec, eco_combine_exact) if eco else ()) + (
-                                                 (dbg_compute_minus,) if dbg_compute_minus else ())
+                                                 (dbg_compute_minus,) if dbg_compute_minus else ()) + (
+                                                 (1,) if xorder_on else ())
     prepared = _CACHE.get(key)
     if prepared is None:
         with COMPILE_LOCK:
@@ -752,6 +774,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                       for i in range(map_count))
                     role3_map_view = from_dlpack(map_storage[:2304])
                     eco_meta_view = from_dlpack(eco_dispatch_meta) if eco else None
+                    xo_view = from_dlpack(xorder_table) if xorder_on else None
                     y_view = from_dlpack(y)
                     stats_view = from_dlpack(stats) if stats is not None else signal_view
                     rank_view, token_view = Uint32(0), Uint32(0)
@@ -768,7 +791,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                          clamp_view, alpha_view)
                                         if role == 3 else
                                         (signal_view, peer_view, rank_view, token_view,
-                                         eco_meta_view, None, None,
+                                         eco_meta_view if eco else xo_view, None, None,
                                          clamp_view, alpha_view))
                         # eco_fixed_slots follows tensor_map_1..21 in the kernel signature
                         if eco and role == 2:
@@ -781,7 +804,7 @@ def prepare_role_binaries(config, y: torch.Tensor,
                                 ptx, role, dump_dir, target=compiler_target,
                                 use_small_tile_path=small_tile_path,
                                 ptxas_options=compiler_identity.ptxas_options,
-                                eco=eco))
+                                eco=eco, xorder=xorder_on and role == 1))
                         role_config = role_configs[index]
                         compiled_binaries.append(RoleBinary(
                             role, cubin, role_config.dynamic_smem,
@@ -852,9 +875,14 @@ def prepare_role_binaries(config, y: torch.Tensor,
     stats_arg = ctypes.c_void_p(stats.data_ptr() if stats is not None else
                                sym_buffer.buffer.data_ptr())
     fixed_args = (ctypes.c_uint32(eco_fixed_by_rank[sym_buffer.rank_idx]),) if eco else ()
-    role1_args = ((signal_arg, peer_arg, rank_arg, token_arg, ctypes.c_void_p(eco_dispatch_meta.data_ptr()),
-                   clamp_arg, alpha_arg) if eco else
-                  (signal_arg, peer_arg, rank_arg, token_arg, clamp_arg, alpha_arg))
+    if eco:
+        role1_args = (signal_arg, peer_arg, rank_arg, token_arg,
+                      ctypes.c_void_p(eco_dispatch_meta.data_ptr()), clamp_arg, alpha_arg)
+    elif xorder_on:
+        role1_args = (signal_arg, peer_arg, rank_arg, token_arg,
+                      ctypes.c_void_p(xorder_table.data_ptr()), clamp_arg, alpha_arg)
+    else:
+        role1_args = (signal_arg, peer_arg, rank_arg, token_arg, clamp_arg, alpha_arg)
     arguments = (role1_args,
                  (signal_arg, peer_arg, rank_arg, token_arg,
                   clamp_arg, alpha_arg, *fixed_args, *map_args),
@@ -918,10 +946,12 @@ def _eco_dispatch_meta(eco_meta: torch.Tensor, num_logical: int, num_physical: i
 
 def launch_gc_moe(config, y, l1_weights, l2_weights, sym_buffer,
                   shared_l1_weights, shared_l2_weights, stats,
-                  eco_meta=None, eco_state=None, eco_logical_experts: int = 0) -> None:
+                  eco_meta=None, eco_state=None, eco_logical_experts: int = 0,
+                  xorder_table=None) -> None:
     context = get_context(num_ranks=sym_buffer.group.size())
     binaries, arguments = prepare_role_binaries(
         config, y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights, stats, context,
-        eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts)
+        eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts,
+        xorder_table=xorder_table)
     context.launch(binaries, arguments)

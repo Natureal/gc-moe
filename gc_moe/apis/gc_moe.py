@@ -41,6 +41,61 @@ def _activation_scalars(activation_clamp: Optional[float],
     return clamp, alpha
 
 
+
+_L2_PERSIST_DONE = set()
+
+
+def _set_shared_l2_persist(shared_l1_weights, shared_l2_weights) -> None:
+    """Pin the shared-expert weights in L2 (persisting access-policy window).
+
+    The shared expert is a pure 71 MB weight stream that sits right at the L2
+    capacity edge, so the routed weight streams evict it every call. Marking the
+    window persisting keeps it resident across the call. Host-side only; the
+    window is a stream attribute, so it must be set on the stream that launches
+    the kernels.  Enable with GC_MOE_L2_PERSIST=1.
+    """
+    if os.environ.get('GC_MOE_L2_EVICT_LAST', '0') == '1':
+        # the per-instruction createpolicy(evict_last) needs a carve-out to
+        # protect the lines; no stream window is used (graphs don't inherit it)
+        try:
+            import cuda.bindings.driver as cu
+            err, = cu.cuCtxSetLimit(cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE, span)
+            print(f'[gc-moe] L2 carve-out {span/2**20:.1f} MB for evict_last', flush=True)
+        except Exception as exc:                               # noqa: BLE001
+            print(f'[gc-moe] carve-out unavailable: {exc}', flush=True)
+        return
+    if os.environ.get('GC_MOE_L2_PERSIST', '0') != '1':
+        return
+    w1, w2 = shared_l1_weights[0], shared_l2_weights[0]
+    lo = w1.data_ptr()
+    hi = max(w1.data_ptr() + w1.numel(), w2.data_ptr() + w2.numel())
+    span = hi - lo
+    key = (lo, span)
+    if key in _L2_PERSIST_DONE:
+        return
+    try:
+        import cuda.bindings.driver as cu
+        import torch
+        err, = cu.cuCtxSetLimit(cu.CUlimit.CU_LIMIT_PERSISTING_L2_CACHE_SIZE, span)
+        if err != cu.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f'cuCtxSetLimit failed: {err}')
+        val = cu.CUstreamAttrValue()
+        val.accessPolicyWindow.base_ptr = lo
+        val.accessPolicyWindow.num_bytes = span
+        val.accessPolicyWindow.hitRatio = 1.0
+        val.accessPolicyWindow.hitProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_PERSISTING
+        val.accessPolicyWindow.missProp = cu.CUaccessProperty.CU_ACCESS_PROPERTY_STREAMING
+        stream = torch.cuda.current_stream().cuda_stream
+        err, = cu.cuStreamSetAttribute(
+            stream, cu.CUstreamAttrID.CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW, val)
+        if err != cu.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f'cuStreamSetAttribute failed: {err}')
+        _L2_PERSIST_DONE.add(key)
+        print(f'[gc-moe] L2 persist window {span/2**20:.1f} MB at 0x{lo:x}', flush=True)
+    except Exception as exc:                                   # noqa: BLE001
+        print(f'[gc-moe] L2 persist unavailable: {exc}', flush=True)
+
+
 def _check_weight(w: torch.Tensor, expected: tuple[int, ...], dtype: torch.dtype,
                   name: str) -> None:
     if w.dtype != dtype or not w.is_cuda:
@@ -119,6 +174,7 @@ def validate_call(y: torch.Tensor, l1_weights: tuple[torch.Tensor, torch.Tensor]
         _check_weight(shared_l2_weights[0], (shared_i//128,h,128), torch.float8_e4m3fn, 'shared W2')
         _check_sf(shared_l1_weights[1], (2*shared_i,(h+packed_gran_k-1)//packed_gran_k), 'shared W1 SF')
         _check_sf(shared_l2_weights[1], (h,(shared_i+packed_gran_k-1)//packed_gran_k), 'shared W2 SF')
+        _set_shared_l2_persist(shared_l1_weights, shared_l2_weights)
     if cumulative_local_expert_recv_stats is not None:
         stats = cumulative_local_expert_recv_stats
         if stats.dtype != torch.int32 or stats.numel() != local_e or \
@@ -177,7 +233,8 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
                     activation_alpha: Optional[float] = None,
                     eco_meta: Optional[torch.Tensor] = None,
                     eco_state: Optional[torch.Tensor] = None,
-                    eco_logical_experts: int = 0) -> None:
+                    eco_logical_experts: int = 0,
+                    xorder_table: Optional[torch.Tensor] = None) -> None:
     """ECO online split (`sym_buffer` from `get_symm_buffer_for_gc_moe(..., eco=True)`; `eco_meta`: the layer's
     int32 EcoMeta from `rtp_llm/eplb/eco.py` with `gc_moe.eco.unit_ref.unit_section` appended (offset in
     header[15]); `eco_logical_experts`: its logical expert count): `topk_idx` holds logical experts, the
@@ -201,4 +258,5 @@ def fp8_fp4_gc_moe(y: torch.Tensor,
     launch_gc_moe(config, y, l1_weights, l2_weights, call_buffer,
                   shared_l1_weights, shared_l2_weights,
                   cumulative_local_expert_recv_stats,
-                  eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts)
+                  eco_meta=eco_meta, eco_state=eco_state, eco_logical_experts=eco_logical_experts,
+                  xorder_table=xorder_table)

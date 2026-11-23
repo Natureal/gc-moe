@@ -151,8 +151,31 @@ def _signal_offsets() -> dict[str, int]:
 
 SIGNAL_OFFSETS = _signal_offsets()
 
+# x-order dispatch (stage B): a rank publishes its own per-dst heat-table row
+# (local_experts int32, the dst-major table's rank_idx-th row) into the unused
+# tail of the expert_recv_count_sum field so role2's scheduler and role1's
+# pull cursor can walk counts in hot-expert order.  The field is
+# 2*MAX_EXPERTS_PER_RANK u64 = 8192B; the dual-generation count region uses
+# only 2*local_experts u64 (<= 6144B for local_experts <= 384), so the row
+# sits at +6144 and the ready flag at the field's last word (+8188).
+XO_ROW_OFF = 6144
+XO_FLAG_OFF = 8188
+# Per-cluster shared-expert completion debug array (plain pull trace builds only):
+# one u64 ns per role2 cluster, parked in the x-order tail of the recv-count-sum field.
+SHARED_DBG_OFF = XO_ROW_OFF + 512
+SHARED_DBG_WORDS = 4 * 68
+# shared-first gate counter: parked in the unused tail of the expert_send_count field
+SHARED_DONE_WORD = 2048   # 2 u64 per cluster: [0]=~start (min), [1]=done (max)
+# Per-cluster shared phase split (plain pull trace builds only): 4 u64 per cluster
+# [0]=~L1 start (min), [1]=L1 done (max), [2]=~L2 start (min), [3]=L2 done (max),
+# in ns since this rank's role1 start. Parked after the shared-first counter in
+# the unused tail of the expert_send_count field, so the spans can be separated
+# into work (L1/L2 durations) and dependency gaps.
+SHARED_DBG2_OFF = SHARED_DONE_WORD * 4 + 64   # byte offset (16B aligned)
+SHARED_DBG2_WORDS = 8 * 68
 
-ECO_TRACE_RING_FIELDS = 16
+
+ECO_TRACE_RING_FIELDS = 36
 ECO_MAX_DISPATCH_CTAS = 128
 # per-route records (exact combine readiness): capacity * topk routes
 ECO_MAX_ROUTES = TOKEN_ALIGNMENT * 8   # capacity (aligned to TOKEN_ALIGNMENT) * topk <= 8
@@ -242,8 +265,19 @@ class GCBufferLayout:
     sf_ring_tokens: int
     num_shared_experts: int = 0
     eco: bool = False
+    # Pull metadata staging (plain pull only): every peer's live topk-weight table
+    # (level 1) and activation-SF table (level 2) are bulk-copied into this rank's
+    # own buffer, so the pull loop resolves them with local reads instead of one
+    # scattered remote load per token. -1 reads GC_MOE_PULL_META.
+    pull_meta: int = -1
 
     def __post_init__(self) -> None:
+        if self.pull_meta < 0:
+            import os as _os
+            object.__setattr__(self, 'pull_meta',
+                               int(_os.environ.get('GC_MOE_PULL_META', '0')))
+        if self.eco or not 0 <= self.pull_meta <= 5:
+            object.__setattr__(self, 'pull_meta', 0)
         ranks, experts, capacity = self.num_ranks, self.num_experts, self.capacity
         if not (0 < ranks <= MAX_RANKS and 0 < experts <= MAX_EXPERTS and
                 experts % ranks == 0 and experts // ranks <= MAX_EXPERTS_PER_RANK):
@@ -272,8 +306,15 @@ class GCBufferLayout:
     @property
     def num_max_pool_tokens(self) -> int:
         local_experts = self.num_experts // self.num_ranks
-        return align(self.num_ranks * self.capacity * min(self.topk, local_experts)
-                     + local_experts * (max(CANDIDATE_BLOCK_M) - 1), TOKEN_ALIGNMENT)
+        nmp = align(self.num_ranks * self.capacity * min(self.topk, local_experts)
+                    + local_experts * (max(CANDIDATE_BLOCK_M) - 1), TOKEN_ALIGNMENT)
+        import os as _os
+        if _os.environ.get('GC_MOE_PUSH_DISPATCH', '0') == '1':
+            # deepEP pair windows expand the pool index space to pairs*pair_cap
+            # + local_experts*capacity; the impl guarantees pair_rows <=
+            # ring_tokens, so covering the ring bounds every metadata slot.
+            nmp = max(nmp, self.ring_tokens)
+        return nmp
 
     @property
     def workspace_offsets(self) -> dict[str, int]:
@@ -316,17 +357,29 @@ class GCBufferLayout:
         add('l2_acts_sf', sr * i // 32, (sr, i // 128), 'int32', (1, sr))
         add('combine_tokens', (self.topk + bool(s)) * c * h * 2,
             (self.topk + bool(s), c, h), 'bfloat16')
+        if self.pull_meta:
+            # Sized by capacity so the persistent buffer's view offsets match a
+            # call layout's (the live prefix is num_tokens rows).
+            mt = c
+            offset = align(offset, 16)
+            add('pull_meta_w', self.num_ranks * mt * self.topk * 4,
+                (self.num_ranks, mt, self.topk), 'float32')
+            if self.pull_meta >= 2:
+                add('pull_meta_sf', self.num_ranks * mt * h // 32,
+                    (self.num_ranks, mt, h // 128), 'int32')
         return result
+
+    @property
+    def _views_end(self) -> int:
+        return max(v.offset + v.nbytes for v in self.views.values())
 
     @property
     def eco_base(self) -> int:
         """ECO region (eco layouts only): appended after every original field, which keeps their offsets"""
-        v = self.views['combine_tokens']
-        return align(v.offset + v.nbytes, 128)
+        return align(self._views_end, 128)
 
     @property
     def nbytes(self) -> int:
         if self.eco:
             return self.eco_base + eco_region_bytes(self.num_ranks, self.num_experts)
-        v = self.views['combine_tokens']
-        return v.offset + v.nbytes
+        return self._views_end

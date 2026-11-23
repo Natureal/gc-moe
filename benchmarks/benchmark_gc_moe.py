@@ -83,6 +83,20 @@ def _bench_gpu_time_ms(
             fn()
     torch.cuda.synchronize(device)
 
+    tp_out = os.environ.get('GC_TP')
+    if tp_out:
+        import torch.profiler as tprof
+        with tprof.profile(activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]) as prof:
+            if os.environ.get('GC_TP_EAGER') == '1':
+                fn()
+            else:
+                g.replay()
+            torch.cuda.synchronize(device)
+        if dist.get_rank() < int(os.environ.get('GC_TP_NRANK', '4')):
+            prof.export_chrome_trace(f"{tp_out}_rank{dist.get_rank()}.json.gz")
+        if barrier_fn is not None:
+            barrier_fn()
+
     times = []
     for _ in range(iters):
         if barrier_fn is not None:
@@ -148,6 +162,20 @@ def _bench_cuda_graph_ms(
         for _ in range(inner_iters):
             g.replay()
     torch.cuda.synchronize(device)
+
+    tp_out = os.environ.get('GC_TP')
+    if tp_out:
+        import torch.profiler as tprof
+        with tprof.profile(activities=[tprof.ProfilerActivity.CPU, tprof.ProfilerActivity.CUDA]) as prof:
+            if os.environ.get('GC_TP_EAGER') == '1':
+                fn()
+            else:
+                g.replay()
+            torch.cuda.synchronize(device)
+        if dist.get_rank() < int(os.environ.get('GC_TP_NRANK', '4')):
+            prof.export_chrome_trace(f"{tp_out}_rank{dist.get_rank()}.json.gz")
+        if barrier_fn is not None:
+            barrier_fn()
 
     times = []
     for _ in range(iters):

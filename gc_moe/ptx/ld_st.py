@@ -171,6 +171,33 @@ def atom_sys_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> 
 
 
 @dsl_user_op
+def atom_sys_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> Uint32:
+    previous = llvm.inline_asm(
+        T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        'atom.relaxed.sys.global.add.u32 $0, [$1], $2;', '=r,l,r,~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Uint32(previous)
+
+
+@dsl_user_op
+def atom_release_gpu_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> Uint64:
+    previous = llvm.inline_asm(
+        T.i64(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        'atom.release.gpu.global.add.u64 $0, [$1], $2;', '=l,l,l,~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Uint64(previous)
+
+
+@dsl_user_op
+def atom_acq_rel_gpu_add_u64(ptr: cute.Pointer, value: Uint64, *, loc=None, ip=None) -> Uint64:
+    previous = llvm.inline_asm(
+        T.i64(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+        'atom.acq_rel.gpu.global.add.u64 $0, [$1], $2;', '=l,l,l,~{memory}',
+        has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+    return Uint64(previous)
+
+
+@dsl_user_op
 def atom_release_gpu_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> Uint32:
     previous = llvm.inline_asm(
         T.i32(), [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
@@ -232,6 +259,15 @@ def st_global_u32x4(dst_gmem: cute.Pointer, value_0: Uint32,
                value_3.ir_value(loc=loc, ip=ip)],
         'st.global.v4.b32 [$0], {$1, $2, $3, $4};',
         'l,r,r,r,r', has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def nanosleep_u32(ns: Uint32, *, loc=None, ip=None) -> None:
+    """Back off the issuing warp for `ns` nanoseconds (spin-wait pacing)."""
+    llvm.inline_asm(
+        None, [ns.ir_value(loc=loc, ip=ip)],
+        'nanosleep.u32 $0;', 'r,~{memory}', has_side_effects=True,
         asm_dialect=llvm.AsmDialect.AD_ATT)
 
 
@@ -555,6 +591,13 @@ def ld_acquire_sys_u32(ptr: cute.Pointer, *, loc=None, ip=None) -> Uint32:
 def red_release_sys_add_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
     llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
                     'red.release.sys.global.add.u32 [$0], $1;', 'l,r',
+                    has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def red_release_sys_min_u32(ptr: cute.Pointer, value: Uint32, *, loc=None, ip=None) -> None:
+    llvm.inline_asm(None, [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+                    'red.release.sys.global.min.u32 [$0], $1;', 'l,r',
                     has_side_effects=True, asm_dialect=llvm.AsmDialect.AD_ATT)
 
 

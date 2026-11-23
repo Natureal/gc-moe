@@ -18,7 +18,7 @@ ECO_UNIT_THREADS = 576
 
 # Rank-time weights (block wb, active slot wa; a token weighs 1) per gc-moe block M, fitted on gc-moe kernel times
 # (`gcbench/fit_cost_bm.py`); other block sizes take the nearest entry.
-ECO_TIME_WEIGHTS = {16: (249, 140), 32: (272, 117), 64: (260, 111), 96: (335, 38), 128: (293, 52)}
+ECO_TIME_WEIGHTS = {16: (249, 140), 32: (272, 117), 64: (260, 111), 96: (384, 82), 128: (293, 52)}
 
 
 def eco_split_counts_enabled(num_ranks: int) -> bool:
@@ -163,7 +163,7 @@ def compile_eco_plan(num_physical: int, num_ranks: int, num_logical: int, eco_ba
         'OFF_ECO_ROUTES_DONE': eco_base + ECO_SIGNAL_OFFSETS['eco_routes_done'],
     }
     defines.update(zip(('UNIT_BM', 'UNIT_WB', 'UNIT_WA', 'UNIT_NR', 'UNIT_NRC', 'UNIT_HOP2', 'UNIT_HYDRO'), unit))
-    for extra in ('UNIT_HREFINE', 'UNIT_HAUG', 'UNIT_HDBG', 'UNIT_HSPLIT', 'UNIT_HLB', 'UNIT_HTOK', 'UNIT_HORD', 'UNIT_HCF', 'UNIT_HPROF', 'UNIT_HCFLV'):
+    for extra in ('UNIT_HREFINE', 'UNIT_HAUG', 'UNIT_HDBG', 'UNIT_HSPLIT', 'UNIT_HLB', 'UNIT_HTOK', 'UNIT_HORD', 'UNIT_HCF', 'UNIT_HPROF', 'UNIT_HCFLV', 'UNIT_HREBAL'):
         if os.environ.get(f'GC_MOE_ECO_{extra}'):
             defines[extra] = int(os.environ[f'GC_MOE_ECO_{extra}'])
     flags = [f'-D{k}={v}u' if k.startswith('OFF_') else f'-D{k}={v}' for k, v in sorted(defines.items())]

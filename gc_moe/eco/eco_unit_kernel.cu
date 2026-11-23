@@ -77,6 +77,10 @@ static constexpr int kMaxU = 2 * kP;      // tracked movable block units (overfl
 #ifndef UNIT_HLB
 #define UNIT_HLB 1     // 1: relocate / BFS stop once the peak sits on max(ceil(total / R), max floor)
 #endif
+#ifndef UNIT_HREBAL
+#define UNIT_HREBAL 0  // K>0: bounded cost rebalance rounds (move tokens between copies of one expert off
+                       // the costliest rank); bit-exact mirror of work/mpo/ep64/hydro_rebal.py
+#endif
 static constexpr int kCfLv = UNIT_HCFLV;
 static constexpr int kHydRefine = UNIT_HREFINE, kHydAug = UNIT_HAUG, kHydDepth = 8;
 #endif
@@ -1015,6 +1019,113 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
         const int lb = UNIT_HLB ? max((s_fsum + static_cast<int>(s_nu) + static_cast<int>(kR) - 1) / static_cast<int>(kR),
                                       static_cast<int>(s_fmax)) : -1;
         bool atlb = false;
+#if UNIT_HREBAL > 0
+        // ---- cost-aware relocate (merged into the block relocate, no extra pass) --------------------
+        // K rounds: move one whole unit off the costliest rank a = argmax f (f = kWB*blocks + kWA*active
+        // + tokens), to the active copy with the smallest key = 1000*max(f) + sum(f). The per-rank state
+        // is register-resident (lane = rank); every reduction is a warp instruction. The BFS below still
+        // sees the same unit table (hplaced) as the block relocate.
+        {
+            uint64_t st_r = 0;                         // blocks | active << 16 | tokens << 32
+            for (int s = static_cast<int>(lane) * kS; s < (static_cast<int>(lane) + 1) * kS; ++ s) {
+                const int v = q[s];
+                st_r += static_cast<uint64_t>((v + kBM - 1) / kBM) |
+                        (static_cast<uint64_t>(v > 0 ? 1 : 0) << 16) |
+                        (static_cast<uint64_t>(v) << 32);
+            }
+            // slot -> first unit index (oadd is dead after the quota flush)
+            for (int s = static_cast<int>(lane); s < kP; s += 32) oadd[s] = -1;
+            for (int i = static_cast<int>(lane); i < nu; i += 32)
+                if (oadd[hplaced[i] & 0x7fff] < 0) oadd[hplaced[i] & 0x7fff] = i;
+            constexpr int kPairIt = (kS * 8 + 31) / 32;
+            for (int pass = 0; pass < UNIT_HREBAL; ++ pass) {
+                const int f_r = kWB * static_cast<int>(st_r & 0xffffu) +
+                                 kWA * static_cast<int>((st_r >> 16) & 0xffffu) + static_cast<int>(st_r >> 32);
+                const uint32_t pk = (static_cast<uint32_t>(f_r) << 5) | static_cast<uint32_t>(31 - lane);
+                const uint32_t m1 = __reduce_max_sync(~0u, pk);
+                const int r1 = 31 - static_cast<int>(m1 & 31u);
+                const uint32_t m2 = __reduce_max_sync(~0u, lane == r1 ? 0u : pk);
+                const int r2 = 31 - static_cast<int>(m2 & 31u);
+                const uint32_t m3 = __reduce_max_sync(~0u, (lane == r1 or lane == r2) ? 0u : pk);
+                const int v1 = static_cast<int>(m1 >> 5), v2 = static_cast<int>(m2 >> 5), v3 = static_cast<int>(m3 >> 5);
+                const int sumf = __reduce_add_sync(~0u, f_r);
+                const int curkey = 1000 * v1 + sumf;
+                const uint64_t sa = __shfl_sync(~0u, st_r, r1);
+                const int nb_a = static_cast<int>(sa & 0xffffu), ne_a = static_cast<int>((sa >> 16) & 0xffffu),
+                          tk_a = static_cast<int>(sa >> 32);
+                int bkey = 0x7fffffff, bidx = 0x7fffffff, bpay = 0;
+#pragma unroll
+                for (int it = 0; it < kPairIt; ++ it) {
+                    const int pair = static_cast<int>(lane) + it * 32;
+                    int s = 0, qa = 0, b = 0, qb = 0, rb = 0;
+                    bool ok = pair < kS * 8;
+                    if (ok) {
+                        s = r1 * kS + (pair >> 3); qa = q[s];
+                        const int e = phy[s], ci = pair & 7;
+                        ok = qa > 0 and ci < ecnt[e];
+                        if (ok) {
+                            b = cslot[eoff[e] + ci]; qb = q[b]; rb = b / kS;
+                            ok = b != s and rb != r1 and qb > 0;
+                        }
+                    }
+                    const uint64_t sb = __shfl_sync(~0u, st_r, rb);
+                    const int nb_b = static_cast<int>(sb & 0xffffu), ne_b = static_cast<int>((sb >> 16) & 0xffffu),
+                              tk_b = static_cast<int>(sb >> 32);
+                    if (not ok) continue;
+                    const int amt = qa >= kBM ? kBM : qa;
+                    const int fa = kWB * (nb_a - (qa + kBM - 1) / kBM + (qa - amt + kBM - 1) / kBM)
+                                 + kWA * (ne_a - (qa == amt ? 1 : 0)) + (tk_a - amt);
+                    const int fb = kWB * (nb_b - (qb + kBM - 1) / kBM + (qb + amt + kBM - 1) / kBM)
+                                 + kWA * ne_b + (tk_b + amt);
+                    const int others = (rb == r2 and v3 < v2) ? v3 : v2;
+                    const int key = 1000 * max(max(fa, fb), others) +
+                                    (sumf - v1 - (kWB * nb_b + kWA * ne_b + tk_b) + fa + fb);
+                    const int idx = (s << 9) | b;
+                    if (key < bkey or (key == bkey and idx < bidx)) { bkey = key; bidx = idx; bpay = s | (b << 9) | (amt << 18); }
+                }
+                const int k0 = __reduce_min_sync(~0u, bkey);
+                const int i0 = __reduce_min_sync(~0u, bkey == k0 ? bidx : 0x7fffffff);
+                const uint32_t win = __ballot_sync(~0u, bkey == k0 and bidx == i0);
+                const int pay = __shfl_sync(~0u, bpay, __ffs(win) - 1);
+                if (k0 >= curkey - 300) break;   // skip sub-block refinements: offline det max is unchanged
+                const int ss = pay & 511, bb = (pay >> 9) & 511, am = pay >> 18;
+                const int qa_old = q[ss], qb_old = q[bb];
+                q[ss] -= am; q[bb] += am;
+                const int ra = ss / kS, rb = bb / kS;
+                hload[ra] -= 1; hload[rb] += 1;
+                if (lane == ra) {
+                    st_r -= 1ull | (static_cast<uint64_t>(q[ss] == 0 ? 1 : 0) << 16) | (static_cast<uint64_t>(am) << 32);
+                }
+                if (lane == rb) st_r += 1ull | (static_cast<uint64_t>(am) << 32);
+                // Update the matching unit for the BFS below. Whole-bm moves take a full unit, remainder
+                // moves take the expert's partial unit; the scan is only over this slot's own units.
+                if (lane == 0) {
+                    int pick = -1, fallback = -1;
+                    for (int ui = oadd[ss]; ui < nu and (hplaced[ui] & 0x7fff) == ss; ++ ui) {
+                        const bool part = (hplaced[ui] & 0x8000) != 0;
+                        if (fallback < 0) fallback = ui;
+                        if (qa_old >= kBM and not part) { pick = ui; break; }
+                        if (qa_old < kBM and part) { pick = ui; break; }
+                    }
+                    const int ui = pick >= 0 ? pick : fallback;
+                    if (ui >= 0) {
+                        const bool part = (hplaced[ui] & 0x8000) != 0;
+                        if (not UNIT_HSPLIT) {
+                            if (part) { pf[ss] = 0; pf[bb] = 1; }
+                            else { y[ss] -= 1; y[bb] += 1; }
+                        }
+                        hplaced[ui] = (hplaced[ui] & 0x8000) | bb;
+                    }
+                }
+            }
+            int top = 0;
+            for (int r = static_cast<int>(lane); r < static_cast<int>(kR); r += 32)
+                top = max(top, hload[r]);
+            for (int off = 16; off > 0; off >>= 1)
+                top = max(top, __shfl_xor_sync(~0u, top, off));
+            atlb = top <= lb;
+        }
+#else
         // ---- relocate: serial scan in placement order; every unit that can leave a peak rank does ---
         for (int pass = 0; pass < kHydRefine; ++ pass) {
             int top = 0;   // warp-max over the two ranks each lane covers
@@ -1083,6 +1194,7 @@ eco_plan_kernel(const int* meta, uint8_t* buffer, uint16_t* state, int* stats, c
             if (__ballot_sync(~0u, moved) == 0)
                 break;
         }
+#endif
         if (lane == 0) {
             milestone(33);
             s_lb = lb;

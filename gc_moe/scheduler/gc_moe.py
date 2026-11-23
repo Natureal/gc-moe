@@ -15,11 +15,14 @@ from cutlass import Int32, Uint32, Uint64
 
 from ..common.math import warp_inclusive_sum
 from ..layout.gc_moe import (ECO_SIGNAL_OFFSETS, ECO_TRACE_RING_FIELDS, MAX_EXPERTS,
-                             SIGNAL_OFFSETS)
+                             SIGNAL_OFFSETS, XO_FLAG_OFF)
 from ..ptx.ld_st import (
     atom_add_u64,
     atom_max_u32_global,
     ld_acquire_gpu_u32,
+    ld_acquire_gpu_u64,
+    ld_acquire_sys_u32,
+    ld_acquire_sys_u64,
     ld_volatile_u32,
     red_global_max_u64,
     red_global_min_u64,
@@ -27,12 +30,15 @@ from ..ptx.ld_st import (
     ld_volatile_u64,
     warp_wait_count_u64,
     st_global_u32,
+    st_global_u64,
     ld_acquire_sys_u64,
     atom_add_u32,
     st_async_cluster_u32x4,
 )
 from ..ptx.utils import (
+    device_trap,
     elect_one_sync,
+    read_clock64,
     read_globaltimer,
     warp_first_set_bit,
 )
@@ -181,6 +187,90 @@ def locate_routed_pool_block(counts: cute.Tensor,
 
 
 @cute.jit
+def locate_push_pool_block(pair_word: Uint64, pool_block: Uint32,
+                           pair_blocks: cutlass.Constexpr,
+                           num_ranks: cutlass.Constexpr,
+                           block_m: cutlass.Constexpr):
+    """deepEP low-latency layout: block = pair*pair_blocks + m_block with
+    pair = local_slot*num_ranks + src_rank. A block whose rows already reached
+    block_m is FULL and needs no pair count; otherwise the pair count word
+    (total + 1; 0 = not ready) gives the tail shape."""
+    pair = pool_block // Uint32(pair_blocks)
+    m_block = pool_block % Uint32(pair_blocks)
+    expert = pair // Uint32(num_ranks)
+    cnt = Uint32(pair_word - Uint64(1))
+    used = m_block * Uint32(block_m)
+    valid_m = Uint32(0)
+    if cnt > used:
+        valid_m = min(Uint32(block_m), cnt - used)
+    return expert, m_block, valid_m
+
+
+@cute.jit
+def xo_wait_position(xo_ptr: cute.Pointer, recv_ptr: cute.Pointer,
+                     expert_counts: cute.Tensor, pos: Uint32, lane: Int32,
+                     local_experts: cutlass.Constexpr,
+                     num_ranks: cutlass.Constexpr,
+                     dispatch_sms: cutlass.Constexpr,
+                     block_m: cutlass.Constexpr,
+                     native_order: cutlass.Constexpr = False) -> Uint32:
+    """x-order pool: wait for hot-position `pos`'s summed count word and store
+    it in the owning lane's expert_counts slot.  All lanes poll the same
+    (broadcast) address; returns the warp-total padded block count over all
+    positions <= pos."""
+    wave = pos // Uint32(32)
+    owner = pos % Uint32(32)
+    if cutlass.const_expr(native_order):
+        poll_expert = pos
+    else:
+        poll_expert = Uint32(xo_ptr[pos])
+    expected = Uint32(dispatch_sms * num_ranks)
+    count = Uint64(0)
+    wait_start = read_globaltimer()
+    while Uint32(count >> 32) != expected:
+        count = ld_volatile_u64(recv_ptr + poll_expert * Uint32(2))
+        if read_globaltimer() - wait_start > Uint64(60000000000):
+            device_trap()
+    count = ld_acquire_sys_u64(recv_ptr + poll_expert * Uint32(2))
+    if Uint32(lane) == owner:
+        expert_counts[wave] = Uint32(count)
+    cute.arch.sync_warp()
+    lane_blocks = Uint32(0)
+    for w in cutlass.range_constexpr((local_experts + 31) // 32):
+        pidx = Uint32(w * 32) + Uint32(lane)
+        if pidx <= pos and pidx < Uint32(local_experts):
+            lane_blocks += (expert_counts[w] + Uint32(block_m - 1)) // \
+                Uint32(block_m)
+    return cute.arch.warp_redux_sync(lane_blocks, 'add')
+
+
+@cute.jit
+def xo_cover(xo_ptr: cute.Pointer, recv_ptr: cute.Pointer,
+             expert_counts: cute.Tensor, routed: Uint32, waited: Uint32,
+             pool_block: Uint32, lane: Int32,
+             local_experts: cutlass.Constexpr,
+             num_ranks: cutlass.Constexpr,
+             dispatch_sms: cutlass.Constexpr,
+             block_m: cutlass.Constexpr,
+             native_order: cutlass.Constexpr = False):
+    """Grow the known x-order pool prefix until it covers `pool_block`.
+
+    Positions are waited in order 0,1,2,... (`waited` = next position index);
+    each wait returns the warp-total padded blocks over the waited prefix.
+    Returns (routed_m_blocks, waited).  Coverage is checked against the
+    claim index actually claimed, so races between scheduler warps on the
+    shared task counters are harmless.
+    """
+    while routed <= pool_block and waited < Uint32(local_experts):
+        routed = xo_wait_position(
+            xo_ptr, recv_ptr, expert_counts, waited,
+            lane, local_experts, num_ranks, dispatch_sms, block_m,
+            native_order)
+        waited += Uint32(1)
+    return routed, waited
+
+
+@cute.jit
 def cached_num_tokens(counts: cute.Tensor, expert: Int32,
                       lane: Uint32,
                       local_experts: cutlass.Constexpr) -> Uint32:
@@ -202,6 +292,58 @@ def advance_expert(counts: cute.Tensor, token_idx: Uint32,
     while token_idx >= expert_end and current_expert < Int32(local_experts):
         current_expert += Int32(1)
         if current_expert < Int32(local_experts):
+            pool_block_offset += (expert_end - expert_start +
+                                  Uint32(block_m - 1)) // Uint32(block_m)
+            expert_start = expert_end
+            expert_end += cached_num_tokens(
+                counts, current_expert, lane, local_experts)
+    return current_expert, expert_start, expert_end, pool_block_offset
+
+
+@cute.jit
+def advance_expert_xo(counts: cute.Tensor, token_idx: Uint32,
+                      current_expert: Int32, expert_start: Uint32,
+                      expert_end: Uint32, pool_block_offset: Uint32,
+                      lane: Uint32,
+                      local_experts: cutlass.Constexpr,
+                      block_m: cutlass.Constexpr,
+                      recv_ptr: cute.Pointer, xo: cute.Tensor,
+                      xo_row_base: Uint32,
+                      dispatch_sms: cutlass.Constexpr,
+                      num_ranks: cutlass.Constexpr,
+                      nvlink_timeout_secs: cutlass.Constexpr,
+                      native_order: cutlass.Constexpr = False):
+    """x-order pool pull cursor: like advance_expert, but waits each entered
+    position's summed count lazily instead of requiring all counts upfront.
+
+    Positions are entered in increasing hot order; the owner lane (pos%32)
+    polls that position's real-expert count word (xo[row_base+pos]) until
+    every source rank's contribution lands, then caches it for
+    cached_num_tokens.  Positions already waited are never re-entered, so
+    each position costs one poll round plus a warp sync.
+    """
+    while token_idx >= expert_end and current_expert < Int32(local_experts):
+        current_expert += Int32(1)
+        if current_expert < Int32(local_experts):
+            pos = Uint32(current_expert)
+            owner = pos % Uint32(32)
+            wave = pos // Uint32(32)
+            count = Uint64(0)
+            if Uint32(lane) == owner:
+                if cutlass.const_expr(native_order):
+                    poll_expert = pos
+                else:
+                    poll_expert = Uint32(xo[xo_row_base + pos])
+                expected = Uint32(dispatch_sms * num_ranks)
+                wait_start = read_clock64()
+                while Uint32(count >> 32) != expected:
+                    count = ld_volatile_u64(recv_ptr + poll_expert * Uint32(2))
+                    if Uint64(read_clock64() - wait_start) >= Uint64(
+                            nvlink_timeout_secs * 2000000000):
+                        device_trap()
+                count = ld_acquire_sys_u64(recv_ptr + poll_expert * Uint32(2))
+                counts[wave] = Uint32(count)
+            cute.arch.sync_warp()
             pool_block_offset += (expert_end - expert_start +
                                   Uint32(block_m - 1)) // Uint32(block_m)
             expert_start = expert_end
@@ -328,6 +470,19 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                    eco_base: cutlass.Constexpr = 0,
                    eco_fixed_slots: Uint32 = None,
                    eco_spec: cutlass.Constexpr = False,
+                   push_dispatch: cutlass.Constexpr = False,
+                   pair_blocks: cutlass.Constexpr = 0,
+                   total_pair_blocks: cutlass.Constexpr = 0,
+                   dep_data_ready: cutlass.Constexpr = 0,
+                   expert_cap: cutlass.Constexpr = 0,
+                   dense_block: cutlass.Constexpr = 0,
+                   dep_expert_base: cutlass.Constexpr = 0,
+                   dep_blk_cnt: cutlass.Constexpr = 0,
+                   xo_ptr: cute.Pointer = None,
+                   xorder_pool: cutlass.Constexpr = False,
+                   prog_native: cutlass.Constexpr = False,
+                   no_routed: cutlass.Constexpr = False,
+                   shared_dynamic: cutlass.Constexpr = False,
 ) -> None:
     """Publish shared and interleaved routed tasks, then the end sentinel.
 
@@ -339,12 +494,17 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                        Uint32(compute_sms))
     if cutlass.const_expr(shared_experts > 0):
         shared_l1_clusters = l1_clusters * shared_experts
+        # shared_dynamic: force the atomic global-claim loop even when the
+        # static one-task-per-cluster map would fit. Early-ready consumer
+        # clusters then claim shared tasks first instead of the fixed
+        # cluster->task assignment waiting on late-scheduled CTAs.
+        sh_sched_sms = 0 if shared_dynamic else compute_sms
         iteration = publish_shared_phase(
             task, full, empty, shared_l1_count_ptr, iteration,
             Int32(lane), Uint32(block // 2),
             Uint32(GCBlockPhase.SharedLinear1),
             num_tokens, block_m, shared_l1_clusters,
-            compute_sms, 2 * intermediate * shared_experts,
+            sh_sched_sms, 2 * intermediate * shared_experts,
             hidden)
         if shared_l2_early:
             iteration = publish_shared_phase(
@@ -352,7 +512,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                 Int32(lane), Uint32(block // 2),
                 Uint32(GCBlockPhase.SharedLinear2),
                 num_tokens, block_m, l2_clusters,
-                compute_sms, hidden,
+                sh_sched_sms, hidden,
                 intermediate * shared_experts)
     # Each lane owns experts wave*32+lane in registers, as in
     # GCMoEScheduler. The count cache survives routed L1/L2 task
@@ -360,6 +520,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
     eco_epoch = Uint32(0)
     eco_num_fixed = Uint32(0)
     eco_plan_loaded = Uint32(0)
+    xo_waited = Uint32(0)
     if cutlass.const_expr(eco):
         eco_epoch = ld_volatile_u32(signals + SIGNAL_OFFSETS['recv_parity'] // 4)
         eco_num_fixed = eco_fixed_slots
@@ -374,28 +535,85 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                 expert_counts[wave] = Uint32(ld_acquire_sys_u64(recv_ptr + slot_idx * Uint32(2)))
         eco_trace_point(signals, 10, False, eco_trace, eco_base)
         eco_trace_ring_point(signals, 4, block, eco_trace, eco_base)
+    elif cutlass.const_expr(push_dispatch):
+        # deepEP low-latency + dst repack: per-(expert, src) count words are
+        # consumed by the repack warps, which publish dep_expert_base[e] =
+        # total+1 once expert e's tokens sit compacted in its dense window.
+        dep_base = signals + SIGNAL_OFFSETS['size'] // 4
+        eb_ptr = dep_base + dep_expert_base
+        dense_per_expert = min(expert_cap // block_m,
+                               num_ranks * pair_blocks)
+        dense_eblocks = expert_cap // block_m
+        eco_trace_ring_point(signals, 4, block, eco_trace, eco_base)
+    elif cutlass.const_expr(xorder_pool or prog_native):
+        # Progressive ingestion: counts are waited lazily in position order
+        # as the claim loop advances; expert_counts starts empty (0 blocks
+        # each).  x-order pool: role1 publishes this rank's hot-order row +
+        # release flag in its prologue; acquire the flag so the row reads
+        # below are ordered after.  prog_native uses the identity mapping
+        # (position == local expert) and publishes no row.
+        if cutlass.const_expr(xorder_pool):
+            xo_flag_ptr = signals + (SIGNAL_OFFSETS['expert_recv_count_sum'] +
+                                     XO_FLAG_OFF) // 4
+            xo_flag_t0 = read_globaltimer()
+            while ld_acquire_sys_u32(xo_flag_ptr) != Uint32(0x584f0001):
+                if read_globaltimer() - xo_flag_t0 > Uint64(60000000000):
+                    device_trap()
+        for wave in cutlass.range_constexpr(
+                (local_experts + 31) // 32):
+            expert_counts[wave] = Uint32(0)
+    elif cutlass.const_expr(no_routed):
+        for wave in cutlass.range_constexpr((local_experts + 31) // 32):
+            expert_counts[wave] = Uint32(0)
     else:
+        rdy_min = Uint32(0xffffffff)
+        rdy_max = Uint32(0)
+        trace_t0 = Uint64(0)
+        if cutlass.const_expr(eco_trace):
+            trace_t0 = ld_volatile_u64(
+                signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4 +
+                Uint32(24) * Uint32(2))
         for wave in cutlass.range_constexpr(
                 (local_experts + 31) // 32):
             local_expert = Uint32(wave * 32 + lane)
             count = Uint64(0)
             if local_expert < Uint32(local_experts):
+                # x-order pool: lane position is a hot-order slot; the count
+                # word lives on the row of the expert mapped to that slot.
+                poll_expert = local_expert
+                if cutlass.const_expr(xorder_pool):
+                    poll_expert = Uint32(xo_ptr[local_expert])
                 while Uint32(count >> 32) != Uint32(
                         dispatch_sms * num_ranks):
-                    count = ld_volatile_u64(recv_ptr + local_expert * 2)
-                count = ld_acquire_sys_u64(recv_ptr + local_expert * 2)
+                    count = ld_volatile_u64(recv_ptr + poll_expert * 2)
+                count = ld_acquire_sys_u64(recv_ptr + poll_expert * 2)
+                if cutlass.const_expr(eco_trace):
+                    rdy = Uint32(read_globaltimer() - trace_t0)
+                    rdy_min = min(rdy_min, rdy)
+                    rdy_max = max(rdy_max, rdy)
             expert_counts[wave] = Uint32(count)
+        if cutlass.const_expr(eco_trace):
+            if block == Int32(0):
+                wmin = cute.arch.warp_redux_sync(rdy_min, 'min')
+                wmax = cute.arch.warp_redux_sync(rdy_max, 'max')
+                if elect_one_sync():
+                    base = signals + (eco_base + ECO_SIGNAL_OFFSETS['eco_trace']) // 4
+                    st_global_u64(base + Uint32(3) * Uint32(2), Uint64(wmin))
+                    st_global_u64(base + Uint32(4) * Uint32(2), Uint64(wmax))
         eco_trace_ring_point(signals, 4, block, eco_trace, eco_base)
     cute.arch.sync_warp()
-    lane_m_blocks = Uint32(0)
-    for wave in cutlass.range_constexpr(
-            (local_experts + 31) // 32):
-        received = expert_counts[wave]
-        own_blocks = (received + Uint32(block_m - 1)) // \
-            Uint32(block_m)
-        lane_m_blocks += own_blocks
-    routed_m_blocks = cute.arch.warp_redux_sync(
-        lane_m_blocks, 'add')
+    if cutlass.const_expr(push_dispatch):
+        routed_m_blocks = Uint32(local_experts * dense_per_expert)
+    else:
+        lane_m_blocks = Uint32(0)
+        for wave in cutlass.range_constexpr(
+                (local_experts + 31) // 32):
+            received = expert_counts[wave]
+            own_blocks = (received + Uint32(block_m - 1)) // \
+                Uint32(block_m)
+            lane_m_blocks += own_blocks
+        routed_m_blocks = cute.arch.warp_redux_sync(
+            lane_m_blocks, 'add')
     # Match GCMoEScheduler::get_gc_num_l1_warmup_waves and
     # get_next_task for one locality domain: enough L1 work is
     # issued before the first L2 wave, then one L1 follows each
@@ -414,6 +632,10 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                           num_clusters - 1) // num_clusters
         l1_warmup = min(total_l1_waves,
                         max(Uint32(first_l2_warmup), interleave_warmup))
+    if cutlass.const_expr(xorder_pool or prog_native):
+        # Progressive counts: total is unknown upfront; seed the minimum
+        # L1-before-L2 pacing and let the required_l1 gates self-balance.
+        l1_warmup = Uint32(first_l2_warmup)
     if cutlass.const_expr(eco):
         # An empty fixed prefix must claim L1 first, using the existing quota-loading path below. Starting
         # with L2 can make every scheduler wait on L1 tasks nobody has issued. Avoid another inlined copy of
@@ -421,6 +643,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
         if routed_m_blocks == Uint32(0):
             l1_warmup = Uint32(first_l2_warmup)
     l1_done = Uint32(0xffffffff)
+    push_ready_expert = Uint32(0xffffffff)
     # Typed before the loop for both count-loading paths (CuTe DSL joins need one type)
     local_expert = Uint32(0)
     scheduling = True
@@ -437,21 +660,62 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                             signals, rank_idx, eco_epoch, eco_num_fixed, expert_counts, Int32(lane),
                             local_experts, block_m, eco_base, num_ranks, eco_trace, block, eco_spec)
                         eco_plan_loaded = Uint32(1)
+                if cutlass.const_expr(xorder_pool or prog_native):
+                    routed_m_blocks, xo_waited = xo_cover(
+                        xo_ptr if xo_ptr is not None else recv_ptr,
+                        recv_ptr, expert_counts, routed_m_blocks,
+                        xo_waited, task_idx // l1_clusters,
+                        Int32(lane), local_experts, num_ranks,
+                        dispatch_sms, block_m, prog_native)
                 if task_idx >= routed_m_blocks * l1_clusters:
                     l1_warmup = l1_done
                 else:
                     pool_block = task_idx // l1_clusters
                     n_cluster = task_idx % l1_clusters
-                    local_expert, m_block, valid_m = \
-                        locate_routed_pool_block(
-                            expert_counts, pool_block, Uint32(lane),
-                            local_experts, block_m)
-                    publish_iteration(task, full, iteration, Int32(lane),
-                                      Uint32(GCBlockPhase.Linear1), local_expert,
-                                      m_block, n_cluster, pool_block, valid_m,
-                                      Uint32(2 * intermediate), Uint32(hidden))
-                    iteration = Uint32(iteration + Uint32(1))
-                    fetching = False
+                    if cutlass.const_expr(push_dispatch):
+                        pb_e = pool_block // Uint32(dense_per_expert)
+                        db_m = pool_block % Uint32(dense_per_expert)
+                        eb_w = ld_acquire_gpu_u32(eb_ptr + pb_e)
+                        pb_wait = read_globaltimer()
+                        while eb_w == Uint32(0):
+                            eb_w = ld_acquire_gpu_u32(eb_ptr + pb_e)
+                            if read_globaltimer() - pb_wait > Uint64(5000000000):
+                                cute.printf(
+                                    'push repack timeout rank={} blk={} e={} pb={}',
+                                    rank_idx, block, pb_e, pool_block)
+                                device_trap()
+                        db_cnt = eb_w - Uint32(1)
+                        db_nb = (db_cnt + Uint32(block_m - 1)) // \
+                            Uint32(block_m)
+                        local_expert = pb_e
+                        m_block = db_m
+                        valid_m = Uint32(0)
+                        if db_m < db_nb:
+                            valid_m = min(Uint32(block_m),
+                                          db_cnt - db_m * Uint32(block_m))
+                        if valid_m > Uint32(0):
+                            publish_iteration(
+                                task, full, iteration, Int32(lane),
+                                Uint32(GCBlockPhase.Linear1), local_expert,
+                                m_block, n_cluster,
+                                dense_block + pb_e * Uint32(dense_eblocks) +
+                                db_m, valid_m,
+                                Uint32(2 * intermediate), Uint32(hidden))
+                            iteration = Uint32(iteration + Uint32(1))
+                            fetching = False
+                    else:
+                        local_expert, m_block, valid_m = \
+                            locate_routed_pool_block(
+                                expert_counts, pool_block, Uint32(lane),
+                                local_experts, block_m)
+                        if cutlass.const_expr(xorder_pool):
+                            local_expert = Uint32(xo_ptr[local_expert])
+                        publish_iteration(task, full, iteration, Int32(lane),
+                                          Uint32(GCBlockPhase.Linear1), local_expert,
+                                          m_block, n_cluster, pool_block, valid_m,
+                                          Uint32(2 * intermediate), Uint32(hidden))
+                        iteration = Uint32(iteration + Uint32(1))
+                        fetching = False
                     if cutlass.const_expr(eco):
                         # ECO: take the plan as soon as it is published (non-blocking poll after a publish, while
                         # the consumers are busy), not at the claim that first needs a replica slot
@@ -471,6 +735,13 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                             signals, rank_idx, eco_epoch, eco_num_fixed, expert_counts, Int32(lane),
                             local_experts, block_m, eco_base, num_ranks, eco_trace, block, eco_spec)
                         eco_plan_loaded = Uint32(1)
+                if cutlass.const_expr(xorder_pool or prog_native):
+                    routed_m_blocks, xo_waited = xo_cover(
+                        xo_ptr if xo_ptr is not None else recv_ptr,
+                        recv_ptr, expert_counts, routed_m_blocks,
+                        xo_waited, task_idx // l2_clusters,
+                        Int32(lane), local_experts, num_ranks,
+                        dispatch_sms, block_m, prog_native)
                 if task_idx >= routed_m_blocks * l2_clusters:
                     scheduling = False
                     fetching = False
@@ -479,19 +750,44 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                         l1_warmup = Uint32(1)
                     pool_block = task_idx // l2_clusters
                     n_cluster = task_idx % l2_clusters
-                    local_expert, m_block, valid_m = \
-                        locate_routed_pool_block(
-                            expert_counts, pool_block, Uint32(lane),
-                            local_experts, block_m)
-                    required_l1 = (pool_block + 1) * l1_clusters
-                    while ld_volatile_u32(l1_count_ptr) < required_l1:
-                        pass
-                    publish_iteration(task, full, iteration, Int32(lane),
-                                      Uint32(GCBlockPhase.Linear2), local_expert,
-                                      m_block, n_cluster, pool_block, valid_m,
-                                      Uint32(hidden), Uint32(intermediate))
-                    iteration = Uint32(iteration + Uint32(1))
-                    fetching = False
+                    pub_blk = pool_block
+                    if cutlass.const_expr(push_dispatch):
+                        pb_e = pool_block // Uint32(dense_per_expert)
+                        db_m = pool_block % Uint32(dense_per_expert)
+                        eb_w = ld_acquire_gpu_u32(eb_ptr + pb_e)
+                        while eb_w == Uint32(0):
+                            eb_w = ld_acquire_gpu_u32(eb_ptr + pb_e)
+                        db_cnt = eb_w - Uint32(1)
+                        db_nb = (db_cnt + Uint32(block_m - 1)) // \
+                            Uint32(block_m)
+                        local_expert = pb_e
+                        m_block = db_m
+                        valid_m = Uint32(0)
+                        if db_m < db_nb:
+                            valid_m = min(Uint32(block_m),
+                                          db_cnt - db_m * Uint32(block_m))
+                        pub_blk = dense_block + pb_e * Uint32(dense_eblocks) + \
+                            db_m
+                    else:
+                        local_expert, m_block, valid_m = \
+                            locate_routed_pool_block(
+                                expert_counts, pool_block, Uint32(lane),
+                                local_experts, block_m)
+                        if cutlass.const_expr(xorder_pool):
+                            local_expert = Uint32(xo_ptr[local_expert])
+                    publish_l2 = valid_m > Uint32(0)
+                    if cutlass.const_expr(not push_dispatch):
+                        publish_l2 = True
+                    if publish_l2:
+                        required_l1 = (pool_block + 1) * l1_clusters
+                        while ld_volatile_u32(l1_count_ptr) < required_l1:
+                            pass
+                        publish_iteration(task, full, iteration, Int32(lane),
+                                          Uint32(GCBlockPhase.Linear2), local_expert,
+                                          m_block, n_cluster, pub_blk, valid_m,
+                                          Uint32(hidden), Uint32(intermediate))
+                        iteration = Uint32(iteration + Uint32(1))
+                        fetching = False
                     if cutlass.const_expr(eco):
                         # ECO: take the plan as soon as it is published (non-blocking poll after a publish, while
                         # the consumers are busy), not at the claim that first needs a replica slot
@@ -510,7 +806,7 @@ def schedule_tasks(task: cute.Pointer, full: cute.Pointer, empty: cute.Pointer,
                 Int32(lane), Uint32(block // 2),
                 Uint32(GCBlockPhase.SharedLinear2),
                 num_tokens, block_m, l2_clusters,
-                compute_sms, hidden,
+                sh_sched_sms, hidden,
                 intermediate * shared_experts)
     wait_task_slot(empty, iteration)
     publish_iteration(task, full, iteration, Int32(lane),
